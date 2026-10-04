@@ -15,7 +15,7 @@ O primeiro jogo escolhido como alvo é **Shadow Hearts**.
 
 A ideia é partir do código executável original do jogo, analisar sua estrutura, identificar suas funções e instruções MIPS e, futuramente, transformar esse código em uma implementação que possa ser executada diretamente em uma arquitetura moderna.
 
-O projeto está sendo desenvolvido principalmente em **C# / .NET**.
+O projeto está sendo desenvolvido principalmente em **C# / .NET** 10.
 
 ---
 
