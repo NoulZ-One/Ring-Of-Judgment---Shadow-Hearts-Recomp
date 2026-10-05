@@ -534,3 +534,36 @@ Depois disso começa uma das partes mais importantes do projeto:
 ```text
 ISO → ELF → MIPS → Functions → Recompiler → Runtime → Game
 ```
+
+🖥️ Recursos planejados
+Recurso	Objetivo	Status
+Vulkan	Renderização multiplataforma	🟡 Planejado
+Windows	Execução nativa	🟡 Planejado
+Linux	Execução nativa	🟡 Planejado
+macOS	Execução nativa	🟡 Planejado
+60 Hz	Compatibilidade com a taxa original	🟡 Planejado
+75 Hz	Suporte a monitores de 75 Hz	🟡 Planejado
+120 Hz	Alta taxa de atualização	🟡 Planejado
+144 Hz	Alta taxa de atualização	🟡 Planejado
+Até 144 FPS/QPS	Maior taxa de atualização do jogo	🟡 Planejado
+Resolução personalizada	Permitir resoluções modernas	🟡 Planejado
+4:3	Proporção original	🟡 Planejado
+16:9	Widescreen	🟡 Planejado
+21:9	Ultrawide	🟡 Planejado
+Fullscreen	Tela cheia	🟡 Planejado
+Borderless	Janela sem bordas	🟡 Planejado
+Janela	Execução em modo janela	🟡 Planejado
+VSync	Sincronização vertical	🟡 Planejado
+VRR	Compatibilidade futura com taxas variáveis	🟡 Planejado
+Remapeamento de controles	Configuração personalizada	🟡 Planejado
+Teclado e mouse	Entrada alternativa	🟡 Planejado
+Controles modernos	Suporte a controles atuais	🟡 Planejado
+Filtro de textura	Melhor qualidade visual	🟡 Planejado
+Filtragem anisotrópica	Melhor qualidade de texturas	🟡 Planejado
+Anti-aliasing	Redução de serrilhado	🟡 Planejado
+Resolução interna escalável	Renderização acima da resolução original	🟡 Planejado
+HUD adaptativo	Interface adequada a diferentes proporções	🟡 Planejado
+Correção de câmera/FOV	Adaptação ao widescreen/ultrawide	🟡 Planejado
+Áudio moderno	Sistema de áudio independente do hardware original	🟡 Planejado
+Memory Card virtual	Sistema de saves moderno	🟡 Planejado
+Ferramentas de debugging	Desenvolvimento e análise	🟡 Planejado
