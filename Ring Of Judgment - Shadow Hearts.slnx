@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SH.Core/SH.Core.csproj" />
+    <Project Path="src/SH.ELF/SH.ELF.csproj" />
+    <Project Path="src/SH.ISO/SH.ISO.csproj" />
+  </Folder>
+</Solution>

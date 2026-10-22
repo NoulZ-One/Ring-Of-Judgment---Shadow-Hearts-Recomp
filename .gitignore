@@ -1,0 +1,22 @@
+﻿# Artefatos de compilação .NET
+**/bin/
+**/obj/
+
+# Configurações locais do Rider e do Visual Studio
+.idea/
+.vs/
+*.user
+*.suo
+.out/
+
+# Executáveis e arquivos intermediários gerados
+out/
+*.exe
+*.dll
+*.pdb
+*.cpp
+
+
+# Imagens de disco e arquivos grandes do jogo
+*.iso
+*.bin
