@@ -18,5 +18,5 @@ out/
 
 
 # Imagens de disco e arquivos grandes do jogo
-*.iso
-*.bin
+/*.iso
+/*.bin
