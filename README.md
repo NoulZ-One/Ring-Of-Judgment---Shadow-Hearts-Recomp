@@ -61,9 +61,7 @@ Current progress:
 **Why are you performing this recompilation in C#?**
 > I decided to do this re-implementation in C# because I am studying C#. I intend to use the code being built by AI for study purposes; so yes, I plan to revisit this code in the future, even once it is fully functional.   And, if possible, I also want to make some further modifications.
 
-
 ---
-
 
 # Estado atual
 
@@ -104,17 +102,18 @@ Foram observadas chamadas a funções como RenderPrim, RenderPmBlend, GsxSetRmVe
 Isso é um marco importante: o fluxo do jogo alcança código relacionado à renderização. Porém, ainda não há comprovação de que os comandos gráficos produzam uma imagem correta na tela.
 
 
-
-**Subsistema**:                          **Situação indicada pelos logs**:
-CPU e instruções MIPS/R5900	             O código é executado, mas há instruções que ainda precisam ser implementadas ou verificadas.
-Memória e execução	                     O executável é carregado e o runtime avança por diversas rotinas; não há validação completa de todos os acessos à memória e exceções.
-Sistema de arquivos	                     Leituras da ISO e de arquivos do jogo foram observadas com sucesso.
-Syscalls e serviços do PS2	             Diversos serviços são chamados; falta validar completamente os resultados e a semântica de cada implementação.
-DMA e processamento gráfico	             Há atividade registrada, mas não está demonstrado que todo o fluxo de transferência e renderização esteja correto.
-Memory Card	                             Há chamadas como sceMcGetSlotMax, sceMcOpen e sceMcClose, mas não há comprovação de gravação e carregamento persistentes.
-Áudio e controles	                       Há sinais de inicialização e chamadas relacionadas, mas não há teste funcional comprovado.
+| **Subsistema** | **Situação indicada pelos logs** |
+|---|---|
+| CPU e instruções MIPS/R5900 | O código é executado, mas há instruções que ainda precisam ser implementadas ou verificadas. |
+| Memória e execução | O executável é carregado e o runtime avança por diversas rotinas; não há validação completa de todos os acessos à memória e exceções. |
+| Sistema de arquivos | Leituras da ISO e de arquivos do jogo foram observadas com sucesso. |
+| Syscalls e serviços do PS2 | Diversos serviços são chamados; falta validar completamente os resultados e a semântica de cada implementação. |
+| DMA e processamento gráfico | Há atividade registrada, mas não está demonstrado que todo o fluxo de transferência e renderização esteja correto. |
+| Memory Card | Há chamadas como `sceMcGetSlotMax`, `sceMcOpen` e `sceMcClose`, mas não há comprovação de gravação e carregamento persistentes. |
+| Áudio e controles | Há sinais de inicialização e chamadas relacionadas, mas não há teste funcional comprovado. |
 
 ---
+
 > **Onde travou a execução**:
 
 Instrução sem suporte
@@ -133,9 +132,9 @@ Não é seguro simplesmente substituir a instrução por um NOP, porque isso pod
 VCALLMSR no endereço 0x002FCAFC
 
 ---
-## sobre o código
+## Sobre o código
 
-Ao compilar a solução (`dotnet build`), é gerada a pasta `OUT/`, contendo os arquivos C++ (`.cpp`) e o executável `ps2_game.exe`.
+Ao executar a solução (`dotnet run --project src\SH.Core`), é gerada a pasta `OUT/`, contendo os arquivos C++ (`.cpp`) e o executável `ps2_game.exe`.
 Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comportamento do runtime, identificar problemas e investigar os próximos bloqueios durante a execução do jogo.
 
 ---
@@ -177,14 +176,15 @@ Calls to functions such as RenderPrim, RenderPmBlend, and GsxSetRmVertex—along
 This is a significant milestone: the game’s execution flow is reaching code associated with rendering. However, there is no confirmation yet that these graphics commands actually produce a correct image on the screen.
 
 
-**Subsystem**:                         **Status indicated by logs**:
-CPU and MIPS/R5900 instructions	       Code is being executed, but some instructions still require implementation or verification.
-Memory and execution	                 The executable is loaded and the runtime progresses through various routines; however, not all memory accesses and exceptions have been fully validated.
-File system	                           Reads from the ISO and game files have been successfully observed.
-Syscalls and PS2 services	             Various services are being called; the results and the semantics of each implementation have yet to be fully validated.
-DMA and graphics processing	           Activity has been recorded, but it has not been demonstrated that the entire transfer and rendering flow is correct.
-Memory Card	                           Calls such as `sceMcGetSlotMax`, `sceMcOpen`, and `sceMcClose` are present, but there is no confirmation of persistent saving or loading.
-Audio and controls	                   There are signs of initialization and related calls, but no proven functional testing.
+| **Subsystem** | **Status indicated by logs** |
+|---|---|
+| CPU and MIPS/R5900 instructions | Code is being executed, but some instructions still require implementation or verification. |
+| Memory and execution | The executable is loaded, and the runtime progresses through various routines; however, not all memory accesses and exceptions have been fully validated. |
+| File system | Successful read operations from the ISO and game files have been observed. |
+| PS2 Syscalls and services | Various services are being called; the results and the semantics of each implementation have yet to be fully validated. |
+| DMA and graphics processing | Activity has been recorded, but it has not been demonstrated that the entire transfer and rendering flow is correct. |
+| Memory Card | Calls such as `sceMcGetSlotMax`, `sceMcOpen`, and `sceMcClose` are present, but there is no confirmation of persistent saving or loading. |
+| Audio and controls | There are signs of initialization and related calls, but no proven functional testing. |
 
 ---
 
@@ -209,7 +209,7 @@ at address 0x002FCAFC
 
 ## About the code
 
-Compiling the solution (`dotnet build`) generates an `OUT/` folder, which contains the C++ files (`.cpp`) and the executable `ps2_game.exe`.
+When running the solution (`dotnet run --project src\SH.Core`) generates an `OUT/` folder, which contains the C++ files (`.cpp`) and the executable `ps2_game.exe`.
 Running `ps2_game.exe` produces logs that make it possible to analyze runtime behavior, identify issues, and investigate any crashes that may occur while the game is running.
 
 ---
