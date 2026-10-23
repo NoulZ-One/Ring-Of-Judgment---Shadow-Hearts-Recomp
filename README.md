@@ -87,7 +87,7 @@ Current progress:
 - Isso demonstra que a infraestrutura de leitura já está avançada, embora não prove que todos os recursos são interpretados corretamente.
 
 
-> 4. Execução de serviços e criação de threads]
+> 4. Execução de serviços e criação de threads
 
 Os logs registram atividade relacionada a:
 - Criação de threads e uso de semáforos.
