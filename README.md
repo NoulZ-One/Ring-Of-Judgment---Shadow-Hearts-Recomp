@@ -77,7 +77,7 @@ Current progress:
 - Foram geradas 4.708 funções C++.
 - 62 funções receberam implementações alternativas via HLE (High-Level Emulation).
 - A geração não registrou falhas.
-- Ainda existem 11 instruções reportadas como não suportadas nessa etapa.
+- Ainda existem 11 instruções reportadas como não suportadas nessa etapa (9 VCALLMSR, 1 VCALLMS e 1 PMULTH).
 
 > 3. Leitura da ISO e dos arquivos do jogo
 
@@ -152,7 +152,7 @@ Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comporta
 - 4,708 C++ functions were generated.
 - 62 functions received alternative implementations via HLE (High-Level Emulation).
 - The generation process encountered no failures.
-- There are still 11 instructions reported as unsupported at this stage.
+- There are still 11 instructions reported as unsupported at this stage (9 VCALLMSR, 1 VCALLMS e 1 PMULTH).
 
 > 3. Reading of the ISO and game files
 
