@@ -111,25 +111,36 @@ Isso é um marco importante: o fluxo do jogo alcança código relacionado à ren
 | DMA e processamento gráfico | Há atividade registrada, mas não está demonstrado que todo o fluxo de transferência e renderização esteja correto. |
 | Memory Card | Há chamadas como `sceMcGetSlotMax`, `sceMcOpen` e `sceMcClose`, mas não há comprovação de gravação e carregamento persistentes. |
 | Áudio e controles | Há sinais de inicialização e chamadas relacionadas, mas não há teste funcional comprovado. |
+--
 
----
-
-> **Onde travou a execução**:
-
-Instrução sem suporte
-Endereço: 0x002FCAFC · Função: GsxSetRmVertex
-O runtime interrompe a execução ao encontrar a instrução VCALLMSR.
-Também foram identificadas outras instruções reportadas como não suportadas na geração, incluindo VCALLMS e PMULTH.
-Próxima ação técnica: examinar a palavra de instrução e o código ao redor de 0x002FCAFC, determinar a semântica correta e implementar o comportamento necessário. 
-Não é seguro simplesmente substituir a instrução por um NOP, porque isso pode eliminar operações essenciais ao processamento gráfico.
+**O JOGO EXIBIU SUAS PRIMEIRAS IMAGENS**
 
 ---
 
 ## Próximo passo / prioridade atual:
 
-**Resolver o bloqueio VCALLMSR**
+**Corrigir e estabilizar a renderização do GS (Graphics Synthesizer)**
 
-VCALLMSR no endereço 0x002FCAFC
+Marco alcançado: primeiras imagens do jogo!
+
+O projeto alcançou um importante marco técnico: as primeiras imagens reconhecíveis de Shadow Hearts foram geradas com sucesso!
+Ao executar o ps2_game.exe, o runtime produz arquivos no formato .PPM, contendo os primeiros resultados visuais do jogo, incluindo o logotipo da Aruze e a tela de título de Shadow Hearts.
+Esse avanço demonstra que partes importantes do pipeline gráfico do PlayStation 2, incluindo o processamento de comandos gráficos e a escrita na memória gráfica, já estão funcionando na implementação própria do projeto.
+
+## Estado atual
+
+Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresenta problemas, como duplicação de elementos, posicionamento incorreto, faixas pretas e áreas não renderizadas corretamente.
+
+## Próximos objetivos
+
+- Corrigir a seleção e a apresentação dos framebuffers do GS.
+- Validar o endereçamento e a organização da VRAM.
+- Investigar possíveis problemas nas texturas, transparências e composição gráfica.
+- Eliminar artefatos visuais e imagens duplicadas.
+- Estabilizar a renderização da tela de título.
+- Posteriormente, implementar ou validar os controles para avançar até o menu e o gameplay.
+
+**Objetivo imediato**: obter uma tela de título visualmente correta e estável, utilizando o runtime próprio do projeto.
 
 ---
 ## Sobre o código
@@ -188,23 +199,35 @@ This is a significant milestone: the game’s execution flow is reaching code as
 
 ---
 
-> **Where execution stalled**:
-
-Unsupported instruction
-Address: 0x002FCAFC · Function: GsxSetRmVertex
-The runtime halts execution upon encountering the VCALLMSR instruction.
-Other instructions reported as unsupported during generation—specifically VCALLMS and PMULTH—have also been identified.
-Next technical step: examine the instruction word and the code surrounding 0x002FCAFC, determine the correct semantics, and implement the required behavior.
-Simply replacing the instruction with a NOP is not safe, as this could eliminate operations essential to graphics processing.
+> **THE GAME HAS REVEALED ITS FIRST IMAGES** 
 
 ---
 
 ## Next step / Current Priority:
 
-**Resolve the VCALLMSR block**
+**Fixing and stabilizing GS (Graphics Synthesizer) rendering**
 
-at address 0x002FCAFC
+Milestone reached: first in-game images!
 
+The project has hit a significant technical milestone: the first recognizable images from *Shadow Hearts* have been successfully generated!
+
+When running `ps2_game.exe`, the runtime produces files in .PPM format, containing the initial visual output from the game—including the Aruze logo and the *Shadow Hearts* title screen.
+
+This breakthrough demonstrates that key components of the PlayStation 2 graphics pipeline—such as the processing of graphics commands and writing to graphics memory—are already functional within the project’s custom implementation.
+Current Status
+
+Although the initial images are recognizable, the rendering still presents issues, such as duplicated elements, incorrect positioning, black bars, and areas that are not rendered correctly.
+
+## Next Objectives
+
+- Correct the selection and presentation of the GS (Graphics Synthesizer) framebuffers.
+- Validate VRAM addressing and organization.
+- Investigate potential issues with textures, transparencies, and graphical composition.
+- Eliminate visual artifacts and duplicated images.
+- Stabilize the rendering of the title screen.
+- Subsequently, implement or validate the controls to progress to the menu and gameplay.
+
+Immediate Goal: Achieve a visually correct and stable title screen, using the project's own runtime.
 ---
 
 ## About the code
