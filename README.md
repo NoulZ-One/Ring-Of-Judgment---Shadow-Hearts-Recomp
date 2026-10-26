@@ -149,7 +149,11 @@ Ao executar a solução (`dotnet run --project src\SH.Core`), é gerada a pasta 
 Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comportamento do runtime, identificar problemas e investigar os próximos bloqueios durante a execução do jogo.
 
 ---
+## Primeiras imagens do jogo / First images of the game 
+<img width="640" height="448" alt="gs_000" src="https://github.com/user-attachments/assets/403e4f18-b585-47be-9feb-7029dd8e407f" />
+<img width="640" height="448" alt="gs_023" src="https://github.com/user-attachments/assets/e3de94f7-2d7b-47d7-8f7f-3797de87d430" />
 
+---
 # Current Status
 
 > 1. Loading of the ELF executable
