@@ -170,6 +170,7 @@ internal static class EmitDemo
         hle.AppendLine("#include \"ps2_functions.h\"");
         hle.AppendLine("#include <cstdio>");
         hle.AppendLine("#include <cstring>");
+        hle.AppendLine("#include <cstdlib>");
         hle.AppendLine();
 
         foreach (ElfSymbol function in emitted.Where(f => Hle.Contains(f.Name)))

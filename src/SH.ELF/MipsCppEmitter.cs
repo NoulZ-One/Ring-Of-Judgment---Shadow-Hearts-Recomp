@@ -44,8 +44,8 @@ static inline uint64_t S32(uint32_t v) { return (uint64_t)(int64_t)(int32_t)v; }
 
 // Diagnostico: compile com -DPS2_TRACE para guardar as ultimas funcoes entradas.
 #ifdef PS2_TRACE
-void ps2_trace_enter(uint32_t address);
-#define PS2_TRACE_ENTER(a) ps2_trace_enter(a)
+void ps2_trace_enter(Ctx& c, uint32_t address);
+#define PS2_TRACE_ENTER(a) ps2_trace_enter(c, a)
 // Ultimo rotulo de desvio executado: mostra em que laco o jogo esta preso.
 extern volatile uint32_t g_loop_mark;
 #define PS2_LOOP_MARK(a) (g_loop_mark = (a))
@@ -703,6 +703,9 @@ void ps2_break(Ctx& c, uint32_t address);
 
 // Auxiliares das funcoes substituidas por codigo nativo (HLE)
 const char* ps2_cstr(Ctx& c, uint32_t address, char* buffer, size_t capacity);
+// Agenda fn(arg) para rodar daqui a `frames` vsyncs, em contexto de interrupcao (como um callback
+// assincrono do IOP/DMA). Usado pelos HLEs que precisam avisar o fim depois de a funcao voltar.
+void ps2_defer_call(uint32_t frames, uint32_t fn, uint32_t arg);
 uint32_t ps2_alloc_id();
 [[noreturn]] void ps2_hle_unimplemented(Ctx& c, const char* name);
 
@@ -742,6 +745,8 @@ void ps2_di(Ctx& c);
 uint32_t ps2_mfc0(Ctx& c, int reg);
 void ps2_mtc0(Ctx& c, int reg, uint32_t value);
 void ps2_unsupported(Ctx& c, uint32_t address, const char* mnemonic);
+// VCALLMS/VCALLMSR: inicia um microprograma do VU0 no endereco indicado (bytes da micro memoria).
+void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 ";
 
     // Runtime minimo (ps2_runtime.cpp): despacho por endereco usando a tabela
@@ -763,6 +768,7 @@ void ps2_unsupported(Ctx& c, uint32_t address, const char* mnemonic);
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -807,7 +813,72 @@ static const Ps2FuncEntry* find_containing(uint32_t address)
 static uint32_t g_ring[64];
 static unsigned g_ring_pos = 0;
 
-void ps2_trace_enter(uint32_t address) { g_ring[g_ring_pos++ & 63u] = address; }
+// PS2_WATCH=0x00234790,0x002216A0 imprime os argumentos ($a0..$a3), $ra e $sp a cada entrada nessas
+// funcoes. PS2_WATCH_MIN=N so imprime quando $a0 ou $a1 for >= N (ex.: 0x100000 para ver alocacoes
+// grandes em malloc). Util para achar quem pede memoria demais.
+static uint32_t g_watch[16];
+static unsigned g_watch_n = 0;
+static uint32_t g_watch_min = 0;
+static unsigned g_watch_prints = 0;
+
+static int ps2_watch_init()
+{
+    const char* e = std::getenv("PS2_WATCH");
+
+    if (e != nullptr)
+    {
+        while (*e != 0 && g_watch_n < 16)
+        {
+            char* end = nullptr;
+            unsigned long v = std::strtoul(e, &end, 0);
+
+            if (end == e)
+                break;
+
+            g_watch[g_watch_n++] = (uint32_t)v;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+
+    const char* m = std::getenv("PS2_WATCH_MIN");
+
+    if (m != nullptr)
+        g_watch_min = (uint32_t)std::strtoul(m, nullptr, 0);
+
+    return 0;
+}
+
+static int g_watch_ready = ps2_watch_init();
+
+void ps2_trace_enter(Ctx& c, uint32_t address)
+{
+    g_ring[g_ring_pos++ & 63u] = address;
+
+    if (g_watch_n == 0)
+        return;
+
+    for (unsigned i = 0; i < g_watch_n; i++)
+    {
+        if (g_watch[i] != address)
+            continue;
+
+        uint32_t a0 = (uint32_t)c.r[4].lo, a1 = (uint32_t)c.r[5].lo;
+
+        if (g_watch_min != 0 && a0 < g_watch_min && a1 < g_watch_min)
+            return;
+
+        if (g_watch_prints++ < 400)
+        {
+            const Ps2FuncEntry* e = find_entry(address);
+
+            std::fprintf(stderr, "  [watch] %s 0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X sp=0x%08X\n",
+                e ? e->name : "?", address, a0, a1, (uint32_t)c.r[6].lo, (uint32_t)c.r[7].lo,
+                (uint32_t)c.r[31].lo, (uint32_t)c.r[29].lo);
+        }
+
+        return;
+    }
+}
 #endif
 
 static void dump_trace()
@@ -930,6 +1001,44 @@ static void hw_hist_print()
     }
 }
 
+// Versao do histograma que nao zera nada: usada nos pulsos para ver, sem parar o jogo, quais
+// registradores o laco atual esta lendo. Mostra a diferenca desde o pulso anterior.
+static void hw_hist_peek(int top_n)
+{
+    static uint64_t s_prev[512] = {};
+    uint64_t delta[512];
+
+    for (int i = 0; i < 512; i++)
+    {
+        delta[i] = g_hist_cnt[i] >= s_prev[i] ? g_hist_cnt[i] - s_prev[i] : g_hist_cnt[i];
+        s_prev[i] = g_hist_cnt[i];
+    }
+
+    std::fprintf(stderr, "    leituras de hardware neste intervalo:");
+
+    bool any = false;
+
+    for (int n = 0; n < top_n; n++)
+    {
+        int best = -1;
+
+        for (int i = 0; i < 512; i++)
+        {
+            if (delta[i] != 0 && (best < 0 || delta[i] > delta[best]))
+                best = i;
+        }
+
+        if (best < 0)
+            break;
+
+        std::fprintf(stderr, " 0x%08X x%llu", g_hist_addr[best], (unsigned long long)delta[best]);
+        delta[best] = 0;
+        any = true;
+    }
+
+    std::fprintf(stderr, any ? "\n" : " (nenhuma)\n");
+}
+
 // Relogio do host: os timers e o vsync andam com o tempo real, para os laços de espera terminarem.
 static uint64_t hw_now_ns()
 {
@@ -964,16 +1073,32 @@ uint64_t ps2_hw_read(Ctx&, uint32_t phys, int size)
         std::fprintf(stderr, "hw leitura  0x%08X (%d bytes)\n", phys, size);
     }
 
+    // Timer 0: modo (+0x10, com as flags EQUF/OVFF) e comparacao (+0x20). O handler do jogo faz
+    // "ler, OU 0xC00, escrever"; se a leitura devolver 0, o CUE/CMPE sao apagados e o timer morre.
+    if (phys == 0x10000010u)
+        return g_timer0_mode;
+
+    if (phys == 0x10000020u)
+        return g_timer0_comp;
+
     // Timers 0 a 3 (contador em +0x00 de cada bloco de 0x800): 16 bits a ~576 kHz (BUSCLK/256).
     if (phys >= 0x10000000u && phys < 0x10002000u && (phys & 0x7FFu) == 0u)
         return (hw_now_ns() * 576ull / 1000000ull) & 0xFFFFull;
 
     // GS_CSR: FINISH (bit 1) sempre pronto (o GS emulado e instantaneo), VSINT (bit 3) a cada
     // quadro, FIELD (bit 13) alternando.
-    if (phys == 0x12001000u)
+    // Vale para qualquer byte/palavra dentro dos 8 bytes do registrador (o jogo le o byte +1 para o FIELD).
+    if (phys >= 0x12001000u && phys < 0x12001008u)
     {
         gs_vsync_update();
-        return 0x2ull | (g_gs_vsint ? 0x8ull : 0ull) | ((uint64_t)g_gs_field << 13);
+
+        uint64_t csr = 0x2ull | (g_gs_vsint ? 0x8ull : 0ull) | ((uint64_t)g_gs_field << 13);
+        uint64_t value = csr >> ((phys & 7u) * 8u);
+
+        if (size < 8)
+            value &= (1ull << (size * 8)) - 1ull;
+
+        return value;
     }
 
     // Muitas leituras seguidas do mesmo registrador: o jogo espera por algo que nao vem.
@@ -994,15 +1119,19 @@ uint64_t ps2_hw_read(Ctx&, uint32_t phys, int size)
     return 0;
 }
 
-void ps2_hw_write(Ctx&, uint32_t phys, uint64_t value, int size)
+void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value);
+
+void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
 {
+    ps2_dma_write(c, phys, value);
+
     // GS_CSR: escrever 1 no bit 3 limpa o VSINT
     if (phys == 0x12001000u && (value & 0x8ull))
         g_gs_vsint = false;
 
     // Timer 0: modo (+0x10) e valor de comparacao (+0x20); a interrupcao sai quando o jogo liga CUE e CMPE
     if (phys == 0x10000010u)
-        g_timer0_mode = value;
+        g_timer0_mode = (value & ~0xC00ull) | (g_timer0_mode & 0xC00ull & ~value);
 
     if (phys == 0x10000020u)
         g_timer0_comp = value;
@@ -2298,6 +2427,8 @@ static void on_crash(int sig)
 
 // Vigia: se nenhuma syscall acontece por muito tempo, o jogo esta preso num laco de codigo (sem
 // chamar o kernel). Mostra onde e termina. PS2_WATCHDOG=segundos (padrao 20; 0 desliga).
+static void irq_debug_print();   // definida junto das interrupcoes
+
 static void watchdog_thread(unsigned seconds)
 {
     uint64_t last = g_activity.load();
@@ -2321,9 +2452,18 @@ static void watchdog_thread(unsigned seconds)
             const Ps2FuncEntry* e = top ? find_entry(top) : nullptr;
             std::fprintf(stderr, "  [pulso %us] syscalls=%llu funcoes chamadas=%u ultima=%s marca=0x%08X\n", elapsed,
                 (unsigned long long)now, g_ring_pos, e ? e->name : "?", g_loop_mark);
+            hw_hist_peek(6);
 #else
             std::fprintf(stderr, "  [pulso %us] syscalls=%llu\n", elapsed, (unsigned long long)now);
 #endif
+
+            // PS2_PULSE_DETAIL=1: a cada pulso mostra o estado de cada thread, os semaforos e as
+            // ultimas 64 funcoes chamadas (para ver o que o laco principal faz quando "parece parado").
+            if (std::getenv("PS2_PULSE_DETAIL"))
+            {
+                print_threads();
+                dump_trace();
+            }
         }
 
         if (now != last)
@@ -2337,6 +2477,7 @@ static void watchdog_thread(unsigned seconds)
         {
             std::fprintf(stderr, "\nVIGIA: nenhuma syscall ha %u segundos; o jogo esta preso em um laco de codigo. Threads e ultimas funcoes:\n", idle);
             print_threads();
+            irq_debug_print();
             print_loop_mark();
             hw_hist_print();
             dump_trace();
@@ -2351,6 +2492,7 @@ static void irq_tick_thread()
 {
     const uint64_t period = 16683333ull;
     uint64_t next_vsync = hw_now_ns() + period;
+    uint64_t t0_next = 0;
 
     for (;;)
     {
@@ -2365,9 +2507,23 @@ static void irq_tick_thread()
             flags |= 1u;
         }
 
-        // CUE (bit 7) e CMPE (bit 8) ligados e causa 9 habilitada
+        // CUE (bit 7) e CMPE (bit 8) ligados e causa 9 habilitada: dispara a cada "comparacao" ticks
+        // do contador (576 kHz); o handler limpa o EQUF escrevendo 1 no bit 10 do modo.
         if ((g_timer0_mode & 0x180ull) == 0x180ull && g_timer0_comp != 0 && (g_intc_mask & (1u << 9)))
-            flags |= 2u;
+        {
+            uint64_t t0_period = (uint64_t)g_timer0_comp * 1000000000ull / 576000ull;
+
+            if (t0_next == 0 || now >= t0_next)
+            {
+                t0_next = now + t0_period;
+                g_timer0_mode |= 0x400ull;
+                flags |= 2u;
+            }
+        }
+        else
+        {
+            t0_next = 0;
+        }
 
         if (flags)
         {
@@ -2716,7 +2872,28 @@ namespace
             g_fio_repeat = 0;
         }
 
-        if (g_fio_repeat < 2)
+        // Comandos de consulta (4 getStatus, 12 strDataCh, 20 CdSync, 21 GetError) sao repetidos o
+        // tempo todo pelas threads do jogo: so os 3 primeiros de cada um aparecem no log, para nao
+        // gastar o limite de linhas do rpc_log nem esconder os comandos que importam.
+        bool polling = (cmd == 4u || cmd == 12u || cmd == 20u || cmd == 21u);
+        static unsigned s_poll_logged[32] = {};
+
+        if (polling)
+        {
+            unsigned& n = s_poll_logged[cmd & 31u];
+
+            if (n < 3u)
+            {
+                n++;
+                rpc_log(c, "FIO", cmd, send, ssize, recv, rsize);
+            }
+            else if (n == 3u)
+            {
+                n++;
+                std::fprintf(stderr, "  (FIO comando=%u e consulta de rotina; as proximas nao serao impressas)\n", cmd);
+            }
+        }
+        else if (g_fio_repeat < 2)
         {
             rpc_log(c, "FIO", cmd, send, ssize, recv, rsize);
         }
@@ -2732,6 +2909,63 @@ namespace
         //   comando 21 (GetErr)  : palavra 3 da resposta e o codigo de erro (0 = nenhum).
         rpc_zero_recv(c, recv, rsize);
 
+        // Leitura de arquivo dos PKB (protocolo deduzido do disassembly de FileIOLib::read/getStatus):
+        //   cmd 2 com +0x64 (destino) e +0x68 (bytes) zerados = "carregue o arquivo do FIOHND"; o IOP
+        //         guarda o pedido (LSN em +0x70, tamanho arredondado a 2048 em +0x78) e aceita (palavra 0 = 1).
+        //   cmd 4 (getStatus): enquanto ha pedido pendente, a resposta e {5, tamanho, 0}. Com 5 o
+        //         FileIOLib::getStatus aloca o BufMemory (hnd[40], tamanho = palavra 1) e envia o cmd 5.
+        //   cmd 5: +0x64 = destino no EE (dados do BufMemory), +0x68 = bytes, +0x70 = LSN: o IOP copia o
+        //         arquivo (setor a partir de LSN) para la. Depois o cmd 4 volta a responder 0 (= pronto).
+        // Todos os arquivos dos PKB observados comecam no inicio de um setor (LSN = inicio do PKB +
+        // deslocamento/2048, resto 0), entao nao ha deslocamento dentro do setor.
+        static bool s_pkb_armed = false;
+        static uint32_t s_pkb_size = 0;
+
+        if (cmd == 4 && s_pkb_armed && recv != 0 && rsize >= 12)
+        {
+            s_pkb_armed = false;
+            mwr<uint32_t>(c, recv + 0, 5u);
+            mwr<uint32_t>(c, recv + 4, s_pkb_size);
+            mwr<uint32_t>(c, recv + 8, 0u);
+            std::fprintf(stderr, "  FIO getStatus: arquivo de PKB pronto (%u bytes); o jogo vai pedir os dados (cmd 5)\n", s_pkb_size);
+        }
+
+        // Comandos sem implementacao (6 = strReadStart, 12 = ?, ...): na primeira vez de cada um,
+        // mostra quem chamou e as ultimas funcoes, para saber o que ele faz no FileIOLib.
+        {
+            static std::set<uint32_t> s_fio_unknown;
+            bool known = cmd == 1u || cmd == 2u || cmd == 4u || cmd == 5u || cmd == 6u || cmd == 12u || cmd == 20u || cmd == 21u;
+
+            if (!known && s_fio_unknown.insert(cmd).second)
+            {
+                std::fprintf(stderr, "\n  [FIO] comando %u ainda sem implementacao; quem chamou:\n", cmd);
+                print_stack_callers(c);
+                dump_trace();
+                std::fprintf(stderr, "\n");
+            }
+        }
+
+        // comando 6 (FileIOLib::strReadStart): +0x68 = parametro (0x7F no filme), +0x6C.. = copia do
+        // _FIOHND. O FileIOLib so devolve verdadeiro se a palavra 0 da resposta for 1.
+        if (cmd == 6 && recv != 0 && rsize >= 4)
+        {
+            static unsigned s_str_start_log = 0;
+
+            if (s_str_start_log < 20)
+            {
+                s_str_start_log++;
+                std::fprintf(stderr, "  FIO strReadStart: parametro=0x%X lsn=%u tamanho=%u\n",
+                    mrd<uint32_t>(c, send + 0x68), mrd<uint32_t>(c, send + 0x70), mrd<uint32_t>(c, send + 0x78));
+            }
+
+            mwr<uint32_t>(c, recv + 0, 1u);
+        }
+
+        // comando 12 (FileIOLib::strDataCh): a palavra 0 da resposta e o retorno. Diferente de zero
+        // significa "o canal de audio do IOP quer mais 0x1000 bytes"; o StreamRead::Run entao copia um
+        // bloco do anel de PCM e o envia por outro comando. Zero ("nao precisa de dados") ja e a
+        // resposta padrao e nao trava nada: a thread so consulta a cada poucos ticks.
+
         // comando 2 (read): o pedido (664 bytes) traz
         //   +0x64 = endereco de destino no EE (BufMemory + 4)     +0x68 = bytes a ler
         //   +0x6C.. = copia do _FIOHND (0x2C bytes): +0x70 = LSN absoluto do arquivo no disco
@@ -2743,6 +2977,36 @@ namespace
             uint32_t bytes = mrd<uint32_t>(c, send + 0x68);
             uint32_t lsn = mrd<uint32_t>(c, send + 0x70);
             bool ok = true;
+            bool direct = false;
+
+            // Leitura direta (hipotese, a confirmar com o disassembly de FileIOLib::read): para arquivos
+            // dos PKB o jogo chama read() sem BufMemory, entao +0x64/+0x68 vem zerados. Nesse caso o
+            // FIOHND copiado em +0x6C traz o destino no EE (palavra 0), o LSN (palavra 1, = +0x70) e o
+            // tamanho (palavra 3, = +0x78). Sem isso a leitura "volta ok" sem copiar nada e o jogo
+            // processa um buffer zerado (foi assim que a Logo caiu num BREAK de divisao por zero).
+            // DESLIGADO por padrao: a hipotese estava errada. Pelo disassembly, hnd[0] (+0x6C) e o terceiro
+            // argumento do open() (um ponteiro/token dentro do pedido do DvdromOrder), nao o destino, e a
+            // leitura direta corrompia a heap. Mantido so sob PS2_FIO_DIRECT=1 para experimentos.
+            if (dest == 0 && bytes == 0 && std::getenv("PS2_FIO_DIRECT") != nullptr)
+            {
+                uint32_t d2 = mrd<uint32_t>(c, send + 0x6C);
+                uint32_t b2 = mrd<uint32_t>(c, send + 0x78);
+
+                if (d2 != 0 && b2 != 0 && b2 <= 0x04000000u && (uint64_t)d2 + b2 <= 0x02000000ull)
+                {
+                    dest = d2;
+                    bytes = b2;
+                    direct = true;
+                }
+            }
+
+            if (dest == 0 && bytes == 0 && !direct)
+            {
+                s_pkb_armed = true;
+                s_pkb_size = mrd<uint32_t>(c, send + 0x78);
+                std::fprintf(stderr, "  FIO leitura sem BufMemory (PKB): lsn=%u tamanho=%u -> pedido guardado\n",
+                    lsn, s_pkb_size);
+            }
 
             if (dest != 0 && bytes != 0)
             {
@@ -2776,16 +3040,61 @@ namespace
             if (s_fio_reads < 200)
             {
                 s_fio_reads++;
-                std::fprintf(stderr, "  FIO leitura: lsn=%u bytes=%u (%u setores) -> 0x%08X %s\n",
-                    lsn, bytes, (bytes + 2047u) / 2048u, dest, ok ? "ok" : "FALHOU (fora da ISO)");
+                std::fprintf(stderr, "  FIO leitura%s: lsn=%u bytes=%u (%u setores) -> 0x%08X %s\n",
+                    direct ? " direta" : "", lsn, bytes, (bytes + 2047u) / 2048u, dest, ok ? "ok" : "FALHOU (fora da ISO)");
             }
 
             if (ok)
                 mwr<uint32_t>(c, recv + 0, 1u);   // 1 = pedido aceito
         }
 
+        // comando 5: o FileIOLib::getStatus mandou o destino (BufMemory + 4) e o tamanho do arquivo cujo
+        // pedido o cmd 2 deixou pendente. O LSN vem na copia do _FIOHND (+0x70).
+        if (cmd == 5 && send != 0 && ssize >= 0x98)
+        {
+            uint32_t dest = mrd<uint32_t>(c, send + 0x64);
+            uint32_t bytes = mrd<uint32_t>(c, send + 0x68);
+            uint32_t lsn = mrd<uint32_t>(c, send + 0x70);
+            bool ok = dest != 0 && bytes != 0 && (uint64_t)dest + bytes <= 0x02000000ull;
+            uint32_t sectors = (bytes + 2047u) / 2048u;
+            uint32_t done = 0;
+            std::vector<uint8_t> chunk;
+
+            while (ok && done < sectors)
+            {
+                uint32_t n = sectors - done;
+
+                if (n > 512u)
+                    n = 512u;
+
+                chunk.resize((size_t)n * 2048u);
+                ok = iso_read_sectors(lsn + done, n, chunk.data());
+
+                if (ok)
+                {
+                    uint32_t offset = done * 2048u;
+                    uint32_t len = bytes - offset < n * 2048u ? bytes - offset : n * 2048u;
+                    std::memcpy(host_ptr(c, dest + offset, len), chunk.data(), len);
+                }
+
+                done += n;
+            }
+
+            static unsigned s_fio_cmd5 = 0;
+
+            if (s_fio_cmd5 < 200)
+            {
+                s_fio_cmd5++;
+                std::fprintf(stderr, "  FIO cmd 5 (dados de PKB): lsn=%u bytes=%u (%u setores) -> 0x%08X %s\n",
+                    lsn, bytes, sectors, dest, ok ? "ok" : "FALHOU");
+            }
+
+            // palavra 0 != 0 = "ainda ocupado": o proximo getStatus (cmd 4, que agora responde 0) conclui.
+            mwr<uint32_t>(c, recv + 0, 1u);
+        }
+
         // Se o jogo insiste na mesma chamada sem progresso, e laco sem fim: para e mostra onde.
-        if (g_fio_repeat >= 300)
+        if (!polling && g_fio_repeat >= 300)
         {
             std::fprintf(stderr, "\nFIO: o jogo repetiu a mesma chamada (comando=%u) %u vezes sem progresso.\n"
                 "O servico FIO ainda so registra a chamada; falta implementar o que o comando faz.\n", cmd, g_fio_repeat);
@@ -2827,15 +3136,74 @@ namespace
     //                        a biblioteca exige mcserv >= 0x20A e mcman >= 0x20E.
     //   demais comandos    : a palavra 0 da resposta e o resultado que sceMcSync devolve ao jogo.
     // Por enquanto o cartao esta "ausente": resultado < -2 (0 = mesmo cartao, -1 = trocado, -2 = sem formato).
+    int mc_env_int(const char* name, int fallback, bool* present = nullptr)
+    {
+        const char* v = std::getenv(name);
+
+        if (present)
+            *present = (v != nullptr && *v != 0);
+
+        return (v != nullptr && *v != 0) ? (int)std::strtol(v, nullptr, 0) : fallback;
+    }
+
+    // Experimento (variaveis de ambiente, lidas uma vez):
+    //   PS2_MC_RESULT  resultado do comando 1 (GetInfo) e dos demais comandos. Padrao -10 (sem cartao).
+    //                  0 = mesmo cartao, -1 = cartao trocado, -2 = sem formato, < -2 = ausente.
+    //   PS2_MC_FIRST   se definida, resultado do primeiro GetInfo depois de cada init (um cartao real
+    //                  responde -1 ali); os seguintes usam PS2_MC_RESULT.
+    //   PS2_MC_INFO    "tipo,livre,formato" (ex.: 2,8000,1): escrito como 3 palavras no ponteiro que
+    //                  vai em send+0x1C do GetInfo. O layout NAO foi confirmado: e um palpite para teste.
     void mcserv_service(Ctx& c, uint32_t cmd, uint32_t send, uint32_t ssize, uint32_t recv, uint32_t rsize)
     {
         static unsigned s_mc_log = 0;
+        static unsigned s_mc_inits = 0;
+        static bool s_cfg = false;
+        static bool s_has_first = false;
+        static int s_result = -10;
+        static int s_first = -10;
+        static bool s_has_info = false;
+        static uint32_t s_info[3] = { 2, 8000, 1 };
+        static bool s_first_pending = true;
+        static std::set<uint32_t> s_seen_cmds;
+
+        if (!s_cfg)
+        {
+            s_cfg = true;
+            // Padrao (testado): cartao "novo" no primeiro GetInfo, depois "mesmo"; tipo 2, 8000 livres, formatado.
+            s_result = mc_env_int("PS2_MC_RESULT", 0);
+            s_first = mc_env_int("PS2_MC_FIRST", -1, &s_has_first);
+            s_has_first = true;
+            s_has_info = true;
+
+            const char* info = std::getenv("PS2_MC_INFO");
+
+            if (info != nullptr && std::strcmp(info, "off") == 0)
+            {
+                s_has_info = false;   // PS2_MC_INFO=off desliga a escrita das informacoes
+            }
+            else if (info != nullptr && *info != 0)
+            {
+                unsigned a = 0, b = 0, f = 0;
+
+                if (std::sscanf(info, "%u,%u,%u", &a, &b, &f) == 3)
+                {
+                    s_info[0] = a; s_info[1] = b; s_info[2] = f;
+                }
+            }
+
+            std::fprintf(stderr, "  [MC] resultado=%d primeiro=%d info=%s\n", s_result, s_first,
+                         s_has_info ? "sim" : "nao");
+        }
 
         if (s_mc_log < 20)
         {
             s_mc_log++;
             rpc_log(c, "MCSERV", cmd, send, ssize, recv, rsize);
         }
+
+        // Todo comando novo aparece uma vez no log: mostra o que o jogo pede depois do GetInfo.
+        if (cmd != 0xFEu && cmd != 1u && s_seen_cmds.insert(cmd).second)
+            std::fprintf(stderr, "  [MC] comando novo 0x%X (enviar=%u bytes, receber=%u bytes)\n", cmd, ssize, rsize);
 
         rpc_zero_recv(c, recv, rsize);
 
@@ -2844,6 +3212,12 @@ namespace
 
         if (cmd == 0xFEu)
         {
+            s_mc_inits++;
+            s_first_pending = true;
+
+            if (s_mc_inits == 1 || s_mc_inits % 100 == 0)
+                std::fprintf(stderr, "  [MC] sceMcInit numero %u\n", s_mc_inits);
+
             if (rsize >= 12)
             {
                 mwr<uint32_t>(c, recv + 0, 0u);       // resultado: ok
@@ -2854,8 +3228,35 @@ namespace
             return;
         }
 
+        int result = s_result;
+
+        if (cmd == 1u)
+        {
+            if (s_first_pending && s_has_first)
+                result = s_first;
+
+            s_first_pending = false;
+
+            if (s_has_info)
+            {
+                uint32_t out = mrd<uint32_t>(c, send + 0x1Cu);
+
+                if (out != 0)
+                    for (int i = 0; i < 3; i++)
+                        mwr<uint32_t>(c, out + 4u * (uint32_t)i, s_info[i]);
+            }
+
+            static unsigned s_get_log = 0;
+
+            if (s_get_log < 12)
+            {
+                s_get_log++;
+                std::fprintf(stderr, "  [MC] GetInfo -> %d (saida=0x%08X)\n", result, mrd<uint32_t>(c, send + 0x1Cu));
+            }
+        }
+
         if (rsize >= 4)
-            mwr<uint32_t>(c, recv + 0, (uint32_t)-10);   // sem cartao
+            mwr<uint32_t>(c, recv + 0, (uint32_t)result);
     }
 
     // Servico desconhecido: registra e devolve zeros (sucesso), para o boot nao parar.
@@ -2911,7 +3312,15 @@ void ps2_rpc(Ctx& c, int function)
             }
             else
             {
-                std::fprintf(stderr, "  sceSifBindRpc(0x%08X) -> servico %s\n", sid, service->name);
+                static std::map<uint32_t, unsigned> s_bind_count;
+                unsigned n = ++s_bind_count[sid];
+
+                if (n <= 3)
+                    std::fprintf(stderr, "  sceSifBindRpc(0x%08X) -> servico %s\n", sid, service->name);
+                else if (n == 4)
+                    std::fprintf(stderr, "  sceSifBindRpc(0x%08X): mais binds iguais; a partir daqui so a cada 1000\n", sid);
+                else if (n % 1000 == 0)
+                    std::fprintf(stderr, "  sceSifBindRpc(0x%08X): %u binds\n", sid, n);
             }
 
             // struct sceSifClientData (40 bytes):
@@ -3225,9 +3634,1285 @@ void ps2_pad(Ctx& c, int function)
     c.r[2].lo = (uint64_t)result;
 }
 
-void ps2_break(Ctx&, uint32_t address)
+// ---- DMA (VIF1 / GIF) -> GS: por enquanto so decodifica e registra (PS2_GIFLOG=1), nao desenha ----
+// Canais: 1 = VIF1 (0x10009000), 2 = GIF (0x1000A000). Cada kick (CHCR com STR) percorre a cadeia de
+// DMAtags na hora e entrega os dados: no GIF direto para o decodificador de GIFtags; no VIF1 passam
+// pelo interpretador de VIFcodes (DIRECT/DIRECTHL -> GIF, UNPACK/MPG sao so contados). O resultado e
+// o fluxo de escritas em registradores do GS (gs_write), o ponto onde entrara o GS de verdade.
+namespace
 {
-    std::fprintf(stderr, "BREAK em 0x%08X\n", address);
+    struct DmaChan { uint32_t madr = 0, qwc = 0, tadr = 0; };
+    DmaChan g_dmach[3];
+    const bool g_giflog = std::getenv("PS2_GIFLOG") != nullptr;
+    const bool g_gsdump = std::getenv("PS2_GSDUMP") != nullptr;   // segundos entre dumps de quadro (padrao 5)
+    const bool g_gsrun = g_giflog || g_gsdump;                    // decodifica o fluxo de DMA e roda o GS
+    unsigned g_giflog_budget = 600;
+    unsigned g_dma_detail = 0;
+    unsigned g_vif_log = 200, g_gif_log = 80, g_raw_log = 64;
+    std::mutex g_gs_mu;
+
+    struct GsStats
+    {
+        uint64_t kicks[3] = {}, tags_packed = 0, tags_reglist = 0, tags_image = 0, image_qw = 0;
+        uint64_t direct_qw = 0, mpg_words = 0, unpack_cmds = 0, mscal = 0;
+        uint64_t prim[8] = {};
+        uint64_t reg[256] = {};
+    };
+
+    GsStats g_gs;
+    unsigned g_gs_vsyncs = 0;
+
+    const char* gs_reg_name(unsigned r)
+    {
+        switch (r)
+        {
+            case 0x00: return "PRIM";      case 0x01: return "RGBAQ";    case 0x02: return "ST";
+            case 0x03: return "UV";        case 0x04: return "XYZF2";    case 0x05: return "XYZ2";
+            case 0x06: return "TEX0_1";    case 0x07: return "TEX0_2";   case 0x08: return "CLAMP_1";
+            case 0x09: return "CLAMP_2";   case 0x0A: return "FOG";      case 0x0C: return "XYZF3";
+            case 0x0D: return "XYZ3";      case 0x14: return "TEX1_1";   case 0x15: return "TEX1_2";
+            case 0x16: return "TEX2_1";    case 0x17: return "TEX2_2";   case 0x18: return "XYOFFSET_1";
+            case 0x19: return "XYOFFSET_2"; case 0x1A: return "PRMODECONT"; case 0x1B: return "PRMODE";
+            case 0x1C: return "TEXCLUT";   case 0x22: return "SCANMSK";  case 0x3B: return "TEXA";
+            case 0x3D: return "FOGCOL";    case 0x3F: return "TEXFLUSH"; case 0x40: return "SCISSOR_1";
+            case 0x41: return "SCISSOR_2"; case 0x42: return "ALPHA_1";  case 0x43: return "ALPHA_2";
+            case 0x44: return "DIMX";      case 0x45: return "DTHE";     case 0x46: return "COLCLAMP";
+            case 0x47: return "TEST_1";    case 0x48: return "TEST_2";   case 0x49: return "PABE";
+            case 0x4A: return "FBA_1";     case 0x4B: return "FBA_2";    case 0x4C: return "FRAME_1";
+            case 0x4D: return "FRAME_2";   case 0x4E: return "ZBUF_1";   case 0x4F: return "ZBUF_2";
+            case 0x50: return "BITBLTBUF"; case 0x51: return "TRXPOS";   case 0x52: return "TRXREG";
+            case 0x53: return "TRXDIR";    case 0x54: return "HWREG";    case 0x60: return "SIGNAL";
+            case 0x61: return "FINISH";    case 0x62: return "LABEL";
+            default: return "?";
+        }
+    }
+
+
+    // ======== GS por software (esboco): VRAM de 4 MB, transferencias, sprites e triangulos 2D ========
+    // Cobre o que as telas atuais usam (sprites com/sem textura, CLUT de 4/8 bits, alpha, scissor).
+    // Fora do escopo por enquanto: Z-buffer, mipmap, filtro bilinear, fog, antialiasing, dither.
+    uint32_t g_vram[1u << 20];                       // 4 MB
+    uint8_t g_blk32[4][8], g_blk16[8][4], g_blk8[4][8], g_blk4[8][4];
+    uint8_t g_col32[8][8], g_col16[8][16], g_col8[16][16];
+    uint16_t g_col4[16][32];
+    bool g_gs_tables_ready = false;
+
+    void gs_init_tables()
+    {
+        if (g_gs_tables_ready)
+            return;
+
+        g_gs_tables_ready = true;
+
+        static const int b32[8] = { 0, 1, 4, 5, 16, 17, 20, 21 };
+        static const int b16[4] = { 0, 2, 8, 10 };
+        static const int p32[8] = { 0, 1, 4, 5, 8, 9, 12, 13 };
+        static const int p16a[16] = { 0, 2, 8, 10, 16, 18, 24, 26, 1, 3, 9, 11, 17, 19, 25, 27 };
+        static const int p8[16] = { 0, 4, 16, 20, 32, 36, 48, 52, 2, 6, 18, 22, 34, 38, 50, 54 };
+        static const int p4[8] = { 0, 8, 32, 40, 64, 72, 96, 104 };
+
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 8; c++)
+            {
+                g_blk32[r][c] = (uint8_t)(b32[c] + 2 * (r & 1) + 8 * (r >> 1));
+                g_blk8[r][c] = g_blk32[r][c];
+            }
+
+        for (int r = 0; r < 8; r++)
+            for (int c = 0; c < 4; c++)
+            {
+                g_blk16[r][c] = (uint8_t)(b16[c] + (r & 1) + 4 * ((r >> 1) & 1) + 16 * (r >> 2));
+                g_blk4[r][c] = g_blk16[r][c];
+            }
+
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+                g_col32[y][x] = (uint8_t)(p32[x] + 2 * (y & 1) + 16 * (y >> 1));
+
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 16; x++)
+                g_col16[y][x] = (uint8_t)(p16a[x] + 4 * (y & 1) + 32 * (y >> 1));
+
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++)
+            {
+                int v = p8[x];
+
+                if (y & 2) v ^= 33;
+                if (y & 1) v += 8;
+
+                switch (y >> 2)
+                {
+                    case 1: v ^= 96; break;
+                    case 2: v += 128; break;
+                    case 3: v ^= 224; break;
+                    default: break;
+                }
+
+                g_col8[y][x] = (uint8_t)v;
+            }
+
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 32; x++)
+            {
+                int v = p4[x & 7] + 2 * (x >> 3);
+
+                if (y & 2) v ^= 65;
+                if (y & 1) v += 16;
+
+                switch (y >> 2)
+                {
+                    case 1: v ^= 192; break;
+                    case 2: v += 256; break;
+                    case 3: v ^= 448; break;
+                    default: break;
+                }
+
+                g_col4[y][x] = (uint16_t)v;
+            }
+    }
+
+    inline uint32_t ix_ct32(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
+    {
+        uint32_t page = (bp >> 5) + (y >> 5) * bw + (x >> 6);
+        return ((page << 11) + ((uint32_t)g_blk32[(y >> 3) & 3][(x >> 3) & 7] << 6) + g_col32[y & 7][x & 7]) & 0xFFFFFu;
+    }
+
+    inline uint32_t ix_ct16(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)    // indice de meia-palavra
+    {
+        uint32_t page = (bp >> 5) + (y >> 6) * bw + (x >> 6);
+        return ((page << 12) + ((uint32_t)g_blk16[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
+    }
+
+    inline uint32_t ix_t8(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de byte
+    {
+        uint32_t pw = bw >> 1 ? bw >> 1 : 1;
+        uint32_t page = (bp >> 5) + (y >> 6) * pw + (x >> 7);
+        return ((page << 13) + ((uint32_t)g_blk8[(y >> 4) & 3][(x >> 4) & 7] << 8) + g_col8[y & 15][x & 15]) & 0x3FFFFFu;
+    }
+
+    inline uint32_t ix_t4(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de nibble
+    {
+        uint32_t pw = bw >> 1 ? bw >> 1 : 1;
+        uint32_t page = (bp >> 5) + (y >> 7) * pw + (x >> 7);
+        return ((page << 14) + ((uint32_t)g_blk4[(y >> 4) & 7][(x >> 5) & 3] << 9) + g_col4[y & 15][x & 31]) & 0x7FFFFFu;
+    }
+
+    inline uint8_t* vram8() { return reinterpret_cast<uint8_t*>(g_vram); }
+
+    uint32_t gs_read_px(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
+    {
+        switch (psm)
+        {
+            case 0x00: return g_vram[ix_ct32(bp, bw, x, y)];
+            case 0x01: return g_vram[ix_ct32(bp, bw, x, y)] & 0xFFFFFFu;
+            case 0x02: case 0x0A:
+            {
+                uint16_t v;
+                std::memcpy(&v, vram8() + (size_t)ix_ct16(bp, bw, x, y) * 2, 2);
+                return v;
+            }
+            case 0x13: return vram8()[ix_t8(bp, bw, x, y)];
+            case 0x14:
+            {
+                uint32_t n = ix_t4(bp, bw, x, y);
+                return (vram8()[n >> 1] >> ((n & 1) * 4)) & 0xF;
+            }
+            case 0x1B: return g_vram[ix_ct32(bp, bw, x, y)] >> 24;
+            case 0x24: return (g_vram[ix_ct32(bp, bw, x, y)] >> 24) & 0xF;
+            case 0x2C: return (g_vram[ix_ct32(bp, bw, x, y)] >> 28) & 0xF;
+            default: return 0;
+        }
+    }
+
+    void gs_write_px(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t v)
+    {
+        switch (psm)
+        {
+            case 0x00: g_vram[ix_ct32(bp, bw, x, y)] = v; break;
+            case 0x01:
+            {
+                uint32_t& d = g_vram[ix_ct32(bp, bw, x, y)];
+                d = (d & 0xFF000000u) | (v & 0xFFFFFFu);
+                break;
+            }
+            case 0x02: case 0x0A:
+            {
+                uint16_t h = (uint16_t)v;
+                std::memcpy(vram8() + (size_t)ix_ct16(bp, bw, x, y) * 2, &h, 2);
+                break;
+            }
+            case 0x13: vram8()[ix_t8(bp, bw, x, y)] = (uint8_t)v; break;
+            case 0x14:
+            {
+                uint32_t n = ix_t4(bp, bw, x, y);
+                uint8_t& b = vram8()[n >> 1];
+                b = (n & 1) ? (uint8_t)((b & 0x0F) | ((v & 0xF) << 4)) : (uint8_t)((b & 0xF0) | (v & 0xF));
+                break;
+            }
+            case 0x1B:
+            {
+                uint32_t& d = g_vram[ix_ct32(bp, bw, x, y)];
+                d = (d & 0x00FFFFFFu) | ((v & 0xFF) << 24);
+                break;
+            }
+            case 0x24:
+            {
+                uint32_t& d = g_vram[ix_ct32(bp, bw, x, y)];
+                d = (d & 0xF0FFFFFFu) | ((v & 0xF) << 24);
+                break;
+            }
+            case 0x2C:
+            {
+                uint32_t& d = g_vram[ix_ct32(bp, bw, x, y)];
+                d = (d & 0x0FFFFFFFu) | ((v & 0xF) << 28);
+                break;
+            }
+            default: break;
+        }
+    }
+
+    struct GsCtx
+    {
+        uint64_t tex0 = 0, tex1 = 0, clamp = 0, alpha = 0, test = 0, frame = 0, zbuf = 0, xyoffset = 0, scissor = 0;
+    };
+
+    struct GsVertex
+    {
+        float x = 0, y = 0, r = 0, g = 0, b = 0, a = 0, u = 0, v = 0;
+    };
+
+    struct GsState
+    {
+        GsCtx ctx[2];
+        uint64_t prim = 0, rgbaq = 0x3F80000000000000ull, st = 0, uv = 0, texa = 0, colclamp = 1;
+        uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0, trxdir = 3;
+        GsVertex q[3];
+        int nq = 0;
+        uint32_t clut[256] = {};
+        uint64_t clut_tex0 = ~0ull;
+
+        // transferencia host -> local em andamento
+        bool xfer = false;
+        uint32_t x = 0, y = 0, x0 = 0, rrw = 0, rrh = 0, dpsm = 0, dbp = 0, dbw = 0;
+        uint8_t pend[32] = {};
+        unsigned npend = 0;
+        uint64_t unsupported = 0;
+    };
+
+    GsState g_st;
+
+    // Registradores privilegiados (para saber qual area esta sendo exibida)
+    uint64_t g_gs_priv[0x100 / 8];
+
+    inline float gs_clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+    uint32_t gs_clut_color(uint32_t cpsm, uint32_t v)
+    {
+        if (cpsm == 0x00)
+            return v;
+
+        if (cpsm == 0x01)
+            return (v & 0xFFFFFFu) | 0x80000000u;
+
+        uint32_t r = (v & 31) << 3, g = ((v >> 5) & 31) << 3, b = ((v >> 10) & 31) << 3;
+        return r | (g << 8) | (b << 16) | ((v & 0x8000) ? 0x80000000u : 0u);
+    }
+
+    void gs_load_clut(uint64_t tex0)
+    {
+        uint32_t psm = (uint32_t)((tex0 >> 20) & 0x3F);
+        uint32_t cbp = (uint32_t)((tex0 >> 37) & 0x3FFF);
+        uint32_t cpsm = (uint32_t)((tex0 >> 51) & 0xF);
+        uint32_t csa = (uint32_t)((tex0 >> 56) & 0x1F);
+        bool is4 = psm == 0x14 || psm == 0x24 || psm == 0x2C;
+        unsigned n = is4 ? 16 : 256;
+
+        for (unsigned i = 0; i < n; i++)
+        {
+            uint32_t j = i;
+
+            if (!is4)
+                j = (i & 0xE7u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);   // CSM1: bits 3 e 4 trocados
+
+            uint32_t entry = is4 ? i + csa * 16 : j;
+            uint32_t x, y, raw;
+
+            if (cpsm == 0x00 || cpsm == 0x01)
+            {
+                x = entry & 7;
+                y = entry >> 3;
+
+                if (!is4) { x = entry & 15; y = entry >> 4; }
+
+                raw = g_vram[ix_ct32(cbp, 1, x, y)];
+            }
+            else
+            {
+                x = entry & 15;
+                y = entry >> 4;
+                uint16_t h;
+                std::memcpy(&h, vram8() + (size_t)ix_ct16(cbp, 1, x, y) * 2, 2);
+                raw = h;
+            }
+
+            g_st.clut[i] = gs_clut_color(cpsm, raw);
+        }
+    }
+
+    // Cor do texel (RGBA 8 bits; alpha 0x80 = opaco como no GS)
+    uint32_t gs_texel(const GsCtx& c, int iu, int iv)
+    {
+        uint32_t tbp = (uint32_t)(c.tex0 & 0x3FFF), tbw = (uint32_t)((c.tex0 >> 14) & 0x3F);
+        uint32_t psm = (uint32_t)((c.tex0 >> 20) & 0x3F);
+        int tw = (int)((c.tex0 >> 26) & 0xF), th = (int)((c.tex0 >> 30) & 0xF);
+        int w = 1 << tw, h = 1 << th;
+
+        auto wrap = [](int v, int size, unsigned mode, int minv, int maxv)
+        {
+            switch (mode)
+            {
+                case 0: return v & (size - 1);
+                case 1: return v < 0 ? 0 : (v >= size ? size - 1 : v);
+                case 2: return v < minv ? minv : (v > maxv ? maxv : v);
+                default: return (v & minv) | maxv;
+            }
+        };
+
+        iu = wrap(iu, w, (unsigned)(c.clamp & 3), (int)((c.clamp >> 4) & 0x3FF), (int)((c.clamp >> 14) & 0x3FF));
+        iv = wrap(iv, h, (unsigned)((c.clamp >> 2) & 3), (int)((c.clamp >> 34) & 0x3FF), (int)((c.clamp >> 44) & 0x3FF));
+
+        uint32_t raw = gs_read_px(psm, tbp, tbw, (uint32_t)iu, (uint32_t)iv);
+
+        switch (psm)
+        {
+            case 0x00: return raw;
+            case 0x01:
+            {
+                uint32_t a = (uint32_t)(g_st.texa & 0xFF);
+
+                if ((g_st.texa & 0x8000) && (raw & 0xFFFFFF) == 0)
+                    a = 0;
+
+                return (raw & 0xFFFFFFu) | (a << 24);
+            }
+            case 0x02: case 0x0A:
+            {
+                uint32_t r = (raw & 31) << 3, g = ((raw >> 5) & 31) << 3, b = ((raw >> 10) & 31) << 3;
+                uint32_t a = (raw & 0x8000) ? (uint32_t)((g_st.texa >> 32) & 0xFF) : (uint32_t)(g_st.texa & 0xFF);
+
+                if ((g_st.texa & 0x8000) && (raw & 0x7FFF) == 0)
+                    a = 0;
+
+                return r | (g << 8) | (b << 16) | (a << 24);
+            }
+            case 0x13: case 0x1B: return g_st.clut[raw & 0xFF];
+            case 0x14: case 0x24: case 0x2C: return g_st.clut[raw & 0xF];
+            default: return 0xFF00FF | 0x80000000u;   // formato nao suportado: magenta
+        }
+    }
+
+    void gs_pixel(int ci, int x, int y, float fr, float fg, float fb, float fa, float u, float v)
+    {
+        const GsCtx& c = g_st.ctx[ci];
+
+        // scissor (limites inclusivos)
+        int sx0 = (int)(c.scissor & 0x7FF), sx1 = (int)((c.scissor >> 16) & 0x7FF);
+        int sy0 = (int)((c.scissor >> 32) & 0x7FF), sy1 = (int)((c.scissor >> 48) & 0x7FF);
+
+        if (x < sx0 || x > sx1 || y < sy0 || y > sy1 || x < 0 || y < 0)
+            return;
+
+        int vr = (int)gs_clampf(fr, 0, 255), vg = (int)gs_clampf(fg, 0, 255), vb = (int)gs_clampf(fb, 0, 255), va = (int)gs_clampf(fa, 0, 255);
+        int r = vr, g = vg, b = vb, a = va;
+
+        if (g_st.prim & 0x10)   // TME
+        {
+            uint32_t t = gs_texel(c, (int)std::floor(u), (int)std::floor(v));
+            int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
+            bool tcc = ((c.tex0 >> 34) & 1) != 0;
+            unsigned tfx = (unsigned)((c.tex0 >> 35) & 3);
+
+            switch (tfx)
+            {
+                case 0:   // MODULATE
+                    r = std::min(255, tr * vr >> 7); g = std::min(255, tg * vg >> 7); b = std::min(255, tb * vb >> 7);
+                    a = tcc ? std::min(255, ta * va >> 7) : va;
+                    break;
+                case 1:   // DECAL
+                    r = tr; g = tg; b = tb; a = tcc ? ta : va;
+                    break;
+                default:  // HIGHLIGHT / HIGHLIGHT2
+                    r = std::min(255, (tr * vr >> 7) + va); g = std::min(255, (tg * vg >> 7) + va); b = std::min(255, (tb * vb >> 7) + va);
+                    a = (tfx == 2 && tcc) ? std::min(255, ta + va) : (tcc ? ta : va);
+                    break;
+            }
+        }
+
+        // alpha test
+        if (c.test & 1)
+        {
+            int aref = (int)((c.test >> 4) & 0xFF);
+            bool pass = true;
+
+            switch ((c.test >> 1) & 7)
+            {
+                case 0: pass = false; break;
+                case 2: pass = a < aref; break;
+                case 3: pass = a <= aref; break;
+                case 4: pass = a == aref; break;
+                case 5: pass = a >= aref; break;
+                case 6: pass = a > aref; break;
+                case 7: pass = a != aref; break;
+                default: break;
+            }
+
+            if (!pass)
+                return;   // AFAIL: so o caso KEEP/descartar e tratado
+        }
+
+        uint32_t fbp = (uint32_t)(c.frame & 0x1FF) * 32, fbw = (uint32_t)((c.frame >> 16) & 0x3F), fpsm = (uint32_t)((c.frame >> 24) & 0x3F);
+        uint32_t fbmsk = (uint32_t)(c.frame >> 32);
+        uint32_t dst = gs_read_px(fpsm, fbp, fbw, (uint32_t)x, (uint32_t)y);
+        int dr, dg, db, da;
+
+        if (fpsm == 0x02 || fpsm == 0x0A)
+        {
+            dr = (int)((dst & 31) << 3); dg = (int)(((dst >> 5) & 31) << 3); db = (int)(((dst >> 10) & 31) << 3);
+            da = (dst & 0x8000) ? 0x80 : 0;
+        }
+        else
+        {
+            dr = (int)(dst & 0xFF); dg = (int)((dst >> 8) & 0xFF); db = (int)((dst >> 16) & 0xFF); da = (int)((dst >> 24) & 0xFF);
+        }
+
+        if (g_st.prim & 0x40)   // ABE: (A - B) * C >> 7 + D
+        {
+            auto pick = [&](unsigned sel, int cs, int cd) { return sel == 0 ? cs : (sel == 1 ? cd : 0); };
+            unsigned A = (unsigned)(c.alpha & 3), B = (unsigned)((c.alpha >> 2) & 3), C = (unsigned)((c.alpha >> 4) & 3), D = (unsigned)((c.alpha >> 6) & 3);
+            int fix = (int)((c.alpha >> 32) & 0xFF);
+            int cf = C == 0 ? a : (C == 1 ? da : fix);
+            int nr = (((pick(A, r, dr) - pick(B, r, dr)) * cf) >> 7) + pick(D, r, dr);
+            int ng = (((pick(A, g, dg) - pick(B, g, dg)) * cf) >> 7) + pick(D, g, dg);
+            int nb = (((pick(A, b, db) - pick(B, b, db)) * cf) >> 7) + pick(D, b, db);
+
+            if (g_st.colclamp & 1)
+            {
+                r = nr < 0 ? 0 : (nr > 255 ? 255 : nr); g = ng < 0 ? 0 : (ng > 255 ? 255 : ng); b = nb < 0 ? 0 : (nb > 255 ? 255 : nb);
+            }
+            else
+            {
+                r = nr & 0xFF; g = ng & 0xFF; b = nb & 0xFF;
+            }
+        }
+
+        uint32_t out;
+
+        if (fpsm == 0x02 || fpsm == 0x0A)
+            out = (uint32_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >= 0x80) ? 0x8000 : 0));
+        else
+            out = (uint32_t)(r | (g << 8) | (b << 16) | (a << 24));
+
+        if (fbmsk != 0)
+            out = (dst & fbmsk) | (out & ~fbmsk);
+
+        gs_write_px(fpsm, fbp, fbw, (uint32_t)x, (uint32_t)y, out);
+    }
+
+    void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
+    {
+        float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
+
+        if (x1 <= x0 || y1 <= y0)
+            return;
+
+        int px0 = (int)std::ceil(x0 - 0.5f), px1 = (int)std::ceil(x1 - 0.5f);
+        int py0 = (int)std::ceil(y0 - 0.5f), py1 = (int)std::ceil(y1 - 0.5f);
+
+        for (int y = py0; y < py1; y++)
+            for (int x = px0; x < px1; x++)
+            {
+                float fu = ((float)x + 0.5f - a.x) / (b.x - a.x);
+                float fv = ((float)y + 0.5f - a.y) / (b.y - a.y);
+                gs_pixel(ci, x, y, b.r, b.g, b.b, b.a, a.u + (b.u - a.u) * fu, a.v + (b.v - a.v) * fv);
+            }
+    }
+
+    void gs_draw_triangle(int ci, const GsVertex& a, const GsVertex& b, const GsVertex& c)
+    {
+        float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+
+        if (area == 0.0f)
+            return;
+
+        int minx = (int)std::floor(std::min(a.x, std::min(b.x, c.x))), maxx = (int)std::ceil(std::max(a.x, std::max(b.x, c.x)));
+        int miny = (int)std::floor(std::min(a.y, std::min(b.y, c.y))), maxy = (int)std::ceil(std::max(a.y, std::max(b.y, c.y)));
+
+        minx = std::max(minx, 0); miny = std::max(miny, 0);
+        maxx = std::min(maxx, 2047); maxy = std::min(maxy, 2047);
+
+        for (int y = miny; y <= maxy; y++)
+            for (int x = minx; x <= maxx; x++)
+            {
+                float px = (float)x + 0.5f, py = (float)y + 0.5f;
+                float w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area;
+                float w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area;
+                float w2 = 1.0f - w0 - w1;
+
+                if (w0 < 0 || w1 < 0 || w2 < 0)
+                    continue;
+
+                gs_pixel(ci, x, y, a.r * w0 + b.r * w1 + c.r * w2, a.g * w0 + b.g * w1 + c.g * w2, a.b * w0 + b.b * w1 + c.b * w2,
+                    a.a * w0 + b.a * w1 + c.a * w2, a.u * w0 + b.u * w1 + c.u * w2, a.v * w0 + b.v * w1 + c.v * w2);
+            }
+    }
+
+    void gs_vertex(uint64_t data, bool kick)
+    {
+        int ci = (int)((g_st.prim >> 9) & 1);
+        const GsCtx& c = g_st.ctx[ci];
+        GsVertex v;
+        float ofx = (float)(c.xyoffset & 0xFFFF), ofy = (float)((c.xyoffset >> 32) & 0xFFFF);
+        v.x = ((float)(data & 0xFFFF) - ofx) / 16.0f;
+        v.y = ((float)((data >> 16) & 0xFFFF) - ofy) / 16.0f;
+        v.r = (float)(g_st.rgbaq & 0xFF);
+        v.g = (float)((g_st.rgbaq >> 8) & 0xFF);
+        v.b = (float)((g_st.rgbaq >> 16) & 0xFF);
+        v.a = (float)((g_st.rgbaq >> 24) & 0xFF);
+
+        int tw = 1 << (int)((c.tex0 >> 26) & 0xF), th = 1 << (int)((c.tex0 >> 30) & 0xF);
+
+        if (g_st.prim & 0x100)   // FST: UV em ponto fixo 12.4
+        {
+            v.u = (float)(g_st.uv & 0x3FFF) / 16.0f;
+            v.v = (float)((g_st.uv >> 16) & 0x3FFF) / 16.0f;
+        }
+        else                     // ST / Q
+        {
+            float s, t, q;
+            uint32_t sb = (uint32_t)g_st.st, tb = (uint32_t)(g_st.st >> 32), qb = (uint32_t)(g_st.rgbaq >> 32);
+            std::memcpy(&s, &sb, 4); std::memcpy(&t, &tb, 4); std::memcpy(&q, &qb, 4);
+
+            if (q == 0.0f)
+                q = 1.0f;
+
+            v.u = s / q * (float)tw;
+            v.v = t / q * (float)th;
+        }
+
+        unsigned type = (unsigned)(g_st.prim & 7);
+        int need = type == 6 ? 2 : (type >= 3 ? 3 : (type == 0 ? 1 : 2));
+
+        // fila de vertices (tira/leque: desloca)
+        if (g_st.nq >= need)
+        {
+            if (type == 4) { g_st.q[0] = g_st.q[1]; g_st.q[1] = g_st.q[2]; g_st.nq = 2; }
+            else if (type == 5) { g_st.q[1] = g_st.q[2]; g_st.nq = 2; }
+            else if (type == 2) { g_st.q[0] = g_st.q[1]; g_st.nq = 1; }
+            else g_st.nq = 0;
+        }
+
+        g_st.q[g_st.nq++] = v;
+
+        if (!kick || g_st.nq < need)
+            return;
+
+        if (type == 6)
+            gs_draw_sprite(ci, g_st.q[0], g_st.q[1]);
+        else if (type >= 3)
+            gs_draw_triangle(ci, g_st.q[0], g_st.q[1], g_st.q[2]);
+        else if (type == 0)
+            gs_pixel(ci, (int)v.x, (int)v.y, v.r, v.g, v.b, v.a, v.u, v.v);
+        else
+            g_st.unsupported++;   // linhas: ainda nao
+
+        if (type == 6 || type == 3 || type == 1 || type == 0)
+            g_st.nq = 0;
+    }
+
+    void gs_xfer_begin()
+    {
+        gs_init_tables();
+        g_st.dbp = (uint32_t)((g_st.bitbltbuf >> 32) & 0x3FFF);
+        g_st.dbw = (uint32_t)((g_st.bitbltbuf >> 48) & 0x3F);
+        g_st.dpsm = (uint32_t)((g_st.bitbltbuf >> 56) & 0x3F);
+        g_st.x0 = g_st.x = (uint32_t)((g_st.trxpos >> 32) & 0x7FF);
+        g_st.y = (uint32_t)((g_st.trxpos >> 48) & 0x7FF);
+        g_st.rrw = (uint32_t)(g_st.trxreg & 0xFFF);
+        g_st.rrh = (uint32_t)((g_st.trxreg >> 32) & 0xFFF);
+        g_st.npend = 0;
+        uint32_t dir = (uint32_t)(g_st.trxdir & 3);
+
+        if (dir == 0)
+        {
+            g_st.xfer = g_st.rrw != 0 && g_st.rrh != 0;
+            g_st.y -= (g_st.xfer ? 0u : 0u);
+            g_st.rrh += g_st.y;   // passa a ser o y final (exclusivo)
+        }
+        else if (dir == 2)   // local -> local
+        {
+            uint32_t sbp = (uint32_t)(g_st.bitbltbuf & 0x3FFF), sbw = (uint32_t)((g_st.bitbltbuf >> 16) & 0x3F);
+            uint32_t spsm = (uint32_t)((g_st.bitbltbuf >> 24) & 0x3F);
+            uint32_t sx = (uint32_t)(g_st.trxpos & 0x7FF), sy = (uint32_t)((g_st.trxpos >> 16) & 0x7FF);
+            uint32_t dx = g_st.x0, dy = (uint32_t)((g_st.trxpos >> 48) & 0x7FF);
+
+            for (uint32_t yy = 0; yy < ((g_st.trxreg >> 32) & 0xFFF); yy++)
+                for (uint32_t xx = 0; xx < g_st.rrw; xx++)
+                    gs_write_px(g_st.dpsm, g_st.dbp, g_st.dbw, dx + xx, dy + yy, gs_read_px(spsm, sbp, sbw, sx + xx, sy + yy));
+        }
+    }
+
+    void gs_xfer_pixel(uint32_t v)
+    {
+        gs_write_px(g_st.dpsm, g_st.dbp, g_st.dbw, g_st.x, g_st.y, v);
+
+        if (++g_st.x >= g_st.x0 + g_st.rrw)
+        {
+            g_st.x = g_st.x0;
+
+            if (++g_st.y >= g_st.rrh)
+                g_st.xfer = false;
+        }
+    }
+
+    void gs_core_image(uint64_t lo, uint64_t hi)
+    {
+        if (!g_st.xfer)
+            return;
+
+        uint8_t bytes[16];
+        std::memcpy(bytes, &lo, 8);
+        std::memcpy(bytes + 8, &hi, 8);
+
+        for (int i = 0; i < 16 && g_st.xfer; i++)
+        {
+            g_st.pend[g_st.npend++] = bytes[i];
+            uint32_t psm = g_st.dpsm;
+
+            if (psm == 0x00 && g_st.npend == 4)
+            {
+                uint32_t v; std::memcpy(&v, g_st.pend, 4); g_st.npend = 0; gs_xfer_pixel(v);
+            }
+            else if (psm == 0x01 && g_st.npend == 3)
+            {
+                uint32_t v = g_st.pend[0] | (g_st.pend[1] << 8) | (g_st.pend[2] << 16); g_st.npend = 0; gs_xfer_pixel(v);
+            }
+            else if ((psm == 0x02 || psm == 0x0A) && g_st.npend == 2)
+            {
+                uint32_t v = g_st.pend[0] | (g_st.pend[1] << 8); g_st.npend = 0; gs_xfer_pixel(v);
+            }
+            else if (psm == 0x13 || psm == 0x1B)
+            {
+                g_st.npend = 0; gs_xfer_pixel(bytes[i]);
+            }
+            else if (psm == 0x14 || psm == 0x24 || psm == 0x2C)
+            {
+                g_st.npend = 0;
+                gs_xfer_pixel(bytes[i] & 0xF);
+
+                if (g_st.xfer)
+                    gs_xfer_pixel(bytes[i] >> 4);
+            }
+            else if (psm != 0x00 && psm != 0x01 && psm != 0x02 && psm != 0x0A)
+            {
+                g_st.npend = 0;
+                g_st.unsupported++;
+            }
+        }
+    }
+
+    void gs_core_write(unsigned reg, uint64_t data)
+    {
+        gs_init_tables();
+
+        switch (reg)
+        {
+            case 0x00: g_st.prim = data & 0x7FF; g_st.nq = 0; break;
+            case 0x01: g_st.rgbaq = data; break;
+            case 0x02: g_st.st = data; break;
+            case 0x03: g_st.uv = data; break;
+            case 0x04: case 0x05: gs_vertex(data, true); break;
+            case 0x0C: case 0x0D: gs_vertex(data, false); break;
+            case 0x06: case 0x07:
+            {
+                GsCtx& c = g_st.ctx[reg - 6];
+                c.tex0 = data;
+                uint32_t cld = (uint32_t)(data >> 61);
+
+                if (cld != 0)
+                    gs_load_clut(data);
+
+                break;
+            }
+            case 0x08: case 0x09: g_st.ctx[reg - 8].clamp = data; break;
+            case 0x14: case 0x15: g_st.ctx[reg - 0x14].tex1 = data; break;
+            case 0x18: case 0x19: g_st.ctx[reg - 0x18].xyoffset = data; break;
+            case 0x3B: g_st.texa = data; break;
+            case 0x40: case 0x41: g_st.ctx[reg - 0x40].scissor = data; break;
+            case 0x42: case 0x43: g_st.ctx[reg - 0x42].alpha = data; break;
+            case 0x46: g_st.colclamp = data; break;
+            case 0x47: case 0x48: g_st.ctx[reg - 0x47].test = data; break;
+            case 0x4C: case 0x4D: g_st.ctx[reg - 0x4C].frame = data; break;
+            case 0x4E: case 0x4F: g_st.ctx[reg - 0x4E].zbuf = data; break;
+            case 0x50: g_st.bitbltbuf = data; break;
+            case 0x51: g_st.trxpos = data; break;
+            case 0x52: g_st.trxreg = data; break;
+            case 0x53: g_st.trxdir = data; gs_xfer_begin(); break;
+            default: break;
+        }
+    }
+
+    // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
+    void gs_dump_frame(unsigned index)
+    {
+        // PMODE.EN1/EN2 escolhem o circuito; DISPFBn / DISPLAYn dizem onde e quanto
+        uint64_t pmode = g_gs_priv[0x00 / 8];
+        uint64_t dispfb = 0, display = 0;
+        uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0, w = 0, h = 0;
+        bool valid = false;
+
+        // tenta primeiro o circuito habilitado em PMODE (EN1 = bit 0, EN2 = bit 1); se os parametros
+        // nao fizerem sentido, tenta o outro
+        for (int pass = 0; pass < 2 && !valid; pass++)
+        {
+            bool c1 = pass == 0 ? (pmode & 1) != 0 : (pmode & 1) == 0;
+            dispfb = g_gs_priv[(c1 ? 0x70 : 0x90) / 8];
+            display = g_gs_priv[(c1 ? 0x80 : 0xA0) / 8];
+
+            fbp = (uint32_t)(dispfb & 0x1FF) * 32;
+            fbw = (uint32_t)((dispfb >> 9) & 0x3F);
+            psm = (uint32_t)((dispfb >> 15) & 0x1F);
+            dbx = (uint32_t)((dispfb >> 32) & 0x7FF);
+            dby = (uint32_t)((dispfb >> 43) & 0x7FF);
+            uint32_t magh = (uint32_t)((display >> 23) & 0xF) + 1;
+            w = ((uint32_t)((display >> 32) & 0xFFF) + 1) / magh;
+            h = (uint32_t)((display >> 44) & 0x7FF) + 1;
+            valid = w != 0 && w <= 1024 && h != 0 && h <= 1024 && fbw != 0;
+        }
+
+        if (!valid)
+        {
+            std::fprintf(stderr, "  [gs] dump %u: parametros de exibicao invalidos (PMODE=0x%llX DISPFB=0x%llX DISPLAY=0x%llX)\n",
+                index, (unsigned long long)pmode, (unsigned long long)dispfb, (unsigned long long)display);
+            return;
+        }
+
+        char name[64];
+        std::snprintf(name, sizeof(name), "gs_%03u.ppm", index);
+        FILE* f = std::fopen(name, "wb");
+
+        if (f == nullptr)
+            return;
+
+        std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++)
+            {
+                uint32_t v = gs_read_px(psm, fbp, fbw, dbx + x, dby + y);
+                uint8_t px[3];
+
+                if (psm == 0x02 || psm == 0x0A)
+                {
+                    px[0] = (uint8_t)((v & 31) << 3); px[1] = (uint8_t)(((v >> 5) & 31) << 3); px[2] = (uint8_t)(((v >> 10) & 31) << 3);
+                }
+                else
+                {
+                    px[0] = (uint8_t)v; px[1] = (uint8_t)(v >> 8); px[2] = (uint8_t)(v >> 16);
+                }
+
+                std::fwrite(px, 1, 3, f);
+            }
+
+        std::fclose(f);
+        std::fprintf(stderr, "  [gs] dump %u: %s (%ux%u, PSM=0x%02X, FBP=%u, FBW=%u, nao suportado ate agora: %llu)\n", index, name, w, h, psm, fbp / 32,
+            fbw, (unsigned long long)g_st.unsupported);
+    }
+
+    void gs_write(unsigned reg, uint64_t data)
+    {
+        reg &= 0xFF;
+        g_gs.reg[reg]++;
+        gs_core_write(reg, data);
+
+        if (reg == 0x00)
+            g_gs.prim[data & 7]++;
+
+        if (!g_giflog || g_giflog_budget == 0)
+            return;
+
+        g_giflog_budget--;
+
+        char extra[160] = "";
+
+        switch (reg)
+        {
+            case 0x4C: case 0x4D:
+                std::snprintf(extra, sizeof(extra), "  FBP=%u FBW=%u PSM=0x%02X", (unsigned)(data & 0x1FF),
+                    (unsigned)((data >> 16) & 0x3F), (unsigned)((data >> 24) & 0x3F));
+                break;
+            case 0x06: case 0x07:
+                std::snprintf(extra, sizeof(extra), "  TBP0=%u TBW=%u PSM=0x%02X TW=%u TH=%u",
+                    (unsigned)(data & 0x3FFF), (unsigned)((data >> 14) & 0x3F), (unsigned)((data >> 20) & 0x3F),
+                    (unsigned)((data >> 26) & 0xF), (unsigned)((data >> 30) & 0xF));
+                break;
+            case 0x50:
+                std::snprintf(extra, sizeof(extra), "  DBP=%u DBW=%u DPSM=0x%02X", (unsigned)((data >> 32) & 0x3FFF),
+                    (unsigned)((data >> 48) & 0x3F), (unsigned)((data >> 56) & 0x3F));
+                break;
+            case 0x52:
+                std::snprintf(extra, sizeof(extra), "  RRW=%u RRH=%u", (unsigned)(data & 0xFFF),
+                    (unsigned)((data >> 32) & 0xFFF));
+                break;
+            case 0x00:
+                std::snprintf(extra, sizeof(extra), "  tipo=%u", (unsigned)(data & 7));
+                break;
+            default:
+                break;
+        }
+
+        std::fprintf(stderr, "  [gs] %-10s 0x%016llX%s\n", gs_reg_name(reg), (unsigned long long)data, extra);
+    }
+
+    struct GifDecoder
+    {
+        bool active = false;
+        unsigned flg = 0, nreg = 0, reg_idx = 0;
+        uint64_t loops_left = 0, image_left = 0, regs = 0;
+        uint32_t q = 0x3F800000u;
+
+        void qword(uint64_t lo, uint64_t hi)
+        {
+            if (image_left != 0)
+            {
+                image_left--;
+                g_gs.image_qw++;
+                gs_core_image(lo, hi);
+                return;
+            }
+
+            if (!active)
+            {
+                uint64_t nloop = lo & 0x7FFF;
+                bool pre = ((lo >> 46) & 1) != 0;
+                uint64_t prim = (lo >> 47) & 0x7FF;
+                flg = (unsigned)((lo >> 58) & 3);
+                nreg = (unsigned)((lo >> 60) & 0xF);
+
+                if (nreg == 0)
+                    nreg = 16;
+
+                regs = hi;
+
+                if (g_giflog && g_gif_log != 0)
+                {
+                    g_gif_log--;
+                    std::fprintf(stderr, "  [gif] tag lo=0x%016llX hi=0x%016llX nloop=%llu eop=%u pre=%u prim=0x%llX flg=%u nreg=%u\n",
+                        (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)nloop,
+                        (unsigned)((lo >> 15) & 1), pre ? 1u : 0u, (unsigned long long)prim, flg, nreg);
+                }
+
+                if (pre && flg == 0)
+                    gs_write(0x00, prim);
+
+                if (flg == 0)
+                    g_gs.tags_packed++;
+                else if (flg == 1)
+                    g_gs.tags_reglist++;
+                else
+                    g_gs.tags_image++;
+
+                if (nloop == 0)
+                    return;
+
+                if (flg >= 2)
+                {
+                    image_left = nloop;
+                    return;
+                }
+
+                active = true;
+                loops_left = nloop;
+                reg_idx = 0;
+
+                if (flg == 1)
+                    loops_left = (nloop * nreg + 1) / 2;   // REGLIST: dois registradores de 64 bits por qword
+
+                return;
+            }
+
+            if (flg == 0)
+            {
+                unsigned r = (unsigned)((regs >> (reg_idx * 4)) & 0xF);
+
+                switch (r)
+                {
+                    case 0x0: gs_write(0x00, lo & 0x7FF); break;
+                    case 0x1:
+                        gs_write(0x01, (lo & 0xFF) | (((lo >> 32) & 0xFF) << 8) | ((hi & 0xFF) << 16)
+                            | (((hi >> 32) & 0xFF) << 24) | ((uint64_t)q << 32));
+                        break;
+                    case 0x2:
+                        q = (uint32_t)hi;
+                        gs_write(0x02, lo);
+                        break;
+                    case 0x3: gs_write(0x03, (lo & 0x3FFF) | (((lo >> 32) & 0x3FFF) << 16)); break;
+                    case 0x4:
+                        gs_write(((hi >> 47) & 1) ? 0x0C : 0x04, (lo & 0xFFFF) | (((lo >> 32) & 0xFFFF) << 16)
+                            | (((hi >> 4) & 0xFFFFFF) << 32) | (((hi >> 36) & 0xFF) << 56));
+                        break;
+                    case 0x5:
+                        gs_write(((hi >> 47) & 1) ? 0x0D : 0x05, (lo & 0xFFFF) | (((lo >> 32) & 0xFFFF) << 16)
+                            | ((hi & 0xFFFFFFFFull) << 32));
+                        break;
+                    case 0xA: gs_write(0x0A, ((hi >> 36) & 0xFF) << 56); break;
+                    case 0xE: gs_write((unsigned)(hi & 0xFF), lo); break;
+                    default: break;   // 0xF = NOP; 6..9, B..D nao usados
+                }
+
+                if (++reg_idx == nreg)
+                {
+                    reg_idx = 0;
+
+                    if (--loops_left == 0)
+                        active = false;
+                }
+            }
+            else
+            {
+                for (int k = 0; k < 2; k++)
+                {
+                    unsigned r = (unsigned)((regs >> (reg_idx * 4)) & 0xF);
+                    gs_write(r, k == 0 ? lo : hi);
+
+                    if (++reg_idx == nreg)
+                        reg_idx = 0;
+                }
+
+                if (--loops_left == 0)
+                    active = false;
+            }
+        }
+    };
+
+    GifDecoder g_gif;
+
+    struct Vif1Decoder
+    {
+        uint32_t cl = 1, wl = 1;
+        uint64_t skip_words = 0, direct_qw = 0;
+        uint32_t dbuf[4] = {};
+        unsigned dn = 0;
+
+        static unsigned vector_bits(unsigned fmt)
+        {
+            static const unsigned bits[16] = { 32, 16, 8, 0, 64, 32, 16, 0, 96, 48, 24, 0, 128, 64, 32, 16 };
+            return bits[fmt & 15];
+        }
+
+        void word(uint32_t w)
+        {
+            if (direct_qw != 0)
+            {
+                dbuf[dn++] = w;
+
+                if (dn == 4)
+                {
+                    dn = 0;
+                    direct_qw--;
+                    g_gs.direct_qw++;
+                    g_gif.qword((uint64_t)dbuf[0] | ((uint64_t)dbuf[1] << 32), (uint64_t)dbuf[2] | ((uint64_t)dbuf[3] << 32));
+                }
+
+                return;
+            }
+
+            if (skip_words != 0)
+            {
+                skip_words--;
+                return;
+            }
+
+            unsigned cmd = (w >> 24) & 0x7F;
+            unsigned num = (w >> 16) & 0xFF;
+            unsigned imm = w & 0xFFFF;
+
+            if (g_giflog && g_vif_log != 0)
+            {
+                g_vif_log--;
+                std::fprintf(stderr, "  [vif] codigo=0x%08X cmd=0x%02X num=%u imm=0x%04X (cl=%u wl=%u)\n", w, cmd, num, imm, cl, wl);
+            }
+
+            if (cmd >= 0x60)
+            {
+                g_gs.unpack_cmds++;
+                uint64_t n = num == 0 ? 256 : num;
+                uint64_t in_vectors = n;
+
+                if (cl < wl && wl != 0)
+                    in_vectors = (n / wl) * cl + std::min<uint64_t>(n % wl, cl);
+
+                skip_words = (in_vectors * vector_bits(cmd & 15) + 31) / 32;
+                return;
+            }
+
+            switch (cmd)
+            {
+                case 0x01: cl = imm & 0xFF; wl = (imm >> 8) & 0xFF; break;
+                case 0x14: case 0x15: case 0x17: g_gs.mscal++; break;
+                case 0x20: skip_words = 1; break;
+                case 0x30: case 0x31: skip_words = 4; break;
+                case 0x4A:
+                    skip_words = (uint64_t)(num == 0 ? 256 : num) * 2;
+                    g_gs.mpg_words += skip_words;
+                    break;
+                case 0x50: case 0x51:
+                    direct_qw = imm == 0 ? 65536u : imm;
+                    dn = 0;
+                    break;
+                default: break;   // NOP, OFFSET, BASE, ITOP, STMOD, MSKPATH3, MARK, FLUSH*: sem dados
+            }
+        }
+    };
+
+    Vif1Decoder g_vif1;
+
+    uint32_t dma_addr(uint32_t a)
+    {
+        return (a & 0x80000000u) ? (0x70000000u | (a & 0x3FFFu)) : (a & 0x7FFFFFFFu);
+    }
+
+    void dma_feed(Ctx& c, int ch, uint32_t addr, uint32_t qwc)
+    {
+        if (qwc == 0)
+            return;
+
+        const uint8_t* p = host_ptr(c, dma_addr(addr), (size_t)qwc * 16);
+
+        if (g_giflog && g_raw_log != 0)
+        {
+            std::fprintf(stderr, "  [raw] canal %d: %u qw @0x%08X\n", ch, qwc, addr);
+
+            for (uint32_t i = 0; i < qwc && g_raw_log != 0; i++, g_raw_log--)
+            {
+                uint32_t w[4];
+                std::memcpy(w, p + (size_t)i * 16, 16);
+                std::fprintf(stderr, "    %08X %08X %08X %08X\n", w[0], w[1], w[2], w[3]);
+            }
+        }
+
+        for (uint32_t i = 0; i < qwc; i++)
+        {
+            uint32_t w[4];
+            std::memcpy(w, p + (size_t)i * 16, 16);
+
+            if (ch == 2)
+                g_gif.qword((uint64_t)w[0] | ((uint64_t)w[1] << 32), (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+            else
+                for (int k = 0; k < 4; k++)
+                    g_vif1.word(w[k]);
+        }
+    }
+
+    void dma_walk(Ctx& c, int ch, uint32_t chcr)
+    {
+        DmaChan& d = g_dmach[ch];
+        g_gs.kicks[ch]++;
+        unsigned mod = (chcr >> 2) & 3;
+        bool detail = g_giflog && g_dma_detail < 12;
+
+        if (detail)
+        {
+            g_dma_detail++;
+            std::fprintf(stderr, "  [dma] canal %d kick: CHCR=0x%X MADR=0x%08X QWC=%u TADR=0x%08X\n", ch, chcr, d.madr, d.qwc, d.tadr);
+        }
+
+        if (mod == 0)
+        {
+            dma_feed(c, ch, d.madr, d.qwc);
+            return;
+        }
+
+        if (mod != 1)
+            return;
+
+        uint32_t tadr = d.tadr;
+        uint32_t asr[2] = {};
+        int depth = 0;
+
+        for (int guard = 0; guard < 200000; guard++)
+        {
+            const uint8_t* t = host_ptr(c, dma_addr(tadr), 16);
+            uint64_t lo, hi;
+            std::memcpy(&lo, t, 8);
+            std::memcpy(&hi, t + 8, 8);
+
+            uint32_t qwc = (uint32_t)(lo & 0xFFFF);
+            unsigned id = (unsigned)((lo >> 28) & 7);
+            uint32_t addr = (uint32_t)(lo >> 32);
+
+            if (detail && guard < 8)
+                std::fprintf(stderr, "    tag @0x%08X: id=%u qwc=%u addr=0x%08X  (VIFcodes da tag: 0x%08X 0x%08X)\n",
+                    tadr, id, qwc, addr, (uint32_t)hi, (uint32_t)(hi >> 32));
+
+            // No VIF1 a metade alta da DMAtag (bits 64..127) leva dois VIFcodes, tipicamente
+            // [NOP, DIRECT(qwc)] (convencao da libgraph): eles chegam ao VIF antes dos dados da tag.
+            // E isso que faz os pacotes GIF "puros" dos dados serem aceitos pelo PATH2.
+            if (ch == 1)
+            {
+                g_vif1.word((uint32_t)hi);
+                g_vif1.word((uint32_t)(hi >> 32));
+            }
+
+            switch (id)
+            {
+                case 0: dma_feed(c, ch, addr, qwc); return;                                  // refe
+                case 1: dma_feed(c, ch, tadr + 16, qwc); tadr += 16 + qwc * 16; break;      // cnt
+                case 2: dma_feed(c, ch, tadr + 16, qwc); tadr = addr; break;                // next
+                case 3: case 4: dma_feed(c, ch, addr, qwc); tadr += 16; break;              // ref, refs
+                case 5:                                                                      // call
+                    dma_feed(c, ch, tadr + 16, qwc);
+
+                    if (depth < 2)
+                        asr[depth++] = tadr + 16 + qwc * 16;
+
+                    tadr = addr;
+                    break;
+                case 6:                                                                      // ret
+                    dma_feed(c, ch, tadr + 16, qwc);
+
+                    if (depth == 0)
+                        return;
+
+                    tadr = asr[--depth];
+                    break;
+                default: dma_feed(c, ch, tadr + 16, qwc); return;                           // end
+            }
+        }
+    }
+}
+
+void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
+{
+    // registradores privilegiados do GS (PMODE, DISPFB1/2, DISPLAY1/2...): dizem qual area e exibida
+    if (g_gsrun && phys >= 0x12000000u && phys < 0x12000100u && (phys & 7u) == 0)
+    {
+        g_gs_priv[(phys - 0x12000000u) >> 3] = value;
+        return;
+    }
+
+    if (!g_gsrun || phys < 0x10008000u || phys >= 0x1000B000u || (phys & 0xFFFu) >= 0x60u)
+        return;
+
+    int ch = (int)((phys - 0x10008000u) >> 12);
+    uint32_t reg = phys & 0xFFFu;
+
+    if (ch == 0)
+        return;
+
+    DmaChan& d = g_dmach[ch];
+
+    switch (reg)
+    {
+        case 0x10: d.madr = (uint32_t)value; break;
+        case 0x20: d.qwc = (uint32_t)value; break;
+        case 0x30: d.tadr = (uint32_t)value; break;
+        case 0x00:
+            if (value & 0x100)
+            {
+                std::lock_guard<std::mutex> lk(g_gs_mu);
+                dma_walk(c, ch, (uint32_t)value);
+            }
+
+            break;
+        default: break;
+    }
+}
+
+// Resumo a cada 120 vsyncs (2 s): o que o jogo mandou desenhar nesse intervalo.
+void ps2_gs_vsync()
+{
+    if (!g_gsrun)
+        return;
+
+    ++g_gs_vsyncs;
+
+    if (g_gsdump)
+    {
+        static unsigned dumps = 0;
+        static unsigned period = 0;
+
+        if (period == 0)
+        {
+            const char* e = std::getenv("PS2_GSDUMP");
+            unsigned secs = e != nullptr ? (unsigned)std::strtoul(e, nullptr, 0) : 5u;
+            period = (secs == 0 ? 5u : secs) * 60u;
+        }
+
+        if (g_gs_vsyncs % period == 0 && dumps < 60)
+        {
+            std::lock_guard<std::mutex> lk(g_gs_mu);
+            gs_dump_frame(dumps++);
+        }
+    }
+
+    if (!g_giflog || g_gs_vsyncs % 120u != 0)
+        return;
+
+    std::lock_guard<std::mutex> lk(g_gs_mu);
+    static const char* ptype[8] = { "ponto", "linha", "tira-linha", "triangulo", "tira-tri", "leque-tri", "sprite", "?" };
+
+    std::fprintf(stderr, "  [gs] 2s: kicks vif1=%llu gif=%llu | GIFtags packed=%llu reglist=%llu image=%llu (imagem=%llu qw) | direct=%llu qw mpg=%llu w unpack=%llu mscal=%llu\n",
+        (unsigned long long)g_gs.kicks[1], (unsigned long long)g_gs.kicks[2], (unsigned long long)g_gs.tags_packed,
+        (unsigned long long)g_gs.tags_reglist, (unsigned long long)g_gs.tags_image, (unsigned long long)g_gs.image_qw,
+        (unsigned long long)g_gs.direct_qw, (unsigned long long)g_gs.mpg_words, (unsigned long long)g_gs.unpack_cmds,
+        (unsigned long long)g_gs.mscal);
+
+    std::fprintf(stderr, "  [gs] 2s: PRIM:");
+
+    for (int i = 0; i < 8; i++)
+        if (g_gs.prim[i] != 0)
+            std::fprintf(stderr, " %s=%llu", ptype[i], (unsigned long long)g_gs.prim[i]);
+
+    std::fprintf(stderr, " | registradores:");
+
+    for (int n = 0; n < 8; n++)
+    {
+        int best = -1;
+
+        for (int r = 0; r < 256; r++)
+            if (g_gs.reg[r] != 0 && (best < 0 || g_gs.reg[r] > g_gs.reg[best]))
+                best = r;
+
+        if (best < 0)
+            break;
+
+        std::fprintf(stderr, " %s=%llu", gs_reg_name((unsigned)best), (unsigned long long)g_gs.reg[best]);
+        g_gs.reg[best] = 0;   // so para o ranking; os totais por registrador nao importam depois do resumo
+    }
+
+    std::fprintf(stderr, "\n");
+    std::memset(g_gs.prim, 0, sizeof(g_gs.prim));
+    std::memset(g_gs.reg, 0, sizeof(g_gs.reg));
+}
+
+void ps2_break(Ctx& c, uint32_t address)
+{
+    // MWCC usa BREAK 7 depois de DIV para "divisao por zero"; outros codigos sao asserts do jogo.
+    uint32_t word = mrd<uint32_t>(c, address);
+    uint32_t code = (word >> 6) & 0xFFFFFu;
+
+    std::fprintf(stderr, "BREAK em 0x%08X codigo=%u%s\n", address, code,
+        code == 7 ? " (divisao por zero)" : code == 6 ? " (overflow)" : "");
+
+    static const char* names[32] = { "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3",
+        "t4", "t5", "t6", "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1",
+        "gp", "sp", "fp", "ra" };
+
+    for (int i = 1; i < 32; i++)
+        std::fprintf(stderr, "  %-4s= 0x%08X%s", names[i], (unsigned)c.r[i].lo, (i % 4 == 3) ? "\n" : "");
+
+    std::fprintf(stderr, "\n");
     die();
 }
 
@@ -3237,23 +4922,119 @@ void ps2_unsupported(Ctx&, uint32_t address, const char* mnemonic)
     die();
 }
 
+// Stub: ainda nao ha micro memoria nem interpretador do VU0. Registra a chamada e "termina"
+// o microprograma na hora (VBS0 de VPU_STAT = vi[29] limpo), para o jogo seguir adiante.
+void vu0_callms(Ctx& c, uint32_t address, uint32_t raw)
+{
+    static unsigned count = 0;
+    static uint32_t seen[64];
+    static unsigned seen_n = 0;
+
+    count++;
+    bool is_new = true;
+    for (unsigned i = 0; i < seen_n; i++)
+        if (seen[i] == address) { is_new = false; break; }
+
+    if (is_new && seen_n < 64)
+    {
+        seen[seen_n++] = address;
+        std::fprintf(stderr, "  [VU0 stub] %s micro=0x%04X CMSAR0=0x%X (chamada %u; ra=0x%08X)\n",
+                     raw ? "VCALLMS" : "VCALLMSR", address, c.vi[27], count, (uint32_t)c.r[31].lo);
+    }
+
+    c.vi[29] &= ~1u;   // VPU_STAT.VBS0: VU0 ocioso
+}
+
 // Estado das interrupcoes: DIntr/EIntr do SDK usam DI/EI e leem o registrador Status (bit 16 = EIE).
 static bool g_irq_enabled = true;
 
 void ps2_ei(Ctx&) { g_irq_enabled = true; }
 void ps2_di(Ctx&) { g_irq_enabled = false; }
 
+// Diagnostico: quantas vezes cada causa foi entregue e quando foi a ultima.
+static unsigned g_irq_count[32] = {};
+
+struct DeferredCall { int frames; uint32_t fn; uint32_t arg; };
+static std::vector<DeferredCall> g_deferred;
+static std::mutex g_deferred_mu;
+
+void ps2_defer_call(uint32_t frames, uint32_t fn, uint32_t arg)
+{
+    std::lock_guard<std::mutex> lk(g_deferred_mu);
+    g_deferred.push_back({ (int)frames, fn, arg });
+}
+static uint64_t g_irq_last_ns[32] = {};
+
+static void irq_debug_print()
+{
+    uint64_t now = hw_now_ns();
+
+    std::fprintf(stderr, "interrupcoes: EIE=%d dentro_de_handler=%d mascara_intc=0x%X pendente=%d flags=0x%X\n",
+                 g_irq_enabled ? 1 : 0, g_in_irq ? 1 : 0, g_intc_mask, (int)g_irq_pending, g_irq_flags.load());
+    std::fprintf(stderr, "  timer0: modo=0x%llX comparacao=0x%llX\n", (unsigned long long)g_timer0_mode,
+                 (unsigned long long)g_timer0_comp);
+
+    for (int cause = 0; cause < 32; cause++)
+    {
+        if (g_irq_count[cause] == 0)
+            continue;
+
+        std::fprintf(stderr, "  causa %d: %u entregas, ultima ha %llu ms\n", cause, g_irq_count[cause],
+                     (unsigned long long)((now - g_irq_last_ns[cause]) / 1000000ull));
+    }
+}
+
 // Chama os handlers da causa com uma copia do contexto e uma pilha propria; o contexto da thread
 // interrompida nao e alterado.
 static void irq_deliver_cause(Ctx& c, uint32_t cause)
 {
+    g_irq_count[cause & 31u]++;
+    g_irq_last_ns[cause & 31u] = hw_now_ns();
+
     if (cause == 2)   // o kernel mesmo atualiza as flags do SetVSyncFlag a cada vsync
     {
+        gs_vsync_update();
+
         if (g_vsync_flag1)
             mwr<uint32_t>(c, g_vsync_flag1, 1u);
 
         if (g_vsync_flag2)
             mwr<uint64_t>(c, g_vsync_flag2, 0x2ull | ((uint64_t)g_gs_field << 13));
+    }
+
+    // chamadas agendadas por ps2_defer_call: contam um vsync por entrega
+    if (cause == 2)
+    {
+        ps2_gs_vsync();
+
+        std::vector<DeferredCall> due;
+
+        {
+            std::lock_guard<std::mutex> lk(g_deferred_mu);
+
+            for (size_t i = 0; i < g_deferred.size();)
+            {
+                if (--g_deferred[i].frames <= 0)
+                {
+                    due.push_back(g_deferred[i]);
+                    g_deferred.erase(g_deferred.begin() + (std::ptrdiff_t)i);
+                }
+                else
+                    i++;
+            }
+        }
+
+        for (size_t i = 0; i < due.size(); i++)
+        {
+            std::fprintf(stderr, "  [adiado] chamando 0x%08X(0x%X)\n", due[i].fn, due[i].arg);
+
+            Ctx irq = c;
+            irq.r[29].lo = 0x01FF0000u - 0x10u;
+            irq.r[4].lo = due[i].arg;
+            irq.r[5].lo = 0;
+            irq.r[6].lo = 0;
+            ps2_call(irq, due[i].fn);
+        }
     }
 
     if (!(g_intc_mask & (1u << cause)))
@@ -3617,6 +5398,10 @@ void ps2_mtc0(Ctx&, int, uint32_t) {}
         return name switch
         {
             "VNOP" or "VWAITQ" => "",
+
+            // Microprogramas do VU0: por enquanto so um stub que registra a chamada (ps2_hle: vu0_callms).
+            "VCALLMS" => $"vu0_callms(c, 0x{((i.Raw >> 6) & 0x7FFF) * 8:X}u, 0x{i.Raw:X8}u);",
+            "VCALLMSR" => "vu0_callms(c, c.vi[27] * 8u, 0u);",
 
             "VOPMSUB" => $"vu_opmsub(c, {fd}, {fs}, {ft});",
             "VOPMULA" => $"vu_opmula(c, {fs}, {ft});",

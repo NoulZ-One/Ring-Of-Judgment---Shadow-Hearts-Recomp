@@ -151,6 +151,22 @@ try
             if (line.Length == 0 || line.StartsWith('#'))
                 continue;
 
+            // Curinga: "*MpegPlay*" lista simbolos (endereco, tamanho, nome) em vez de desmontar.
+            if (line.Contains('*'))
+            {
+                string pattern = "^" + System.Text.RegularExpressions.Regex.Escape(line).Replace("\\*", ".*") + "$";
+
+                Console.WriteLine();
+                Console.WriteLine($"=== simbolos que casam com {line} ===");
+
+                foreach (ElfSymbol match in functions
+                    .Where(f => System.Text.RegularExpressions.Regex.IsMatch(f.Name, pattern))
+                    .OrderBy(f => f.Address))
+                    Console.WriteLine($"0x{match.Address:X8}  {match.Size,6}  {match.Name}");
+
+                continue;
+            }
+
             if (line.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
                 && uint.TryParse(line.AsSpan(2), System.Globalization.NumberStyles.HexNumber, null, out uint wanted))
             {
@@ -413,10 +429,13 @@ EeCensus.Microcode(image, symbols);
 EeCensus.VuPrograms(symbols);
 EeCensus.SyscallCallers(elfBytes, sections, symbols, functions);
 
-EeCensus.ShowFunction(image, functions, "getBuffer__9FileIOLibFP7_FIOHND");
-EeCensus.ShowFunction(image, functions, "getSize__9FileIOLibFP7_FIOHND");
-EeCensus.ShowFunction(image, functions, "SearchFile__9FileIOLibFPcP10_CDVDRINFO");
-EeCensus.ShowFunction(image, functions, "open__9FileIOLibFPcPv");
+// Funcoes para desmontar: variavel SH_DISASM (nomes separados por virgula). O padrao e o laco de vsync.
+string[] disasmNames = (Environment.GetEnvironmentVariable("SH_DISASM")
+        ?? "VSync__3GsxFi,cbVSync__Fi,TimerWatcherV__6CTimerFi,TimerWatcher0__6CTimerFi")
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+foreach (string disasmName in disasmNames)
+    EeCensus.ShowFunction(image, functions, disasmName);
 
 
 //EeCensus.CallSequenceAll(image, functions, "__9FileIOLib");

@@ -82,6 +82,96 @@ public static class Hle
                     c.r[2].lo = std::strlen(text);
                 """,
 
+            // FMV (temporario): o IPU ainda nao e emulado, entao o sceMpeg do SDK gira para sempre
+            // procurando start code. Start__8MpegPlayFPc(this, caminho) vira "filme que acaba sozinho":
+            //   - devolve 1 (sucesso, como o original);
+            //   - zera this+428 (como o original) e nao cria o StreamRead (this+32448 fica nulo);
+            //   - agenda o callback de fim (this+32464, ex.: VioWarn::MovieCBEnd) para daqui a
+            //     PS2_FMV_FRAMES vsyncs (padrao 30), pois o chamador zera a flag de fim logo apos o retorno.
+            // Quem espera o fim (VioWarn, state 1) segue quando o callback roda. Remover ao emular o IPU.
+            ["Start__8MpegPlayFPc"] = """
+                    static unsigned shown = 0;
+                    uint32_t self = (uint32_t)c.r[4].lo;
+                    char path[160];
+                    ps2_cstr(c, (uint32_t)c.r[5].lo, path, sizeof(path));
+                    const char* e = std::getenv("PS2_FMV_FRAMES");
+                    uint32_t frames = e ? (uint32_t)std::strtoul(e, nullptr, 0) : 30u;
+                    uint32_t endCb = mrd<uint32_t>(c, self + 32464u);
+
+                    mwr<uint32_t>(c, self + 428u, 0u);
+
+                    if (endCb != 0)
+                        ps2_defer_call(frames, endCb, 0u);
+
+                    if (shown < 20)
+                    {
+                        shown++;
+                        std::fprintf(stderr, "  [FMV pulado] Start__8MpegPlay(\"%s\") fim=0x%08X em %u vsyncs\n", path, endCb, frames);
+                    }
+
+                    c.r[2].lo = 1;
+                """,
+
+            // FMV (temporario), par do Start acima. myDelete__8MpegPlayFv(this) e chamado pelo chamador
+            // (VioWarn, state 1) quando o filme acaba. No jogo real ele apaga o semaforo, o buffer e a
+            // thread do filme (DeleteThread numa thread que ainda dorme: ela nunca mais acorda) e depende
+            // do Run/ThreadDeleteCallBack para disparar o callback de delete (this+32468, ex.:
+            // VioWarn::MovieCBDelete, que o state 3/4 espera). Aqui: zera this+76 (como o original),
+            // nao libera nada (o objeto fica orfao, sem risco de uso apos liberar) e agenda o callback.
+            ["myDelete__8MpegPlayFv"] = """
+                    static unsigned shown = 0;
+                    uint32_t self = (uint32_t)c.r[4].lo;
+
+                    // o jogo chama myDelete(NULL) em alguns caminhos (visto no log): nada a fazer
+                    if (self == 0)
+                        return;
+
+                    uint32_t delCb = mrd<uint32_t>(c, self + 32468u);
+
+                    // Libera o que o myDelete original libera, sem o DIntr/EIntr, sem o
+                    // 0x3093D0 (vibracao) e sem esperar a thread do filme:
+                    //   DeleteSema(this+0x50); delete this[436] (flag 1); delete[] this[400]
+                    auto call = [&](uint32_t fn, uint32_t a0v, uint32_t a1v)
+                    {
+                        Ctx t = c;
+                        t.r[4].lo = a0v;
+                        t.r[5].lo = a1v;
+                        ps2_call(t, fn);
+                    };
+
+                    call(0x00209A50u, self + 0x50u, 0u);
+
+                    uint32_t obj = mrd<uint32_t>(c, self + 436u);
+
+                    if (obj != 0)
+                        call(0x00234890u, obj, 1u);
+
+                    mwr<uint32_t>(c, self + 436u, 0u);
+                    mwr<uint32_t>(c, self + 432u, 0u);
+
+                    uint32_t arr = mrd<uint32_t>(c, self + 400u);
+
+                    if (arr != 0)
+                        call(0x00487CC0u, arr, 0x00237740u);
+
+                    mwr<uint32_t>(c, self + 400u, 0u);
+                    mwr<uint32_t>(c, self + 76u, 0u);
+
+                    uint32_t stream = mrd<uint32_t>(c, self + 32448u);
+
+                    if (stream != 0)
+                        mwr<uint32_t>(c, stream + 104u, 0u);
+
+                    if (delCb != 0)
+                        ps2_defer_call(2u, delCb, 0u);
+
+                    if (shown < 20)
+                    {
+                        shown++;
+                        std::fprintf(stderr, "  [FMV pulado] myDelete__8MpegPlay(0x%08X) delete=0x%08X em 2 vsyncs\n", self, delCb);
+                    }
+                """,
+
             // libpad: controle nativo (ver ps2_pad no runtime)
             ["scePadInit"] = "    ps2_pad(c, PS2_PAD_INIT);",
             ["scePadEnd"] = "    ps2_pad(c, PS2_PAD_END);",
