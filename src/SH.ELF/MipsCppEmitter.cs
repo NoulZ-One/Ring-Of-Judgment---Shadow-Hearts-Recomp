@@ -1961,6 +1961,7 @@ namespace
 static uint32_t g_stack_base = 0x01F80000u;
 static uint32_t g_heap_start = 0;
 static uint32_t g_heap_end = 0;
+static uint32_t g_gs_crt_int = 0, g_gs_crt_ffmd = 0;   // SetGsCrt: SMODE2.INT e SMODE2.FFMD
 static uint32_t g_next_id = 1;
 static uint64_t g_gs_imr = 0;
 static unsigned g_syscall_log = 0;
@@ -2074,6 +2075,8 @@ void ps2_syscall(Ctx& c)
         case 2:    // SetGsCrt(interlaced, mode, ffmd): por enquanto so registra
             std::fprintf(stderr, "  SetGsCrt interlace=%u modo=%u ffmd=%u\n",
                 (unsigned)c.r[4].lo, (unsigned)c.r[5].lo, (unsigned)c.r[6].lo);
+            g_gs_crt_int = (uint32_t)c.r[4].lo & 1u;
+            g_gs_crt_ffmd = (uint32_t)c.r[6].lo & 1u;
             c.r[2].lo = 0;
             return;
 
@@ -3772,30 +3775,32 @@ namespace
             }
     }
 
+    // bp vem em blocos de 64 palavras (BP/TBP/CBP). So o bp alinhado a pagina (multiplo de 32) tem (bp & 31) == 0;
+    // CLUTs ficam em qualquer bloco, entao o deslocamento dentro da pagina (bp & 31) precisa entrar no endereco.
     inline uint32_t ix_ct32(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
     {
         uint32_t page = (bp >> 5) + (y >> 5) * bw + (x >> 6);
-        return ((page << 11) + ((uint32_t)g_blk32[(y >> 3) & 3][(x >> 3) & 7] << 6) + g_col32[y & 7][x & 7]) & 0xFFFFFu;
+        return ((page << 11) + ((bp & 31u) << 6) + ((uint32_t)g_blk32[(y >> 3) & 3][(x >> 3) & 7] << 6) + g_col32[y & 7][x & 7]) & 0xFFFFFu;
     }
 
     inline uint32_t ix_ct16(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)    // indice de meia-palavra
     {
         uint32_t page = (bp >> 5) + (y >> 6) * bw + (x >> 6);
-        return ((page << 12) + ((uint32_t)g_blk16[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
+        return ((page << 12) + ((bp & 31u) << 7) + ((uint32_t)g_blk16[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
     }
 
     inline uint32_t ix_t8(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de byte
     {
         uint32_t pw = bw >> 1 ? bw >> 1 : 1;
         uint32_t page = (bp >> 5) + (y >> 6) * pw + (x >> 7);
-        return ((page << 13) + ((uint32_t)g_blk8[(y >> 4) & 3][(x >> 4) & 7] << 8) + g_col8[y & 15][x & 15]) & 0x3FFFFFu;
+        return ((page << 13) + ((bp & 31u) << 8) + ((uint32_t)g_blk8[(y >> 4) & 3][(x >> 4) & 7] << 8) + g_col8[y & 15][x & 15]) & 0x3FFFFFu;
     }
 
     inline uint32_t ix_t4(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de nibble
     {
         uint32_t pw = bw >> 1 ? bw >> 1 : 1;
         uint32_t page = (bp >> 5) + (y >> 7) * pw + (x >> 7);
-        return ((page << 14) + ((uint32_t)g_blk4[(y >> 4) & 7][(x >> 5) & 3] << 9) + g_col4[y & 15][x & 31]) & 0x7FFFFFu;
+        return ((page << 14) + ((bp & 31u) << 9) + ((uint32_t)g_blk4[(y >> 4) & 7][(x >> 5) & 3] << 9) + g_col4[y & 15][x & 31]) & 0x7FFFFFu;
     }
 
     inline uint8_t* vram8() { return reinterpret_cast<uint8_t*>(g_vram); }
@@ -3889,7 +3894,7 @@ namespace
         uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0, trxdir = 3;
         GsVertex q[3];
         int nq = 0;
-        uint32_t clut[256] = {};
+        uint32_t clut[512] = {};   // buffer de CLUT do GS: 256 cores de 32 bits ou 512 de 16 bits
         uint64_t clut_tex0 = ~0ull;
 
         // transferencia host -> local em andamento
@@ -3935,7 +3940,7 @@ namespace
             if (!is4)
                 j = (i & 0xE7u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);   // CSM1: bits 3 e 4 trocados
 
-            uint32_t entry = is4 ? i + csa * 16 : j;
+            uint32_t entry = is4 ? i : j;   // memoria: sempre a partir do CBP (o CSA nao desloca a leitura)
             uint32_t x, y, raw;
 
             if (cpsm == 0x00 || cpsm == 0x01)
@@ -3956,7 +3961,7 @@ namespace
                 raw = h;
             }
 
-            g_st.clut[i] = gs_clut_color(cpsm, raw);
+            g_st.clut[is4 ? ((csa * 16 + i) & 0x1FFu) : i] = gs_clut_color(cpsm, raw);   // CSA = posicao no buffer
         }
     }
 
@@ -3980,7 +3985,7 @@ namespace
         };
 
         iu = wrap(iu, w, (unsigned)(c.clamp & 3), (int)((c.clamp >> 4) & 0x3FF), (int)((c.clamp >> 14) & 0x3FF));
-        iv = wrap(iv, h, (unsigned)((c.clamp >> 2) & 3), (int)((c.clamp >> 34) & 0x3FF), (int)((c.clamp >> 44) & 0x3FF));
+        iv = wrap(iv, h, (unsigned)((c.clamp >> 2) & 3), (int)((c.clamp >> 24) & 0x3FF), (int)((c.clamp >> 34) & 0x3FF));
 
         uint32_t raw = gs_read_px(psm, tbp, tbw, (uint32_t)iu, (uint32_t)iv);
 
@@ -4007,7 +4012,7 @@ namespace
                 return r | (g << 8) | (b << 16) | (a << 24);
             }
             case 0x13: case 0x1B: return g_st.clut[raw & 0xFF];
-            case 0x14: case 0x24: case 0x2C: return g_st.clut[raw & 0xF];
+            case 0x14: case 0x24: case 0x2C: return g_st.clut[(((uint32_t)(c.tex0 >> 56) & 0x1Fu) * 16 + (raw & 0xFu)) & 0x1FFu];
             default: return 0xFF00FF | 0x80000000u;   // formato nao suportado: magenta
         }
     }
@@ -4050,6 +4055,8 @@ namespace
         }
 
         // alpha test
+        bool afail_rgb_only = false;
+
         if (c.test & 1)
         {
             int aref = (int)((c.test >> 4) & 0xFF);
@@ -4068,7 +4075,15 @@ namespace
             }
 
             if (!pass)
-                return;   // AFAIL: so o caso KEEP/descartar e tratado
+            {
+                // AFAIL: 0 KEEP, 1 FB_ONLY, 2 ZB_ONLY, 3 RGB_ONLY (nao ha Z buffer aqui: ZB_ONLY nao escreve nada)
+                unsigned afail = (unsigned)((c.test >> 12) & 3);
+
+                if (afail == 0 || afail == 2)
+                    return;
+
+                afail_rgb_only = afail == 3;
+            }
         }
 
         uint32_t fbp = (uint32_t)(c.frame & 0x1FF) * 32, fbw = (uint32_t)((c.frame >> 16) & 0x3F), fpsm = (uint32_t)((c.frame >> 24) & 0x3F);
@@ -4113,10 +4128,141 @@ namespace
         else
             out = (uint32_t)(r | (g << 8) | (b << 16) | (a << 24));
 
+        if (afail_rgb_only)   // AFAIL = RGB_ONLY: o alfa do destino e mantido
+            out = (fpsm == 0x02 || fpsm == 0x0A) ? ((out & 0x7FFFu) | (dst & 0x8000u)) : ((out & 0x00FFFFFFu) | (dst & 0xFF000000u));
+
         if (fbmsk != 0)
             out = (dst & fbmsk) | (out & ~fbmsk);
 
         gs_write_px(fpsm, fbp, fbw, (uint32_t)x, (uint32_t)y, out);
+    }
+
+    // Diagnostico do GS. Dois modos:
+    //  PS2_GSTRACE=<quantos> [PS2_GSTRACE_SKIP=<n>]: imprime o estado de cada desenho (sprite/triangulo), a partir do n-esimo.
+    //  PS2_GSTRACE_DUMP=1: guarda os ultimos desenhos e, a cada dump de quadro (PS2_GSDUMP), imprime os dos 2 ultimos vsyncs.
+    static std::deque<std::pair<unsigned, std::string>> g_trace_ring;
+    static std::string g_trace_chain;   // quem disparou o DMA que esta sendo processado (ver gs_trace_set_caller)
+
+    static bool gs_trace_enabled()
+    {
+        static int on = -1;
+
+        if (on < 0)
+            on = (std::getenv("PS2_GSTRACE") != nullptr || std::getenv("PS2_GSTRACE_DUMP") != nullptr) ? 1 : 0;
+
+        return on == 1;
+    }
+
+    // Cadeia de chamadores de quem escreveu no CHCR do DMA: $ra e, varrendo a pilha, enderecos de retorno plausiveis
+    // (a palavra anterior ao retorno e um JAL/JALR). Heuristica de depurador: funciona sem informacao de frame.
+    static void gs_trace_set_caller(Ctx& c)
+    {
+        if (!gs_trace_enabled())
+            return;
+
+        g_trace_chain.clear();
+        const char* last = nullptr;
+        int shown = 0;
+        char tmp[160];
+
+        auto add = [&](uint32_t ret)
+        {
+            const Ps2FuncEntry* e = find_containing(ret - 8);
+
+            if (e == nullptr || e->name == nullptr || e->name == last || shown >= 10)
+                return;
+
+            last = e->name;
+            std::snprintf(tmp, sizeof(tmp), "%s%s@%08X", shown ? " < " : "", e->name, (unsigned)(ret - 8));
+            g_trace_chain += tmp;
+            shown++;
+        };
+
+        add((uint32_t)c.r[31].lo);
+        uint32_t sp = (uint32_t)c.r[29].lo & 0x01FFFFFFu;
+
+        for (uint32_t i = 0; i < 1024 && shown < 10 && sp + i * 4 + 4 <= 0x02000000u; i++)
+        {
+            uint32_t w;
+            std::memcpy(&w, c.mem + sp + i * 4, 4);
+
+            if ((w & 3u) != 0 || w < 0x00100010u || w >= 0x01FFFFF0u)
+                continue;
+
+            uint32_t op;
+            std::memcpy(&op, c.mem + (w - 8), 4);
+
+            if ((op >> 26) == 3u || ((op >> 26) == 0u && (op & 0x3Fu) == 9u))   // JAL / JALR
+                add(w);
+        }
+    }
+
+    void gs_trace_draw(const char* kind, int ci, float x0, float y0, float x1, float y1)
+    {
+        static bool init = false;
+        static long skip = 0, count = 0, seen = 0;
+        static bool ring = false;
+
+        if (!init)
+        {
+            const char* t = std::getenv("PS2_GSTRACE");
+            const char* k = std::getenv("PS2_GSTRACE_SKIP");
+            count = t ? std::atol(t) : 0;
+            skip = k ? std::atol(k) : 0;
+            ring = std::getenv("PS2_GSTRACE_DUMP") != nullptr;
+            init = true;
+        }
+
+        if (count <= 0 && !ring)
+            return;
+
+        long n = seen++;
+        bool direct = count > 0 && n >= skip;
+
+        if (!direct && !ring)
+            return;
+
+        if (direct)
+            count--;
+
+        const GsCtx& c = g_st.ctx[ci];
+        char buf[1700];
+        std::snprintf(buf, sizeof(buf),
+            "  [gs] draw #%ld vs=%u %s ctx=%d prim=0x%03X (%.1f,%.1f)-(%.1f,%.1f) tex0: tbp=%u tbw=%u psm=0x%02X tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%X csa=%u cld=%u"
+            " | tex1=0x%llX clamp=0x%llX alpha=0x%llX test=0x%llX texa=0x%llX | frame: fbp=%u fbw=%u psm=0x%02X fbmsk=0x%08X | chamada: %s",
+            n, g_gs_vsyncs, kind, ci, (unsigned)g_st.prim, x0, y0, x1, y1,
+            (unsigned)(c.tex0 & 0x3FFF), (unsigned)((c.tex0 >> 14) & 0x3F), (unsigned)((c.tex0 >> 20) & 0x3F),
+            (unsigned)((c.tex0 >> 26) & 0xF), (unsigned)((c.tex0 >> 30) & 0xF), (unsigned)((c.tex0 >> 34) & 1), (unsigned)((c.tex0 >> 35) & 3),
+            (unsigned)((c.tex0 >> 37) & 0x3FFF), (unsigned)((c.tex0 >> 51) & 0xF), (unsigned)((c.tex0 >> 56) & 0x1F), (unsigned)(c.tex0 >> 61),
+            (unsigned long long)c.tex1, (unsigned long long)c.clamp, (unsigned long long)c.alpha, (unsigned long long)c.test, (unsigned long long)g_st.texa,
+            (unsigned)(c.frame & 0x1FF), (unsigned)((c.frame >> 16) & 0x3F), (unsigned)((c.frame >> 24) & 0x3F), (unsigned)(c.frame >> 32),
+            g_trace_chain.c_str());
+
+        if (direct)
+            std::fprintf(stderr, "%s\n", buf);
+
+        if (ring)
+        {
+            g_trace_ring.emplace_back(g_gs_vsyncs, std::string(buf));
+
+            if (g_trace_ring.size() > 600)
+                g_trace_ring.pop_front();
+        }
+    }
+
+    // Chamado por gs_dump_frame: imprime os desenhos dos 2 ultimos vsyncs (o quadro que acabou de ser exibido).
+    void gs_trace_flush(unsigned index)
+    {
+        if (g_trace_ring.empty())
+            return;
+
+        std::fprintf(stderr, "  [gs] desenhos recentes antes do dump %u (vsync %u):\n", index, g_gs_vsyncs);
+
+        for (const auto& e : g_trace_ring)
+            if (e.first + 2 >= g_gs_vsyncs)
+                std::fprintf(stderr, "%s\n", e.second.c_str());
+
+        g_trace_ring.clear();
     }
 
     void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
@@ -4125,6 +4271,8 @@ namespace
 
         if (x1 <= x0 || y1 <= y0)
             return;
+
+        gs_trace_draw("sprite", ci, x0, y0, x1, y1);
 
         int px0 = (int)std::ceil(x0 - 0.5f), px1 = (int)std::ceil(x1 - 0.5f);
         int py0 = (int)std::ceil(y0 - 0.5f), py1 = (int)std::ceil(y1 - 0.5f);
@@ -4144,6 +4292,8 @@ namespace
 
         if (area == 0.0f)
             return;
+
+        gs_trace_draw("tri", ci, std::min(a.x, std::min(b.x, c.x)), std::min(a.y, std::min(b.y, c.y)), std::max(a.x, std::max(b.x, c.x)), std::max(a.y, std::max(b.y, c.y)));
 
         int minx = (int)std::floor(std::min(a.x, std::min(b.x, c.x))), maxx = (int)std::ceil(std::max(a.x, std::max(b.x, c.x)));
         int miny = (int)std::floor(std::min(a.y, std::min(b.y, c.y))), maxy = (int)std::ceil(std::max(a.y, std::max(b.y, c.y)));
@@ -4365,10 +4515,12 @@ namespace
     // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
     void gs_dump_frame(unsigned index)
     {
+        gs_trace_flush(index);
+
         // PMODE.EN1/EN2 escolhem o circuito; DISPFBn / DISPLAYn dizem onde e quanto
         uint64_t pmode = g_gs_priv[0x00 / 8];
         uint64_t dispfb = 0, display = 0;
-        uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0, w = 0, h = 0;
+        uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0, w = 0, h = 0, magv = 1;
         bool valid = false;
 
         // tenta primeiro o circuito habilitado em PMODE (EN1 = bit 0, EN2 = bit 1); se os parametros
@@ -4386,6 +4538,11 @@ namespace
             dby = (uint32_t)((dispfb >> 43) & 0x7FF);
             uint32_t magh = (uint32_t)((display >> 23) & 0xF) + 1;
             w = ((uint32_t)((display >> 32) & 0xFFF) + 1) / magh;
+            // DISPLAY.DH e a altura de SAIDA (em linhas de exibicao), nao a do buffer. Cada linha do
+            // buffer se repete (MAGV + 1) vezes; alem disso, em interlacado com FFMD = 1 (modo "campo")
+            // o buffer guarda so um campo, ou seja, metade das linhas. Ler DH+1 linhas invade o buffer
+            // vizinho (o jogo usa buffers de 640x224 em FBP 0, 70, 140...). magv = fator total de repeticao.
+            magv = ((uint32_t)((display >> 27) & 0x3) + 1) * ((g_gs_crt_int && g_gs_crt_ffmd) ? 2u : 1u);
             h = (uint32_t)((display >> 44) & 0x7FF) + 1;
             valid = w != 0 && w <= 1024 && h != 0 && h <= 1024 && fbw != 0;
         }
@@ -4409,7 +4566,7 @@ namespace
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < w; x++)
             {
-                uint32_t v = gs_read_px(psm, fbp, fbw, dbx + x, dby + y);
+                uint32_t v = gs_read_px(psm, fbp, fbw, dbx + x, dby + y / magv);
                 uint8_t px[3];
 
                 if (psm == 0x02 || psm == 0x0A)
@@ -4425,8 +4582,8 @@ namespace
             }
 
         std::fclose(f);
-        std::fprintf(stderr, "  [gs] dump %u: %s (%ux%u, PSM=0x%02X, FBP=%u, FBW=%u, nao suportado ate agora: %llu)\n", index, name, w, h, psm, fbp / 32,
-            fbw, (unsigned long long)g_st.unsupported);
+        std::fprintf(stderr, "  [gs] dump %u: %s (%ux%u, buffer %ux%u, repeticao=%u, PSM=0x%02X, FBP=%u, FBW=%u, DISPLAY=0x%llX, nao suportado ate agora: %llu)\n", index, name, w, h,
+            w, (h + magv - 1) / magv, magv, psm, fbp / 32, fbw, (unsigned long long)display, (unsigned long long)g_st.unsupported);
     }
 
     void gs_write(unsigned reg, uint64_t data)
@@ -4821,6 +4978,7 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
             if (value & 0x100)
             {
                 std::lock_guard<std::mutex> lk(g_gs_mu);
+                gs_trace_set_caller(c);
                 dma_walk(c, ch, (uint32_t)value);
             }
 
