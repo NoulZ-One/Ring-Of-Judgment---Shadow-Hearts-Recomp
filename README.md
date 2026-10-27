@@ -131,6 +131,10 @@ Esse avanço demonstra que partes importantes do pipeline gráfico do PlayStatio
 
 Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresenta problemas, como duplicação de elementos, posicionamento incorreto, faixas pretas e áreas não renderizadas corretamente.
 
+## V1 
+- Duplicação corrigida;
+- Paleta de cores das logos corrigidas (aruze e a tela de título do jogo);
+
 ## Próximos objetivos
 
 - Corrigir a seleção e a apresentação dos framebuffers do GS.- Validar o endereçamento e a organização da VRAM.
@@ -217,9 +221,14 @@ The project has hit a significant technical milestone: the first recognizable im
 When running `ps2_game.exe`, the runtime produces files in .PPM format, containing the initial visual output from the game—including the Aruze logo and the *Shadow Hearts* title screen.
 
 This breakthrough demonstrates that key components of the PlayStation 2 graphics pipeline—such as the processing of graphics commands and writing to graphics memory—are already functional within the project’s custom implementation.
-Current Status
+
+## Current Status
 
 Although the initial images are recognizable, the rendering still presents issues, such as duplicated elements, incorrect positioning, black bars, and areas that are not rendered correctly.
+
+V1
+- Duplication fixed;
+- Logo color palettes corrected (Aruze and the game's title screen);
 
 ## Next Objectives
 
