@@ -133,8 +133,7 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 
 ## Próximos objetivos
 
-- Corrigir a seleção e a apresentação dos framebuffers do GS.
-- Validar o endereçamento e a organização da VRAM.
+- Corrigir a seleção e a apresentação dos framebuffers do GS.- Validar o endereçamento e a organização da VRAM.
 - Investigar possíveis problemas nas texturas, transparências e composição gráfica.
 - Eliminar artefatos visuais e imagens duplicadas.
 - Estabilizar a renderização da tela de título.
@@ -150,8 +149,8 @@ Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comporta
 
 ---
 ## Primeiras imagens do jogo / First images of the game 
-<img width="640" height="448" alt="gs_000" src="https://github.com/user-attachments/assets/403e4f18-b585-47be-9feb-7029dd8e407f" />
-<img width="640" height="448" alt="gs_023" src="https://github.com/user-attachments/assets/e3de94f7-2d7b-47d7-8f7f-3797de87d430" />
+<img width="640" height="448" alt="gs_002" src="https://github.com/user-attachments/assets/d78ebecf-8f64-42f5-bd33-7e08db4d28d0" />
+<img width="640" height="448" alt="gs_021" src="https://github.com/user-attachments/assets/98c668bb-c24b-458c-aa5c-34de97369698" />
 
 ---
 # Current Status
