@@ -132,7 +132,7 @@ Esse avanço demonstra que partes importantes do pipeline gráfico do PlayStatio
 Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresenta problemas, como duplicação de elementos, posicionamento incorreto, faixas pretas e áreas não renderizadas corretamente.
 
 ## V1 
-- Duplicação corrigida;
+- Duplicação das imagens corrigida;
 - Paleta de cores das logos corrigidas (aruze e a tela de título do jogo);
 
 ## Próximos objetivos
@@ -227,7 +227,7 @@ This breakthrough demonstrates that key components of the PlayStation 2 graphics
 Although the initial images are recognizable, the rendering still presents issues, such as duplicated elements, incorrect positioning, black bars, and areas that are not rendered correctly.
 
 V1
-- Duplication fixed;
+- Image duplication fixed;
 - Logo color palettes corrected (Aruze and the game's title screen);
 
 ## Next Objectives
