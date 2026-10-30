@@ -77,7 +77,6 @@ Current progress:
 - Foram geradas 4.708 funções C++.
 - 62 funções receberam implementações alternativas via HLE (High-Level Emulation).
 - A geração não registrou falhas.
-- Ainda existem 11 instruções reportadas como não suportadas nessa etapa (9 VCALLMSR, 1 VCALLMS e 1 PMULTH).
 
 > 3. Leitura da ISO e dos arquivos do jogo
 
@@ -148,23 +147,27 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - Fixado o copyright do menu de título;
 - O jogo passa da tela de título. é possível iniciar um novo jogo;
 - A primeira tela e a segunda tela do trem é carregada com sucesso;
-- O yuri agora é visível, embora ele apareça duplicado; 
+- O yuri agora é visível, embora ele apareça duplicado;
+- O menu ingame aparece, embora bastante pixelado; 
 - O jogo inicia a primeira batalha. Quando os personagens entram em pose de combate, o jogo crasha;
 
 
-## Próximos objetivos
+
+## Próximos objetivos / Futuros
 
 - Corrigir a seleção e a apresentação dos framebuffers do GS.- Validar o endereçamento e a organização da VRAM.
 - Investigar possíveis problemas nas texturas, transparências e composição gráfica.
 - Eliminar artefatos visuais e imagens duplicadas.
 - Estabilizar a renderização da tela de título.
-
+- Inserir o Áudio do jogo
 
 **Objetivo imediato**: 
 - Corrigir problema de desempenho. O Gameplay apresentado está muito lento;
 - Fixar os personagens, estão bastantes pixelados;
 - Melhorar os inputs;
 - Fixar o crash da batalha;
+- Fixar o Menu do game pixelado;
+- Fixar o tremor da janela do jogo;
 
 
 ---
@@ -178,6 +181,7 @@ Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comporta
 <img width="640" height="448" alt="gs_002" src="https://github.com/user-attachments/assets/d78ebecf-8f64-42f5-bd33-7e08db4d28d0" />
 <img width="637" height="477" alt="image" src="https://github.com/user-attachments/assets/852a01c4-40df-4c61-ba82-9d4d26334291" />
 <img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/d78a7058-9e35-42e7-8bf4-acc9560e1e31" />
+<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/02e8002a-0ab9-4e6b-976d-b0b090dda5c1" />
 <img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/16ec21c7-0f71-46fb-9e22-b5cb28723d29" />
 
 ---
@@ -266,6 +270,7 @@ Although the initial images are recognizable, the rendering still presents issue
 - The first and second train screens load successfully;
 - Yuri is now visible, though he appears duplicated;
 - The game initiates the first battle. When the characters enter their combat stance, the game crashes;
+- The in-game menu appears, though it is quite pixelated;
 
 ## Next Objectives
 
@@ -274,14 +279,15 @@ Although the initial images are recognizable, the rendering still presents issue
 - Investigate potential issues with textures, transparencies, and graphical composition.
 - Eliminate visual artifacts and duplicated images.
 - Stabilize the rendering of the title screen.
-
+- Insert game audio
 
 ## Immediate Goal: 
 - Fix performance issues; the gameplay is currently very slow;
 - Fix the character visuals—they appear overly pixelated;
 - Improve input responsiveness;
 - Fix the crash that occurs during battle;
-
+- Fix the pixelated game menu;
+- Fix the shaking of the game window;
 ---
 
 ## About the code
