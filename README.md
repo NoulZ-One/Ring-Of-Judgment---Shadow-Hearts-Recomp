@@ -101,6 +101,12 @@ Isso mostra que o jogo já interage com diversas partes do ambiente de execuçã
 Foram observadas chamadas a funções como RenderPrim, RenderPmBlend, GsxSetRmVertex e rotinas relacionadas a DMA e ao processamento gráfico.
 Isso é um marco importante: o fluxo do jogo alcança código relacionado à renderização. Porém, ainda não há comprovação de que os comandos gráficos produzam uma imagem correta na tela.
 
+> 6. O jogo chegou em sua primeira gameplay
+
+O jogo apresentou a sua primeira gameplay. é possível passar da tela de título e chegar a primeira e segunda tela do trem (com sorte se não iniciar alguma batalha)
+
+---
+
 
 | **Subsistema** | **Situação indicada pelos logs** |
 |---|---|
@@ -135,15 +141,31 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - Duplicação das imagens corrigida;
 - Paleta de cores das logos corrigidas (aruze e a tela de título do jogo);
 
+
+## V2
+
+- A janela do jogo agora é exibida sem necessidade de arquivos PPM para visualizar o  jogo e o desenvolvimento;
+- Fixado o copyright do menu de título;
+- O jogo passa da tela de título. é possível iniciar um novo jogo;
+- A primeira tela e a segunda tela do trem é carregada com sucesso;
+- O yuri agora é visível, embora ele apareça duplicado; 
+- O jogo inicia a primeira batalha. Quando os personagens entram em pose de combate, o jogo crasha;
+
+
 ## Próximos objetivos
 
 - Corrigir a seleção e a apresentação dos framebuffers do GS.- Validar o endereçamento e a organização da VRAM.
 - Investigar possíveis problemas nas texturas, transparências e composição gráfica.
 - Eliminar artefatos visuais e imagens duplicadas.
 - Estabilizar a renderização da tela de título.
-- Posteriormente, implementar ou validar os controles para avançar até o menu e o gameplay.
 
-**Objetivo imediato**: obter uma tela de título visualmente correta e estável, utilizando o runtime próprio do projeto.
+
+**Objetivo imediato**: 
+- Corrigir problema de desempenho. O Gameplay apresentado está muito lento;
+- Fixar os personagens, estão bastantes pixelados;
+- Melhorar os inputs;
+- Fixar o crash da batalha;
+
 
 ---
 ## Sobre o código
@@ -154,7 +176,9 @@ Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comporta
 ---
 ## Primeiras imagens do jogo / First images of the game 
 <img width="640" height="448" alt="gs_002" src="https://github.com/user-attachments/assets/d78ebecf-8f64-42f5-bd33-7e08db4d28d0" />
-<img width="640" height="448" alt="gs_021" src="https://github.com/user-attachments/assets/98c668bb-c24b-458c-aa5c-34de97369698" />
+<img width="637" height="477" alt="image" src="https://github.com/user-attachments/assets/852a01c4-40df-4c61-ba82-9d4d26334291" />
+<img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/d78a7058-9e35-42e7-8bf4-acc9560e1e31" />
+<img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/16ec21c7-0f71-46fb-9e22-b5cb28723d29" />
 
 ---
 # Current Status
@@ -193,6 +217,11 @@ This shows that the game already interacts with various parts of the execution e
 Calls to functions such as RenderPrim, RenderPmBlend, and GsxSetRmVertex—along with routines related to DMA and graphics processing—have been observed.
 This is a significant milestone: the game’s execution flow is reaching code associated with rendering. However, there is no confirmation yet that these graphics commands actually produce a correct image on the screen.
 
+> 6. The game has reached its first playable state
+
+The game has unveiled its first gameplay. It is now possible to move past the title screen and reach the first and second screens of the train (provided a battle doesn't trigger).
+
+---
 
 | **Subsystem** | **Status indicated by logs** |
 |---|---|
@@ -226,9 +255,17 @@ This breakthrough demonstrates that key components of the PlayStation 2 graphics
 
 Although the initial images are recognizable, the rendering still presents issues, such as duplicated elements, incorrect positioning, black bars, and areas that are not rendered correctly.
 
-V1
+## V1
 - Image duplication fixed;
 - Logo color palettes corrected (Aruze and the game's title screen);
+
+## V2
+- The game window now displays without requiring PPM files to view the game and its development;
+- Fixed the copyright notice on the title menu;
+- The game proceeds past the title screen; it is possible to start a new game;
+- The first and second train screens load successfully;
+- Yuri is now visible, though he appears duplicated;
+- The game initiates the first battle. When the characters enter their combat stance, the game crashes;
 
 ## Next Objectives
 
@@ -237,9 +274,14 @@ V1
 - Investigate potential issues with textures, transparencies, and graphical composition.
 - Eliminate visual artifacts and duplicated images.
 - Stabilize the rendering of the title screen.
-- Subsequently, implement or validate the controls to progress to the menu and gameplay.
 
-Immediate Goal: Achieve a visually correct and stable title screen, using the project's own runtime.
+
+## Immediate Goal: 
+- Fix performance issues; the gameplay is currently very slow;
+- Fix the character visuals—they appear overly pixelated;
+- Improve input responsiveness;
+- Fix the crash that occurs during battle;
+
 ---
 
 ## About the code
