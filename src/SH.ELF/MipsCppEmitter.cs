@@ -1063,8 +1063,47 @@ static void gs_vsync_update()
     }
 }
 
+// Memorias do VU0 (4 KB cada): micro memoria em 0x11000000 e dados em 0x11004000 (acessiveis pela CPU).
+static uint8_t g_vu0_micro[4096];
+static uint8_t g_vu0_data[4096];
+static uint8_t g_vu1_micro[16384];
+static uint8_t g_vu1_data[16384];
+uint32_t g_vif1_top = 0, g_vif1_itop = 0;
+
+// Perfil (impresso a cada 2 s no resumo [gs]): tempo no DMA do GS/VIF, nos microprogramas e na janela.
+uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0;
+static inline uint64_t prof_now()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void vu0_run(Ctx& c, uint32_t byte_addr);
+void vu1_run(uint32_t byte_addr);
+uint32_t g_vu0_pc_get();
+uint32_t g_vu1_pc_get();
+
+static uint8_t* vu0_mem_ptr(uint32_t phys, int size)
+{
+    uint32_t off;
+    uint8_t* base;
+
+    if (phys >= 0x11000000u && phys < 0x11001000u) { base = g_vu0_micro; off = phys - 0x11000000u; }
+    else if (phys >= 0x11004000u && phys < 0x11005000u) { base = g_vu0_data; off = phys - 0x11004000u; }
+    else if (phys >= 0x11008000u && phys < 0x1100C000u) { base = g_vu1_micro; off = phys - 0x11008000u; }
+    else if (phys >= 0x1100C000u && phys < 0x11010000u) { base = g_vu1_data; off = phys - 0x1100C000u; }
+    else return nullptr;
+
+    return off + (uint32_t)size <= (base == g_vu1_micro || base == g_vu1_data ? 16384u : 4096u) ? base + off : nullptr;
+}
+
 uint64_t ps2_hw_read(Ctx&, uint32_t phys, int size)
 {
+    if (uint8_t* vp = vu0_mem_ptr(phys, size))
+    {
+        uint64_t v = 0;
+        std::memcpy(&v, vp, (size_t)size);
+        return v;
+    }
+
     hw_hist_add(phys);
 
     if (g_hw_log < 300)
@@ -1123,6 +1162,12 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value);
 
 void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
 {
+    if (uint8_t* vp = vu0_mem_ptr(phys, size))
+    {
+        std::memcpy(vp, &value, (size_t)size);
+        return;
+    }
+
     ps2_dma_write(c, phys, value);
 
     // GS_CSR: escrever 1 no bit 3 limpa o VSINT
@@ -2536,6 +2581,106 @@ static void irq_tick_thread()
     }
 }
 
+// ---- entrada do controle: teclado (Windows) e roteiro por variavel de ambiente ----
+//   Teclado (so com a janela do jogo em foco): Enter=START, Backspace=SELECT, setas=direcional, Z=X(cruz), X=O(bola), A=quadrado, S=triangulo,
+//            Q=L1, W=R1, 1=L2, 2=R2.
+//   PS2_PAD_SCRIPT="START@10+0.2,CROSS@14+0.2": BOTAO@segundos+duracao (segundos desde o inicio do programa).
+//   Botoes: SELECT L3 R3 START UP RIGHT DOWN LEFT L2 R2 L1 R1 TRIANGLE CIRCLE CROSS SQUARE.
+void ps2_window_start();          // janela Win32 (definida no fim do arquivo; vazia fora do Windows)
+bool ps2_key_down(int vk);        // tecla apertada (so conta com a janela do jogo em foco)
+
+namespace
+{
+    struct PadButton { const char* name; uint16_t bit; int vk; };
+
+    const PadButton k_pad_buttons[] =
+    {
+        { "SELECT",   0x0100, 0x08 }, { "L3",     0x0200, 0 }, { "R3",    0x0400, 0 }, { "START",  0x0800, 0x0D },
+        { "UP",       0x1000, 0x26 }, { "RIGHT",  0x2000, 0x27 }, { "DOWN", 0x4000, 0x28 }, { "LEFT", 0x8000, 0x25 },
+        { "L2",       0x0001, 0x31 }, { "R2",     0x0002, 0x32 }, { "L1",   0x0004, 0x51 }, { "R1",   0x0008, 0x57 },
+        { "TRIANGLE", 0x0010, 0x53 }, { "CIRCLE", 0x0020, 0x58 }, { "CROSS", 0x0040, 0x5A }, { "SQUARE", 0x0080, 0x41 }
+    };
+
+    struct PadScriptEntry { uint16_t bit; double start; double end; };
+
+    std::vector<PadScriptEntry> pad_parse_script(const char* text)
+    {
+        std::vector<PadScriptEntry> out;
+
+        if (!text)
+            return out;
+
+        std::string s(text);
+        size_t pos = 0;
+
+        while (pos < s.size())
+        {
+            size_t next = s.find_first_of(",;", pos);
+            std::string tok = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            pos = next == std::string::npos ? s.size() : next + 1;
+
+            size_t at = tok.find('@');
+
+            if (at == std::string::npos)
+                continue;
+
+            std::string name = tok.substr(0, at);
+
+            for (char& ch : name)
+                ch = (char)std::toupper((unsigned char)ch);
+
+            double start = std::atof(tok.c_str() + at + 1);
+            size_t plus = tok.find('+', at);
+            double dur = plus == std::string::npos ? 0.2 : std::atof(tok.c_str() + plus + 1);
+
+            for (const PadButton& b : k_pad_buttons)
+            {
+                if (name == b.name)
+                {
+                    out.push_back({ b.bit, start, start + (dur > 0.0 ? dur : 0.2) });
+                    break;
+                }
+            }
+        }
+
+        return out;
+    }
+}
+
+static void pad_input_thread()
+{
+    const std::vector<PadScriptEntry> script = pad_parse_script(std::getenv("PS2_PAD_SCRIPT"));
+    const auto t0 = std::chrono::steady_clock::now();
+    uint16_t last = 0;
+
+    for (;;)
+    {
+        uint16_t pressed = 0;
+        double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+        for (const PadScriptEntry& e : script)
+        {
+            if (now >= e.start && now < e.end)
+                pressed |= e.bit;
+        }
+
+        for (const PadButton& b : k_pad_buttons)
+        {
+            if (b.vk != 0 && ps2_key_down(b.vk))
+                pressed |= b.bit;
+        }
+
+        if (pressed != last)
+        {
+            std::fprintf(stderr, "  [pad] botoes = 0x%04X\n", (unsigned)pressed);
+            last = pressed;
+        }
+
+        ps2_pad_set_state(0, (uint16_t)~pressed, 0x80, 0x80, 0x80, 0x80);
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+}
+
 // Procura a ISO: argumento, variavel PS2_ISO, ou o nome padrao perto da pasta atual.
 // (Aqui tambem liga o tratamento de Ctrl+C, porque e chamada no inicio do programa.)
 void ps2_iso_open_default(int argc, char** argv)
@@ -2546,6 +2691,8 @@ void ps2_iso_open_default(int argc, char** argv)
     std::signal(SIGILL, on_crash);
 
     std::thread(irq_tick_thread).detach();
+    std::thread(pad_input_thread).detach();
+    ps2_window_start();
 
     {
         const char* w = std::getenv("PS2_WATCHDOG");
@@ -3648,7 +3795,12 @@ namespace
     DmaChan g_dmach[3];
     const bool g_giflog = std::getenv("PS2_GIFLOG") != nullptr;
     const bool g_gsdump = std::getenv("PS2_GSDUMP") != nullptr;   // segundos entre dumps de quadro (padrao 5)
-    const bool g_gsrun = g_giflog || g_gsdump;                    // decodifica o fluxo de DMA e roda o GS
+#ifdef _WIN32
+    const bool g_gswin = std::getenv("PS2_NOWINDOW") == nullptr;  // janela do jogo (desligue com PS2_NOWINDOW=1)
+#else
+    const bool g_gswin = false;
+#endif
+    const bool g_gsrun = g_giflog || g_gsdump || g_gswin;         // decodifica o fluxo de DMA e roda o GS
     unsigned g_giflog_budget = 600;
     unsigned g_dma_detail = 0;
     unsigned g_vif_log = 200, g_gif_log = 80, g_raw_log = 64;
@@ -3656,6 +3808,7 @@ namespace
 
     struct GsStats
     {
+        uint64_t xgkicks = 0, xgkick_qw = 0;
         uint64_t kicks[3] = {}, tags_packed = 0, tags_reglist = 0, tags_image = 0, image_qw = 0;
         uint64_t direct_qw = 0, mpg_words = 0, unpack_cmds = 0, mscal = 0;
         uint64_t prim[8] = {};
@@ -4142,6 +4295,11 @@ namespace
     //  PS2_GSTRACE_DUMP=1: guarda os ultimos desenhos e, a cada dump de quadro (PS2_GSDUMP), imprime os dos 2 ultimos vsyncs.
     static std::deque<std::pair<unsigned, std::string>> g_trace_ring;
     static std::string g_trace_chain;   // quem disparou o DMA que esta sendo processado (ver gs_trace_set_caller)
+    static unsigned long g_trace_draws = 0;   // total de sprites/triangulos desenhados (conta sempre)
+    // Por kick de DMA (so quando o trace esta ligado): vertices chutados, triangulos de area zero e primeiro/ultimo vertice.
+    static unsigned long g_trace_vtx = 0, g_trace_degen = 0;
+    static char g_trace_v0[200] = "", g_trace_vn[200] = "";
+    static char g_trace_all[1200] = "";   // todos os vertices (ate 8) do kick: raw XY (12.4) + posicao + uv
 
     static bool gs_trace_enabled()
     {
@@ -4213,6 +4371,8 @@ namespace
             init = true;
         }
 
+        g_trace_draws++;
+
         if (count <= 0 && !ring)
             return;
 
@@ -4245,9 +4405,31 @@ namespace
         {
             g_trace_ring.emplace_back(g_gs_vsyncs, std::string(buf));
 
-            if (g_trace_ring.size() > 600)
+            if (g_trace_ring.size() > 1200)
                 g_trace_ring.pop_front();
         }
+    }
+
+    // PS2_GSTRACE_KICK=1 (junto com PS2_GSTRACE_DUMP): registra cada kick de DMA, inclusive os que nao geram desenho,
+    // com quantos sprites/triangulos ele produziu e o contador de primitivas nao suportadas.
+    static void gs_trace_kick(int ch, unsigned long draws_before, uint64_t unsupported_before)
+    {
+        static int on = -1;
+
+        if (on < 0)
+            on = (std::getenv("PS2_GSTRACE_DUMP") != nullptr && std::getenv("PS2_GSTRACE_KICK") != nullptr) ? 1 : 0;
+
+        if (on != 1)
+            return;
+
+        char buf[1400];
+        std::snprintf(buf, sizeof(buf), "  [gs] kick ch=%d vs=%u desenhos=%lu nao_suportado=+%llu vertices=%lu degenerados=%lu primeiro=%s ultimo=%s prim=0x%03X%s | chamada: %s",
+            ch, g_gs_vsyncs, g_trace_draws - draws_before, (unsigned long long)(g_st.unsupported - unsupported_before),
+            g_trace_vtx, g_trace_degen, g_trace_vtx ? g_trace_v0 : "-", g_trace_vtx > 1 ? g_trace_vn : "-", (unsigned)g_st.prim, (g_trace_degen ? g_trace_all : ""), g_trace_chain.c_str());
+        g_trace_ring.emplace_back(g_gs_vsyncs, std::string(buf));
+
+        if (g_trace_ring.size() > 1200)
+            g_trace_ring.pop_front();
     }
 
     // Chamado por gs_dump_frame: imprime os desenhos dos 2 ultimos vsyncs (o quadro que acabou de ser exibido).
@@ -4291,7 +4473,10 @@ namespace
         float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 
         if (area == 0.0f)
+        {
+            g_trace_degen++;
             return;
+        }
 
         gs_trace_draw("tri", ci, std::min(a.x, std::min(b.x, c.x)), std::min(a.y, std::min(b.y, c.y)), std::max(a.x, std::max(b.x, c.x)), std::max(a.y, std::max(b.y, c.y)));
 
@@ -4317,6 +4502,13 @@ namespace
             }
     }
 
+    // Campos do interlacado: o jogo desenha os quadros alternados com um deslocamento de meia linha (o campo
+    // impar sobe 0,5 linha do buffer). No PS2 o campo impar sai uma linha de saida mais abaixo, e os dois se
+    // alinham; mostrar os quadros sem isso faz a imagem tremer. Aqui, cada vertice de sprite vota se a coordenada
+    // Y esta numa meia linha (2*Y impar); o voto decai, entao vale o do quadro desenhado por ultimo em cada FBP.
+    float g_half_vote[512] = {};
+    std::atomic<unsigned> g_gs_flips{0};   // trocas do buffer exibido (DISPFB): aproximam os quadros do jogo
+
     void gs_vertex(uint64_t data, bool kick)
     {
         int ci = (int)((g_st.prim >> 9) & 1);
@@ -4325,6 +4517,14 @@ namespace
         float ofx = (float)(c.xyoffset & 0xFFFF), ofy = (float)((c.xyoffset >> 32) & 0xFFFF);
         v.x = ((float)(data & 0xFFFF) - ofx) / 16.0f;
         v.y = ((float)((data >> 16) & 0xFFFF) - ofy) / 16.0f;
+
+        if ((g_st.prim & 7) == 6)
+        {
+            int n = (int)std::floor(v.y * 2.0f + 0.5f);
+            float& vote = g_half_vote[c.frame & 0x1FF];
+            vote = vote * 0.9f + ((n & 1) ? 1.0f : -1.0f);
+        }
+
         v.r = (float)(g_st.rgbaq & 0xFF);
         v.g = (float)((g_st.rgbaq >> 8) & 0xFF);
         v.b = (float)((g_st.rgbaq >> 16) & 0xFF);
@@ -4363,6 +4563,23 @@ namespace
         }
 
         g_st.q[g_st.nq++] = v;
+
+        if (kick && gs_trace_enabled())
+        {
+            char* dst = (g_trace_vtx == 0) ? g_trace_v0 : g_trace_vn;
+            std::snprintf(dst, 200, "(%.1f,%.1f) rgba=%.0f,%.0f,%.0f,%.0f uv=%.1f,%.1f", v.x, v.y, v.r, v.g, v.b, v.a, v.u, v.v);
+            if (g_trace_vtx == 0)
+                g_trace_all[0] = 0;
+
+            if (g_trace_vtx < 8)
+            {
+                size_t n = std::strlen(g_trace_all);
+                std::snprintf(g_trace_all + n, sizeof(g_trace_all) - n, " [raw=%04X,%04X (%.1f,%.1f) uv=%.0f,%.0f a=%.0f]",
+                    (unsigned)(data & 0xFFFF), (unsigned)((data >> 16) & 0xFFFF), v.x, v.y, v.u, v.v, v.a);
+            }
+
+            g_trace_vtx++;
+        }
 
         if (!kick || g_st.nq < need)
             return;
@@ -4433,6 +4650,55 @@ namespace
         uint8_t bytes[16];
         std::memcpy(bytes, &lo, 8);
         std::memcpy(bytes + 8, &hi, 8);
+
+        // Caminho rapido: quadword inteiro de pixels completos (32, 16, 8 e 4 bits), sem passar pelo buffer de bytes.
+        if (g_st.npend == 0)
+        {
+            const uint32_t fpsm = g_st.dpsm;
+
+            if (fpsm == 0x00)
+            {
+                uint32_t w[4];
+                std::memcpy(w, bytes, 16);
+
+                for (int k = 0; k < 4 && g_st.xfer; k++)
+                    gs_xfer_pixel(w[k]);
+
+                return;
+            }
+
+            if (fpsm == 0x02 || fpsm == 0x0A)
+            {
+                uint16_t h[8];
+                std::memcpy(h, bytes, 16);
+
+                for (int k = 0; k < 8 && g_st.xfer; k++)
+                    gs_xfer_pixel(h[k]);
+
+                return;
+            }
+
+            if (fpsm == 0x13 || fpsm == 0x1B)
+            {
+                for (int k = 0; k < 16 && g_st.xfer; k++)
+                    gs_xfer_pixel(bytes[k]);
+
+                return;
+            }
+
+            if (fpsm == 0x14 || fpsm == 0x24 || fpsm == 0x2C)
+            {
+                for (int k = 0; k < 16 && g_st.xfer; k++)
+                {
+                    gs_xfer_pixel(bytes[k] & 0xF);
+
+                    if (g_st.xfer)
+                        gs_xfer_pixel(bytes[k] >> 4);
+                }
+
+                return;
+            }
+        }
 
         for (int i = 0; i < 16 && g_st.xfer; i++)
         {
@@ -4512,12 +4778,15 @@ namespace
         }
     }
 
-    // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
-    void gs_dump_frame(unsigned index)
+    // Parametros do quadro exibido: PMODE.EN1/EN2 escolhem o circuito; DISPFBn / DISPLAYn dizem onde e quanto.
+    struct DispParams
     {
-        gs_trace_flush(index);
+        uint64_t pmode = 0, dispfb = 0, display = 0;
+        uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0, w = 0, h = 0, magv = 1;
+    };
 
-        // PMODE.EN1/EN2 escolhem o circuito; DISPFBn / DISPLAYn dizem onde e quanto
+    bool gs_display_params(DispParams& d)
+    {
         uint64_t pmode = g_gs_priv[0x00 / 8];
         uint64_t dispfb = 0, display = 0;
         uint32_t fbp = 0, fbw = 0, psm = 0, dbx = 0, dby = 0, w = 0, h = 0, magv = 1;
@@ -4546,6 +4815,89 @@ namespace
             h = (uint32_t)((display >> 44) & 0x7FF) + 1;
             valid = w != 0 && w <= 1024 && h != 0 && h <= 1024 && fbw != 0;
         }
+
+        d.pmode = pmode; d.dispfb = dispfb; d.display = display;
+        d.fbp = fbp; d.fbw = fbw; d.psm = psm; d.dbx = dbx; d.dby = dby; d.w = w; d.h = h; d.magv = magv;
+        return valid;
+    }
+
+    // Janela: o ultimo quadro convertido (RGB em 0x00RRGGBB), entregue a thread da janela.
+    std::mutex g_win_mu;
+    std::vector<uint32_t> g_win_pix;
+    uint32_t g_win_w = 0, g_win_h = 0;
+    std::atomic<unsigned> g_win_seq{0};
+
+    // Converte o quadro exibido para a janela (~30 Hz; espaca mais se a leitura da VRAM estiver cara).
+    // Le so uma linha por grupo de repeticao (MAGV / campo) e replica as demais.
+    void gs_present_frame()
+    {
+        using clk = std::chrono::steady_clock;
+        static clk::time_point next{};
+        const clk::time_point t0 = clk::now();
+
+        if (t0 < next)
+            return;
+
+        DispParams d;
+
+        if (!gs_display_params(d))
+            return;
+
+        const uint64_t prof_t0 = prof_now();
+        std::vector<uint32_t> pix((size_t)d.w * d.h);
+        const bool c16 = d.psm == 0x02 || d.psm == 0x0A;
+
+        // campo impar (meia linha acima no buffer): desce (MAGV / 2) linhas de saida; PS2_NOFIELDFIX=1 desliga
+        static const bool nofix = std::getenv("PS2_NOFIELDFIX") != nullptr;
+        const bool half = !nofix && d.magv > 1 && g_half_vote[(d.fbp / 32) & 0x1FF] > 0.0f;
+        const uint32_t shift = half ? d.magv / 2 : 0;
+
+        for (uint32_t by = 0; by * d.magv < d.h; by++)
+        {
+            const uint32_t r0 = by == 0 ? 0 : by * d.magv + shift;
+            const uint32_t r1 = std::min(d.h, (by + 1) * d.magv + shift);
+
+            if (r0 >= r1)
+                continue;
+
+            uint32_t* row = &pix[(size_t)r0 * d.w];
+
+            for (uint32_t x = 0; x < d.w; x++)
+            {
+                uint32_t v = gs_read_px(d.psm, d.fbp, d.fbw, d.dbx + x, d.dby + by);
+
+                if (c16)
+                    row[x] = (((v & 31u) << 3) << 16) | ((((v >> 5) & 31u) << 3) << 8) | (((v >> 10) & 31u) << 3);
+                else
+                    row[x] = ((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu);
+            }
+
+            for (uint32_t r = r0 + 1; r < r1; r++)
+                std::memcpy(&pix[(size_t)r * d.w], row, (size_t)d.w * sizeof(uint32_t));
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_win_mu);
+            g_win_pix.swap(pix);
+            g_win_w = d.w;
+            g_win_h = d.h;
+        }
+
+        g_win_seq.fetch_add(1);
+        g_prof_present_ns += prof_now() - prof_t0;
+        const clk::time_point t1 = clk::now();
+        next = t1 + std::max<clk::duration>(std::chrono::milliseconds(33), (t1 - t0) * 3);
+    }
+
+    // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
+    void gs_dump_frame(unsigned index)
+    {
+        gs_trace_flush(index);
+
+        DispParams dp;
+        const bool valid = gs_display_params(dp);
+        const uint32_t fbp = dp.fbp, fbw = dp.fbw, psm = dp.psm, dbx = dp.dbx, dby = dp.dby, w = dp.w, h = dp.h, magv = dp.magv;
+        const uint64_t pmode = dp.pmode, dispfb = dp.dispfb, display = dp.display;
 
         if (!valid)
         {
@@ -4754,17 +5106,160 @@ namespace
 
     GifDecoder g_gif;
 
-    struct Vif1Decoder
+    // VIF0 / VIF1: interpretam os VIFcodes. Levam micro codigo (MPG) e dados (UNPACK) ao VU0/VU1, disparam
+    // programas (MSCAL/MSCALF/MSCNT) e, no VIF1, repassam DIRECT/DIRECTHL ao GIF (PATH2).
+    struct VifDecoder
     {
-        uint32_t cl = 1, wl = 1;
-        uint64_t skip_words = 0, direct_qw = 0;
+        int unit;
+        explicit VifDecoder(int u = 0) : unit(u) {}
+        Ctx* cx = nullptr;                       // VU0 roda no contexto do EE que disparou o DMA
+        uint32_t cl = 1, wl = 1, mode = 0, mask = 0;
+        uint32_t row[4] = {}, col[4] = {};
+        uint32_t base = 0, ofst = 0, tops = 0, itops = 0;
+        bool db = false, dbf = false;
+        uint64_t skip_words = 0, direct_qw = 0, mpg_left = 0, up_left = 0;
+        uint32_t mpg_addr = 0, up_fmt = 0, up_addr = 0, up_num = 0;
+        bool up_usn = false, up_mask = false;
+        int reg_kind = 0;
+        unsigned reg_left = 0, reg_pos = 0;
         uint32_t dbuf[4] = {};
         unsigned dn = 0;
+        std::vector<uint32_t> up_words;
 
         static unsigned vector_bits(unsigned fmt)
         {
             static const unsigned bits[16] = { 32, 16, 8, 0, 64, 32, 16, 0, 96, 48, 24, 0, 128, 64, 32, 16 };
             return bits[fmt & 15];
+        }
+
+        void unpack_commit()
+        {
+            static const unsigned nc[16] = { 1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 4, 4, 4, 4 };
+            static const unsigned cb[16] = { 32, 16, 8, 0, 32, 16, 8, 0, 32, 16, 8, 0, 32, 16, 8, 5 };
+            const unsigned fmt = up_fmt & 15u;
+            uint8_t* data = unit ? g_vu1_data : g_vu0_data;
+            const uint32_t dmask = unit ? 0x3FFu : 0xFFu;
+
+            if (nc[fmt] == 0)
+                return;
+
+            uint64_t bitpos = 0;
+            const uint64_t total = (uint64_t)up_words.size() * 32u;
+
+            auto get = [&](unsigned n) -> uint32_t
+            {
+                uint32_t v = 0;
+
+                for (unsigned i = 0; i < n; i++)
+                {
+                    const uint64_t b = bitpos + i;
+                    v |= ((up_words[(size_t)(b >> 5)] >> (b & 31u)) & 1u) << i;
+                }
+
+                bitpos += n;
+                return v;
+            };
+
+            for (uint32_t i = 0; i < up_num; i++)
+            {
+                const unsigned need = fmt == 15 ? 16u : nc[fmt] * cb[fmt];
+
+                if (bitpos + need > total)
+                    break;
+
+                uint32_t lane[4] = { 0, 0, 0, 0 };
+
+                if (fmt == 15)
+                {
+                    const uint32_t v = get(16);
+                    lane[0] = (v & 31u) << 3; lane[1] = ((v >> 5) & 31u) << 3; lane[2] = ((v >> 10) & 31u) << 3; lane[3] = ((v >> 15) & 1u) << 7;
+                }
+                else
+                {
+                    uint32_t comp[4] = { 0, 0, 0, 0 };
+
+                    for (unsigned k = 0; k < nc[fmt]; k++)
+                    {
+                        uint32_t v = get(cb[fmt]);
+
+                        if (!up_usn && cb[fmt] < 32 && (v & (1u << (cb[fmt] - 1))))
+                            v |= ~0u << cb[fmt];
+
+                        comp[k] = v;
+                    }
+
+                    if (nc[fmt] == 1) { lane[0] = lane[1] = lane[2] = lane[3] = comp[0]; }
+                    else { lane[0] = comp[0]; lane[1] = comp[1]; lane[2] = comp[2]; lane[3] = comp[3]; }
+                }
+
+                const uint32_t slot = (cl >= wl && wl != 0) ? (i / wl) * cl + (i % wl) : i;
+                uint32_t* dst = reinterpret_cast<uint32_t*>(data) + (((up_addr + slot) & dmask) * 4u);
+                const unsigned mrow = i < 3 ? i : 3;
+
+                for (int l = 0; l < 4; l++)
+                {
+                    const unsigned code = up_mask ? ((mask >> ((mrow * 4 + (unsigned)l) * 2)) & 3u) : 0u;
+
+                    if (code == 3)
+                        continue;
+
+                    uint32_t v = lane[l];
+
+                    if (code == 0)
+                    {
+                        if (mode == 1) v += row[l];
+                        else if (mode == 2) { v += row[l]; row[l] = v; }
+                    }
+                    else if (code == 1) v = row[l];
+                    else v = col[mrow];
+
+                    dst[l] = v;
+                }
+            }
+
+            up_words.clear();
+        }
+
+        void start_program(uint32_t byte_addr, bool cont)
+        {
+            if (unit == 0)
+            {
+                if (cx != nullptr)
+                {
+                    vu0_run(*cx, cont ? g_vu0_pc_get() * 8u : byte_addr);
+                    cx->vi[29] &= ~1u;
+                }
+
+                return;
+            }
+
+            g_vif1_itop = itops;
+            g_vif1_top = tops;
+
+            if (db)
+            {
+                dbf = !dbf;
+                tops = base + (dbf ? ofst : 0u);
+            }
+
+            if (!cont)
+            {
+                static uint32_t seen1[32];
+                static unsigned seen1_n = 0;
+                bool is_new = true;
+
+                for (unsigned i = 0; i < seen1_n; i++)
+                    if (seen1[i] == byte_addr) { is_new = false; break; }
+
+                if (is_new && seen1_n < 32)
+                {
+                    seen1[seen1_n++] = byte_addr;
+                    std::fprintf(stderr, "  [VU1] MSCAL micro=0x%04X (TOP=0x%X ITOP=0x%X)\n", byte_addr, g_vif1_top, g_vif1_itop);
+                }
+            }
+
+            vu1_run(cont ? g_vu1_pc_get() * 8u : byte_addr);
+            g_gs.mscal++;
         }
 
         void word(uint32_t w)
@@ -4784,17 +5279,46 @@ namespace
                 return;
             }
 
+            if (mpg_left != 0)
+            {
+                std::memcpy((unit ? g_vu1_micro : g_vu0_micro) + (mpg_addr & (unit ? 0x3FFFu : 0xFFFu)), &w, 4);
+                mpg_addr += 4;
+                mpg_left--;
+                return;
+            }
+
+            if (up_left != 0)
+            {
+                up_words.push_back(w);
+
+                if (--up_left == 0)
+                    unpack_commit();
+
+                return;
+            }
+
+            if (reg_left != 0)
+            {
+                if (reg_kind == 1) row[reg_pos] = w;
+                else if (reg_kind == 2) col[reg_pos] = w;
+                else mask = w;
+
+                reg_pos++;
+                reg_left--;
+                return;
+            }
+
             if (skip_words != 0)
             {
                 skip_words--;
                 return;
             }
 
-            unsigned cmd = (w >> 24) & 0x7F;
-            unsigned num = (w >> 16) & 0xFF;
-            unsigned imm = w & 0xFFFF;
+            const unsigned cmd = (w >> 24) & 0x7F;
+            const unsigned num = (w >> 16) & 0xFF;
+            const unsigned imm = w & 0xFFFF;
 
-            if (g_giflog && g_vif_log != 0)
+            if (unit == 1 && g_giflog && g_vif_log != 0)
             {
                 g_vif_log--;
                 std::fprintf(stderr, "  [vif] codigo=0x%08X cmd=0x%02X num=%u imm=0x%04X (cl=%u wl=%u)\n", w, cmd, num, imm, cl, wl);
@@ -4802,37 +5326,57 @@ namespace
 
             if (cmd >= 0x60)
             {
-                g_gs.unpack_cmds++;
+                if (unit == 1)
+                    g_gs.unpack_cmds++;
+
                 uint64_t n = num == 0 ? 256 : num;
                 uint64_t in_vectors = n;
 
                 if (cl < wl && wl != 0)
                     in_vectors = (n / wl) * cl + std::min<uint64_t>(n % wl, cl);
 
-                skip_words = (in_vectors * vector_bits(cmd & 15) + 31) / 32;
+                up_fmt = cmd & 15u;
+                up_usn = (imm & 0x4000u) != 0;
+                up_mask = (cmd & 0x10u) != 0;
+                up_addr = (imm & 0x3FFu) + ((unit == 1 && (imm & 0x8000u)) ? tops : 0u);
+                up_num = (uint32_t)n;
+                up_words.clear();
+                up_left = (in_vectors * vector_bits(cmd & 15) + 31) / 32;
                 return;
             }
 
             switch (cmd)
             {
                 case 0x01: cl = imm & 0xFF; wl = (imm >> 8) & 0xFF; break;
-                case 0x14: case 0x15: case 0x17: g_gs.mscal++; break;
-                case 0x20: skip_words = 1; break;
-                case 0x30: case 0x31: skip_words = 4; break;
+                case 0x02: if (unit == 1) { ofst = imm & 0x3FF; dbf = false; tops = base; db = true; } break;
+                case 0x03: if (unit == 1) base = imm & 0x3FF; break;
+                case 0x04: if (unit == 1) itops = imm & 0x3FF; break;
+                case 0x05: mode = imm & 3; break;
+                case 0x14: case 0x15: start_program(imm * 8u, false); break;
+                case 0x17: start_program(0, true); break;
+                case 0x20: reg_kind = 3; reg_left = 1; reg_pos = 0; break;
+                case 0x30: reg_kind = 1; reg_left = 4; reg_pos = 0; break;
+                case 0x31: reg_kind = 2; reg_left = 4; reg_pos = 0; break;
                 case 0x4A:
-                    skip_words = (uint64_t)(num == 0 ? 256 : num) * 2;
-                    g_gs.mpg_words += skip_words;
+                    mpg_addr = imm * 8u;
+                    mpg_left = (uint64_t)(num == 0 ? 256 : num) * 2;
+                    g_gs.mpg_words += mpg_left;
                     break;
                 case 0x50: case 0x51:
-                    direct_qw = imm == 0 ? 65536u : imm;
-                    dn = 0;
+                    if (unit == 1)
+                    {
+                        direct_qw = imm == 0 ? 65536u : imm;
+                        dn = 0;
+                    }
+
                     break;
-                default: break;   // NOP, OFFSET, BASE, ITOP, STMOD, MSKPATH3, MARK, FLUSH*: sem dados
+                default: break;   // NOP, MSKPATH3, MARK, FLUSH*: sem dados
             }
         }
     };
 
-    Vif1Decoder g_vif1;
+    VifDecoder g_vif0(0);
+    VifDecoder g_vif1(1);
 
     uint32_t dma_addr(uint32_t a)
     {
@@ -4865,6 +5409,9 @@ namespace
 
             if (ch == 2)
                 g_gif.qword((uint64_t)w[0] | ((uint64_t)w[1] << 32), (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+            else if (ch == 0)
+                for (int k = 0; k < 4; k++)
+                    g_vif0.word(w[k]);
             else
                 for (int k = 0; k < 4; k++)
                     g_vif1.word(w[k]);
@@ -4874,6 +5421,7 @@ namespace
     void dma_walk(Ctx& c, int ch, uint32_t chcr)
     {
         DmaChan& d = g_dmach[ch];
+        g_vif0.cx = &c;
         g_gs.kicks[ch]++;
         unsigned mod = (chcr >> 2) & 3;
         bool detail = g_giflog && g_dma_detail < 12;
@@ -4920,6 +5468,11 @@ namespace
                 g_vif1.word((uint32_t)hi);
                 g_vif1.word((uint32_t)(hi >> 32));
             }
+            else if (ch == 0)
+            {
+                g_vif0.word((uint32_t)hi);
+                g_vif0.word((uint32_t)(hi >> 32));
+            }
 
             switch (id)
             {
@@ -4954,6 +5507,9 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
     // registradores privilegiados do GS (PMODE, DISPFB1/2, DISPLAY1/2...): dizem qual area e exibida
     if (g_gsrun && phys >= 0x12000000u && phys < 0x12000100u && (phys & 7u) == 0)
     {
+        if ((phys == 0x12000070u || phys == 0x12000090u) && (value & 0x1FFu) != (g_gs_priv[(phys - 0x12000000u) >> 3] & 0x1FFu))
+            g_gs_flips.fetch_add(1);
+
         g_gs_priv[(phys - 0x12000000u) >> 3] = value;
         return;
     }
@@ -4963,9 +5519,6 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
 
     int ch = (int)((phys - 0x10008000u) >> 12);
     uint32_t reg = phys & 0xFFFu;
-
-    if (ch == 0)
-        return;
 
     DmaChan& d = g_dmach[ch];
 
@@ -4978,8 +5531,24 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
             if (value & 0x100)
             {
                 std::lock_guard<std::mutex> lk(g_gs_mu);
+
+                if (ch == 0)
+                {
+                    const uint64_t pt0 = prof_now();
+                    dma_walk(c, 0, (uint32_t)value);   // VIF0: micro codigo e dados do VU0, sem GS
+                    g_prof_dma_ns += prof_now() - pt0;
+                    break;
+                }
+
                 gs_trace_set_caller(c);
+                g_trace_vtx = 0;
+                g_trace_degen = 0;
+                unsigned long draws_before = g_trace_draws;
+                uint64_t unsupported_before = g_st.unsupported;
+                const uint64_t pt0 = prof_now();
                 dma_walk(c, ch, (uint32_t)value);
+                g_prof_dma_ns += prof_now() - pt0;
+                gs_trace_kick(ch, draws_before, unsupported_before);
             }
 
             break;
@@ -4994,6 +5563,12 @@ void ps2_gs_vsync()
         return;
 
     ++g_gs_vsyncs;
+
+    if (g_gswin)
+    {
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        gs_present_frame();
+    }
 
     if (g_gsdump)
     {
@@ -5020,11 +5595,26 @@ void ps2_gs_vsync()
     std::lock_guard<std::mutex> lk(g_gs_mu);
     static const char* ptype[8] = { "ponto", "linha", "tira-linha", "triangulo", "tira-tri", "leque-tri", "sprite", "?" };
 
-    std::fprintf(stderr, "  [gs] 2s: kicks vif1=%llu gif=%llu | GIFtags packed=%llu reglist=%llu image=%llu (imagem=%llu qw) | direct=%llu qw mpg=%llu w unpack=%llu mscal=%llu\n",
+    std::fprintf(stderr, "  [gs] 2s: kicks vif1=%llu gif=%llu | GIFtags packed=%llu reglist=%llu image=%llu (imagem=%llu qw) | direct=%llu qw mpg=%llu w unpack=%llu mscal=%llu xgkick=%llu (%llu qw)\n",
         (unsigned long long)g_gs.kicks[1], (unsigned long long)g_gs.kicks[2], (unsigned long long)g_gs.tags_packed,
         (unsigned long long)g_gs.tags_reglist, (unsigned long long)g_gs.tags_image, (unsigned long long)g_gs.image_qw,
         (unsigned long long)g_gs.direct_qw, (unsigned long long)g_gs.mpg_words, (unsigned long long)g_gs.unpack_cmds,
-        (unsigned long long)g_gs.mscal);
+        (unsigned long long)g_gs.mscal, (unsigned long long)g_gs.xgkicks, (unsigned long long)g_gs.xgkick_qw);
+
+    {
+        static uint64_t last_dma = 0, last_vu = 0, last_pr = 0, last_wall = 0;
+        static unsigned last_flips = 0;
+        const uint64_t now = prof_now();
+        const unsigned flips = g_gs_flips.load();
+
+        if (last_wall != 0)
+            std::fprintf(stderr, "  [prof] %.1f s: DMA/GS=%llu ms (microprogramas=%llu ms) janela=%llu ms | trocas de buffer=%u\n",
+                (double)(now - last_wall) / 1e9, (unsigned long long)((g_prof_dma_ns - last_dma) / 1000000u),
+                (unsigned long long)((g_prof_vu_ns - last_vu) / 1000000u), (unsigned long long)((g_prof_present_ns - last_pr) / 1000000u),
+                flips - last_flips);
+
+        last_dma = g_prof_dma_ns; last_vu = g_prof_vu_ns; last_pr = g_prof_present_ns; last_wall = now; last_flips = flips;
+    }
 
     std::fprintf(stderr, "  [gs] 2s: PRIM:");
 
@@ -5080,10 +5670,514 @@ void ps2_unsupported(Ctx&, uint32_t address, const char* mnemonic)
     die();
 }
 
-// Stub: ainda nao ha micro memoria nem interpretador do VU0. Registra a chamada e "termina"
-// o microprograma na hora (VBS0 de VPU_STAT = vi[29] limpo), para o jogo seguir adiante.
+// ---- VU0 e VU1 em modo micro: interpretador ----
+// VU0: micro 4 KB / dados 4 KB, no estado do modo macro (VF, ACC, VI, Q, I, flags). VU1: 16 KB / 16 KB, estado proprio
+// (g_vu1_regs), com EFU (P), XTOP/XITOP e XGKICK (envia o pacote ao GIF). A micro memoria chega por MPG (VIF) ou por
+// escritas da CPU; os dados por UNPACK ou escritas da CPU. MSCAL/VCALLMS rodam o programa na hora, ate o bit E.
+// Cada instrucao de 64 bits = lower (palavra 0) + upper (palavra 1).
+// Simplificacoes: sem ciclos de pipeline, exceto a latencia de Q (DIV/SQRT 7, RSQRT 13).
+
+struct VuUnit
+{
+    Ctx* r;
+    uint8_t* micro;
+    uint8_t* data;
+    uint32_t imask;     // mascara do indice de instrucao (0x1FF no VU0, 0x7FF no VU1)
+    uint32_t dmask;     // mascara do indice de quadword da memoria de dados (0xFF / 0x3FF)
+    bool vu1;
+    uint32_t pc;
+};
+
+uint32_t g_vu0_pc = 0, g_vu1_pc = 0;     // instrucao (de 64 bits) onde o ultimo programa parou, para MSCNT
+uint32_t g_vu0_pc_get() { return g_vu0_pc; }
+uint32_t g_vu1_pc_get() { return g_vu1_pc; }
+static unsigned g_vu0_runs = 0, g_vu1_runs = 0;
+
+static inline uint32_t* um_q(const VuUnit& u, uint32_t index) { return reinterpret_cast<uint32_t*>(u.data) + ((index & u.dmask) * 4u); }
+
+// Flags MAC/status a partir dos resultados exatos (antes de empacotar) das faixas escritas.
+static void um_flags(Ctx& c, const double* r, int dest)
+{
+    uint32_t sign = 0, zero = 0, unf = 0, ovf = 0;
+
+    for (int l = 0; l < 4; l++)
+    {
+        const uint32_t m = 8u >> l;
+
+        if (!(dest & (int)m))
+            continue;
+
+        const double v = r[l];
+        const double a = std::fabs(v);
+
+        if (a > 3.4028234663852886e38) ovf |= m;
+        else if (a != 0.0 && a < 1.1754943508222875e-38) { unf |= m; zero |= m; }
+        else if (a == 0.0) zero |= m;
+
+        if (std::signbit(v) && a != 0.0) sign |= m;
+    }
+
+    const uint32_t mac = (sign << 12) | (zero << 8) | (unf << 4) | ovf;
+    const uint32_t st = ((mac & 0x0F00u) ? 1u : 0u) | ((mac & 0xF000u) ? 2u : 0u) | ((mac & 0x00F0u) ? 4u : 0u) | ((mac & 0x000Fu) ? 8u : 0u);
+    c.vi[17] = mac;
+    c.vi[16] = (c.vi[16] & 0xFF0u) | st | (st << 6);
+}
+
+// Igual a vu_arith, mas atualiza MAC/status (os programas ramificam por eles).
+static void um_arith(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc)
+{
+    double res[4];
+    uint32_t out[4];
+
+    for (int l = 0; l < 4; l++)
+    {
+        const uint32_t ab = c.vf[fs][l];
+        uint32_t bb;
+
+        switch (src)
+        {
+            case VU_SRC_VEC: bb = c.vf[ft][l]; break;
+            case VU_SRC_X:   bb = c.vf[ft][0]; break;
+            case VU_SRC_Y:   bb = c.vf[ft][1]; break;
+            case VU_SRC_Z:   bb = c.vf[ft][2]; break;
+            case VU_SRC_W:   bb = c.vf[ft][3]; break;
+            case VU_SRC_Q:   bb = c.vi[22]; break;
+            default:         bb = c.vi[21]; break;
+        }
+
+        const double a = ee_in(ab), b = ee_in(bb);
+        double r;
+
+        switch (op)
+        {
+            case VU_ADD:  r = a + b; break;
+            case VU_SUB:  r = a - b; break;
+            case VU_MUL:  r = a * b; break;
+            case VU_MADD: r = ee_in(c.vacc[l]) + a * b; break;
+            case VU_MSUB: r = ee_in(c.vacc[l]) - a * b; break;
+            case VU_MAX:  r = a > b ? a : b; break;
+            default:      r = a < b ? a : b; break;
+        }
+
+        res[l] = r;
+        out[l] = op == VU_MAX ? (a > b ? ab : bb) : op == VU_MIN ? (a < b ? ab : bb) : ee_pack(r);
+    }
+
+    for (int l = 0; l < 4; l++)
+    {
+        if (!(dest & (8 >> l))) continue;
+        if (to_acc) c.vacc[l] = out[l];
+        else if (fd != 0) c.vf[fd][l] = out[l];
+    }
+
+    um_flags(c, res, dest);
+}
+
+static void um_opmula(Ctx& c, int fs, int ft)
+{
+    double r[4] = { ee_in(c.vf[fs][1]) * ee_in(c.vf[ft][2]), ee_in(c.vf[fs][2]) * ee_in(c.vf[ft][0]), ee_in(c.vf[fs][0]) * ee_in(c.vf[ft][1]), 0.0 };
+    for (int l = 0; l < 3; l++) c.vacc[l] = ee_pack(r[l]);
+    um_flags(c, r, 0xE);
+}
+
+static void um_opmsub(Ctx& c, int fd, int fs, int ft)
+{
+    double r[4] = { ee_in(c.vacc[0]) - ee_in(c.vf[fs][1]) * ee_in(c.vf[ft][2]),
+                    ee_in(c.vacc[1]) - ee_in(c.vf[fs][2]) * ee_in(c.vf[ft][0]),
+                    ee_in(c.vacc[2]) - ee_in(c.vf[fs][0]) * ee_in(c.vf[ft][1]), 0.0 };
+    if (fd != 0) for (int l = 0; l < 3; l++) c.vf[fd][l] = ee_pack(r[l]);
+    um_flags(c, r, 0xE);
+}
+
+struct UmLowerWrite { int vf = 0; int mask = 0; uint32_t v[4] = {}; };   // escrita de VF adiada (o upper le os valores antigos)
+
+static void um_set_vf(UmLowerWrite& w, int reg, int mask, const uint32_t* v)
+{
+    if (reg == 0) return;
+    w.vf = reg; w.mask = mask;
+    for (int l = 0; l < 4; l++) w.v[l] = v[l];
+}
+
+static inline int um_first_lane(int dest) { return (dest & 8) ? 0 : (dest & 4) ? 1 : (dest & 2) ? 2 : 3; }
+
+
+// Estado, memorias e saida do VU1 (definidos antes do DMA).
+void vu1_xgkick(uint32_t qaddr);
+extern uint32_t g_vif1_top, g_vif1_itop;
+
+// Instrucoes lower exclusivas do VU1: MFP, XTOP, XITOP, XGKICK e a EFU (resultado em P = vi[23]).
+static void um_vu1_special(VuUnit& u, Ctx& c, UmLowerWrite& lw, unsigned idx, int it, int is, int dest, int fsf)
+{
+    (void)u;
+    const double x = ee_in(c.vf[is][0]), y = ee_in(c.vf[is][1]), z = ee_in(c.vf[is][2]), w = ee_in(c.vf[is][3]);
+    const double s = ee_in(c.vf[is][fsf]);
+    const double big = 3.4028234663852886e38;
+    double r = 0.0;
+
+    switch (idx)
+    {
+        case 100: { uint32_t v = c.vi[23]; uint32_t t[4] = { v, v, v, v }; um_set_vf(lw, it, dest, t); return; }   // MFP
+        case 104: if (it != 0) c.vi[it] = g_vif1_top & 0x3FFu; return;                                          // XTOP
+        case 105: if (it != 0) c.vi[it] = g_vif1_itop & 0x3FFu; return;                                         // XITOP
+        case 108: vu1_xgkick(c.vi[is]); return;                                                                 // XGKICK
+        case 112: r = x * x + y * y + z * z; break;                                                              // ESADD
+        case 113: { double d = x * x + y * y + z * z; r = d != 0.0 ? 1.0 / d : big; break; }                    // ERSADD
+        case 114: r = std::sqrt(x * x + y * y + z * z); break;                                                   // ELENG
+        case 115: { double d = std::sqrt(x * x + y * y + z * z); r = d != 0.0 ? 1.0 / d : big; break; }        // ERLENG
+        case 116: r = x != 0.0 ? std::atan(y / x) : (y < 0 ? -1.5707963267948966 : 1.5707963267948966); break; // EATANxy
+        case 117: r = x != 0.0 ? std::atan(z / x) : (z < 0 ? -1.5707963267948966 : 1.5707963267948966); break; // EATANxz
+        case 118: r = x + y + z + w; break;                                                                      // ESUM
+        case 120: r = std::sqrt(std::fabs(s)); break;                                                            // ESQRT
+        case 121: { double d = std::sqrt(std::fabs(s)); r = d != 0.0 ? 1.0 / d : big; break; }                  // ERSQRT
+        case 122: r = s != 0.0 ? 1.0 / s : big; break;                                                           // ERCPR
+        case 124: r = std::sin(s); break;                                                                        // ESIN
+        case 125: r = std::atan(s); break;                                                                       // EATAN
+        case 126: r = std::exp(-s); break;                                                                       // EEXP
+        default: return;                                                                                         // 123 WAITP: nada
+    }
+
+    c.vi[23] = ee_pack(r);
+}
+
+static void vu_run(VuUnit& u, uint32_t byte_addr)
+{
+    Ctx& c = *u.r;
+    const uint32_t* mem = reinterpret_cast<const uint32_t*>(u.micro);
+    uint32_t pc = (byte_addr >> 3) & u.imask;
+    int pend_target = -1, pend_cd = 0;
+    bool end_pending = false;
+    uint32_t q_val = 0;
+    int q_cd = 0;
+    unsigned steps = 0;
+
+    c.vf[0][0] = 0; c.vf[0][1] = 0; c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u;
+
+    for (; steps < 1000000u; steps++)
+    {
+        if (q_cd > 0 && --q_cd == 0)
+            c.vi[22] = q_val;
+
+        const uint32_t cur = pc;
+        const uint32_t lo = mem[cur * 2], hi = mem[cur * 2 + 1];
+        pc = (pc + 1) & u.imask;
+
+        const bool was_delay = pend_cd > 0;
+        const bool stop_after = end_pending;
+        int new_target = -1;
+        UmLowerWrite lw;
+
+        if (hi & 0x40000000u)
+            end_pending = true;
+
+        // ---- lower ----
+        if (hi & 0x80000000u)
+        {
+            c.vi[21] = lo;      // bit I: a palavra lower e um float imediato carregado em I
+        }
+        else
+        {
+            const int it = (lo >> 16) & 31, is = (lo >> 11) & 31, id = (lo >> 6) & 31;
+            const int dest = (lo >> 21) & 15;
+            const int32_t imm11 = ((int32_t)(lo << 21)) >> 21;
+            const uint32_t op7 = lo >> 25;
+
+            switch (op7)
+            {
+                case 0x00:   // LQ
+                {
+                    const uint32_t* q = um_q(u, c.vi[is] + (uint32_t)imm11);
+                    um_set_vf(lw, it, dest, q);
+                    break;
+                }
+                case 0x01:   // SQ fs, imm(it)
+                {
+                    uint32_t* q = um_q(u, c.vi[it] + (uint32_t)imm11);
+                    for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vf[is][l];
+                    break;
+                }
+                case 0x04:   // ILW
+                {
+                    const uint32_t* q = um_q(u, c.vi[is] + (uint32_t)imm11);
+                    if (it != 0) c.vi[it] = q[um_first_lane(dest)] & 0xFFFFu;
+                    break;
+                }
+                case 0x05:   // ISW
+                {
+                    uint32_t* q = um_q(u, c.vi[is] + (uint32_t)imm11);
+                    for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vi[it] & 0xFFFFu;
+                    break;
+                }
+                case 0x08: case 0x09:   // IADDIU / ISUBIU
+                {
+                    const uint32_t imm15 = ((lo >> 10) & 0x7800u) | (lo & 0x7FFu);
+                    if (it != 0) c.vi[it] = (op7 == 0x08 ? c.vi[is] + imm15 : c.vi[is] - imm15) & 0xFFFFu;
+                    break;
+                }
+                case 0x10: c.vi[1] = ((c.vi[18] & 0xFFFFFFu) == (lo & 0xFFFFFFu)) ? 1u : 0u; break;          // FCEQ
+                case 0x11: c.vi[18] = lo & 0xFFFFFFu; break;                                                   // FCSET
+                case 0x12: c.vi[1] = ((c.vi[18] & lo & 0xFFFFFFu) != 0) ? 1u : 0u; break;                     // FCAND
+                case 0x13: c.vi[1] = (((c.vi[18] | lo) & 0xFFFFFFu) == 0xFFFFFFu) ? 1u : 0u; break;           // FCOR
+                case 0x14: case 0x15: case 0x16: case 0x17:   // FSEQ FSSET FSAND FSOR
+                {
+                    const uint32_t imm12 = ((lo >> 10) & 0x800u) | (lo & 0x7FFu);
+                    if (op7 == 0x14 && it != 0) c.vi[it] = ((c.vi[16] & 0xFFFu) == imm12) ? 1u : 0u;
+                    else if (op7 == 0x15) c.vi[16] = (c.vi[16] & 0x3Fu) | (imm12 & 0xFC0u);
+                    else if (op7 == 0x16 && it != 0) c.vi[it] = c.vi[16] & imm12;
+                    else if (op7 == 0x17 && it != 0) c.vi[it] = (c.vi[16] | imm12) & 0xFFFu;
+                    break;
+                }
+                case 0x18: if (it != 0) c.vi[it] = (c.vi[is] == (c.vi[17] & 0xFFFFu)) ? 1u : 0u; break;        // FMEQ
+                case 0x1A: if (it != 0) c.vi[it] = c.vi[is] & c.vi[17] & 0xFFFFu; break;                       // FMAND
+                case 0x1B: if (it != 0) c.vi[it] = (c.vi[is] | c.vi[17]) & 0xFFFFu; break;                     // FMOR
+                case 0x1C: if (it != 0) c.vi[it] = c.vi[18] & 0xFFFu; break;                                   // FCGET
+                case 0x20: new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break;                   // B
+                case 0x21:                                                                                       // BAL
+                    if (it != 0) c.vi[it] = (cur + 2) & 0xFFFFu;
+                    new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask);
+                    break;
+                case 0x24: new_target = (int)(c.vi[is] & u.imask); break;                                       // JR
+                case 0x25:                                                                                       // JALR
+                    if (it != 0) c.vi[it] = (cur + 2) & 0xFFFFu;
+                    new_target = (int)(c.vi[is] & u.imask);
+                    break;
+                case 0x28: if (c.vi[it] == c.vi[is]) new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break;   // IBEQ
+                case 0x29: if (c.vi[it] != c.vi[is]) new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break;   // IBNE
+                case 0x2C: if ((int16_t)c.vi[is] < 0)  new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break; // IBLTZ
+                case 0x2D: if ((int16_t)c.vi[is] > 0)  new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break; // IBGTZ
+                case 0x2E: if ((int16_t)c.vi[is] <= 0) new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break; // IBLEZ
+                case 0x2F: if ((int16_t)c.vi[is] >= 0) new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break; // IBGEZ
+                case 0x40:   // lower "especial"
+                {
+                    const uint32_t funct = lo & 0x3Fu;
+                    const int fsf = (lo >> 21) & 3, ftf = (lo >> 23) & 3;
+
+                    if (funct == 0x30) { vu_iadd(c, id, is, it); break; }
+                    if (funct == 0x31) { vu_isub(c, id, is, it); break; }
+                    if (funct == 0x32) { vu_iaddi(c, it, is, ((int32_t)(lo << 21)) >> 27); break; }
+                    if (funct == 0x34) { vu_iand(c, id, is, it); break; }
+                    if (funct == 0x35) { vu_ior(c, id, is, it); break; }
+
+                    if (funct < 0x3C)
+                        break;
+
+                    const unsigned idx = (((lo >> 6) & 0x1Fu) << 2) | (funct & 3u);
+
+                    switch (idx)
+                    {
+                        case 48: um_set_vf(lw, it, dest, c.vf[is]); break;   // MOVE
+                        case 49: { uint32_t t[4] = { c.vf[is][1], c.vf[is][2], c.vf[is][3], c.vf[is][0] }; um_set_vf(lw, it, dest, t); break; }   // MR32
+                        case 52: case 54:   // LQI / LQD
+                        {
+                            if (idx == 54 && is != 0) c.vi[is] = (c.vi[is] - 1u) & 0xFFFFu;
+                            um_set_vf(lw, it, dest, um_q(u, c.vi[is]));
+                            if (idx == 52 && is != 0) c.vi[is] = (c.vi[is] + 1u) & 0xFFFFu;
+                            break;
+                        }
+                        case 53: case 55:   // SQI / SQD fs, (it)
+                        {
+                            if (idx == 55 && it != 0) c.vi[it] = (c.vi[it] - 1u) & 0xFFFFu;
+                            uint32_t* q = um_q(u, c.vi[it]);
+                            for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vf[is][l];
+                            if (idx == 53 && it != 0) c.vi[it] = (c.vi[it] + 1u) & 0xFFFFu;
+                            break;
+                        }
+                        case 56: case 57: case 58:   // DIV / SQRT / RSQRT: Q chega depois de 7 (13) ciclos
+                        {
+                            if (q_cd > 0) { c.vi[22] = q_val; q_cd = 0; }
+                            const uint32_t old_q = c.vi[22];
+                            if (idx == 56) vu_div(c, is, fsf, it, ftf);
+                            else if (idx == 57) vu_sqrt(c, it, ftf);
+                            else vu_rsqrt(c, is, fsf, it, ftf);
+                            q_val = c.vi[22];
+                            c.vi[22] = old_q;
+                            q_cd = idx == 58 ? 13 : 7;
+                            break;
+                        }
+                        case 59: if (q_cd > 0) { c.vi[22] = q_val; q_cd = 0; } break;   // WAITQ
+                        case 60: vu_mtir(c, it, is, fsf); break;                          // MTIR
+                        case 61: { uint32_t v = (uint32_t)(int32_t)(int16_t)c.vi[is]; uint32_t t[4] = { v, v, v, v }; um_set_vf(lw, it, dest, t); break; }   // MFIR
+                        case 62: { const uint32_t* q = um_q(u, c.vi[is]); if (it != 0) c.vi[it] = q[um_first_lane(dest)] & 0xFFFFu; break; }   // ILWR
+                        case 63: { uint32_t* q = um_q(u, c.vi[is]); for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vi[it] & 0xFFFFu; break; }   // ISWR
+                        case 64:   // RNEXT
+                        {
+                            uint32_t r = c.vi[20];
+                            const uint32_t b = ((r >> 4) & 1u) ^ ((r >> 22) & 1u);
+                            c.vi[20] = (((r << 1) & 0x7FFFFFu) | b) | 0x3F800000u;
+                            uint32_t v = c.vi[20]; uint32_t t[4] = { v, v, v, v }; um_set_vf(lw, it, dest, t);
+                            break;
+                        }
+                        case 65: { uint32_t v = c.vi[20]; uint32_t t[4] = { v, v, v, v }; um_set_vf(lw, it, dest, t); break; }   // RGET
+                        case 66: c.vi[20] = 0x3F800000u | (c.vf[is][fsf] & 0x7FFFFFu); break;                                      // RINIT
+                        case 67: c.vi[20] = 0x3F800000u | ((c.vi[20] ^ c.vf[is][fsf]) & 0x7FFFFFu); break;                         // RXOR
+                        default:
+                            if (u.vu1) um_vu1_special(u, c, lw, idx, it, is, dest, fsf);
+                            break;
+                    }
+
+                    break;
+                }
+                default: break;
+            }
+        }
+
+        // ---- upper ----
+        {
+            const uint32_t funct = hi & 0x3Fu;
+            const int dest = (hi >> 21) & 15, ft = (hi >> 16) & 31, fs = (hi >> 11) & 31, fd = (hi >> 6) & 31;
+
+            if (funct < 0x1C)
+            {
+                static const int ops[7] = { VU_ADD, VU_SUB, VU_MADD, VU_MSUB, VU_MAX, VU_MIN, VU_MUL };
+                um_arith(c, ops[funct >> 2], VU_SRC_X + (int)(funct & 3), dest, fd, fs, ft, 0);
+            }
+            else if (funct < 0x30)
+            {
+                switch (funct)
+                {
+                    case 0x1C: um_arith(c, VU_MUL,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x1D: um_arith(c, VU_MAX,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x1E: um_arith(c, VU_MUL,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x1F: um_arith(c, VU_MIN,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x20: um_arith(c, VU_ADD,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x21: um_arith(c, VU_MADD, VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x22: um_arith(c, VU_ADD,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x23: um_arith(c, VU_MADD, VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x24: um_arith(c, VU_SUB,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x25: um_arith(c, VU_MSUB, VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x26: um_arith(c, VU_SUB,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x27: um_arith(c, VU_MSUB, VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x28: um_arith(c, VU_ADD,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x29: um_arith(c, VU_MADD, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2A: um_arith(c, VU_MUL,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2B: um_arith(c, VU_MAX,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2C: um_arith(c, VU_SUB,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2D: um_arith(c, VU_MSUB, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2E: um_opmsub(c, fd, fs, ft); break;
+                    default:   um_arith(c, VU_MIN,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;   // 0x2F MINI
+                }
+            }
+            else if (funct >= 0x3C)
+            {
+                const unsigned idx = (((hi >> 6) & 0x1Fu) << 2) | (funct & 3u);
+
+                if (idx < 16)
+                {
+                    static const int ops[4] = { VU_ADD, VU_SUB, VU_MADD, VU_MSUB };
+                    um_arith(c, ops[idx >> 2], VU_SRC_X + (int)(idx & 3), dest, 0, fs, ft, 1);
+                }
+                else if (idx < 20) { static const int n[4] = { 0, 4, 12, 15 }; vu_itof(c, dest, ft, fs, n[idx - 16]); }
+                else if (idx < 24) { static const int n[4] = { 0, 4, 12, 15 }; vu_ftoi(c, dest, ft, fs, n[idx - 20]); }
+                else if (idx < 28) um_arith(c, VU_MUL, VU_SRC_X + (int)(idx - 24), dest, 0, fs, ft, 1);
+                else switch (idx)
+                {
+                    case 28: um_arith(c, VU_MUL,  VU_SRC_Q, dest, 0, fs, ft, 1); break;   // MULAq
+                    case 29: vu_abs(c, dest, ft, fs); break;
+                    case 30: um_arith(c, VU_MUL,  VU_SRC_I, dest, 0, fs, ft, 1); break;   // MULAi
+                    case 31: vu_clipw(c, fs, ft); break;
+                    case 32: um_arith(c, VU_ADD,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 33: um_arith(c, VU_MADD, VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 34: um_arith(c, VU_ADD,  VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 35: um_arith(c, VU_MADD, VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 36: um_arith(c, VU_SUB,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 37: um_arith(c, VU_MSUB, VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 38: um_arith(c, VU_SUB,  VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 39: um_arith(c, VU_MSUB, VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 40: um_arith(c, VU_ADD,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 41: um_arith(c, VU_MADD, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 42: um_arith(c, VU_MUL,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 44: um_arith(c, VU_SUB,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 45: um_arith(c, VU_MSUB, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 46: um_opmula(c, fs, ft); break;
+                    default: break;   // 47 NOP
+                }
+            }
+        }
+
+        // escrita adiada do lower (LQ, MOVE...): depois do upper, para ele ter lido os valores antigos
+        if (lw.vf != 0)
+            for (int l = 0; l < 4; l++)
+                if (lw.mask & (8 >> l)) c.vf[lw.vf][l] = lw.v[l];
+
+        c.vf[0][0] = 0; c.vf[0][1] = 0; c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u;
+        c.vi[0] = 0;
+
+        if (was_delay)
+        {
+            pend_cd = 0;
+            pc = (uint32_t)pend_target;
+            pend_target = -1;
+        }
+        else if (new_target >= 0)
+        {
+            pend_target = new_target;
+            pend_cd = 1;
+        }
+
+        if (stop_after)
+            break;
+    }
+
+    if (q_cd > 0)
+        c.vi[22] = q_val;
+
+    if (steps >= 1000000u)
+        std::fprintf(stderr, "  [VU%d] programa em 0x%04X nao terminou em 1e6 instrucoes: abortado\n", u.vu1 ? 1 : 0, byte_addr);
+
+    u.pc = pc;
+}
+
+// VU1: estado proprio (so VF, ACC, VI, Q, P, I, R e flags importam; o resto do Ctx fica sem uso).
+static Ctx g_vu1_regs;
+
+void vu0_run(Ctx& c, uint32_t byte_addr)
+{
+    g_vu0_runs++;
+    const uint64_t pt0 = prof_now();
+    VuUnit u = { &c, g_vu0_micro, g_vu0_data, 0x1FFu, 0xFFu, false, g_vu0_pc };
+    vu_run(u, byte_addr);
+    g_vu0_pc = u.pc;
+    g_prof_vu_ns += prof_now() - pt0;
+}
+
+void vu1_run(uint32_t byte_addr)
+{
+    g_vu1_runs++;
+    const uint64_t pt0 = prof_now();
+    VuUnit u = { &g_vu1_regs, g_vu1_micro, g_vu1_data, 0x7FFu, 0x3FFu, true, g_vu1_pc };
+    vu_run(u, byte_addr);
+    g_vu1_pc = u.pc;
+    g_prof_vu_ns += prof_now() - pt0;
+}
+
+// XGKICK: envia ao GIF (PATH1), a partir do quadword indicado da memoria de dados do VU1, ate o pacote com EOP.
+void vu1_xgkick(uint32_t qaddr)
+{
+    uint32_t a = qaddr & 0x3FFu;
+    bool eop = false;
+
+    for (unsigned guard = 0; guard < 4096; guard++)
+    {
+        const uint32_t* q = reinterpret_cast<const uint32_t*>(g_vu1_data) + ((a & 0x3FFu) * 4u);
+        const uint64_t lo = (uint64_t)q[0] | ((uint64_t)q[1] << 32), hi = (uint64_t)q[2] | ((uint64_t)q[3] << 32);
+
+        if (!g_gif.active && g_gif.image_left == 0)
+            eop = ((lo >> 15) & 1u) != 0;
+
+        g_gif.qword(lo, hi);
+        a++;
+        g_gs.xgkick_qw++;
+
+        if (!g_gif.active && g_gif.image_left == 0 && eop)
+            break;
+    }
+
+    g_gs.xgkicks++;
+}
+
+// VCALLMS / VCALLMSR: roda o microprograma (interpretador acima). PS2_VU0LOG=1 mostra o inicio de cada programa novo.
 void vu0_callms(Ctx& c, uint32_t address, uint32_t raw)
 {
+    static const bool log = std::getenv("PS2_VU0LOG") != nullptr;
     static unsigned count = 0;
     static uint32_t seen[64];
     static unsigned seen_n = 0;
@@ -5096,10 +6190,24 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw)
     if (is_new && seen_n < 64)
     {
         seen[seen_n++] = address;
-        std::fprintf(stderr, "  [VU0 stub] %s micro=0x%04X CMSAR0=0x%X (chamada %u; ra=0x%08X)\n",
-                     raw ? "VCALLMS" : "VCALLMSR", address, c.vi[27], count, (uint32_t)c.r[31].lo);
+        bool empty = true;
+        for (unsigned i = 0; i < 4096 && empty; i++)
+            if (g_vu0_micro[i] != 0) empty = false;
+
+        std::fprintf(stderr, "  [VU0] %s micro=0x%04X CMSAR0=0x%X (chamada %u; ra=0x%08X)%s\n",
+                     raw ? "VCALLMS" : "VCALLMSR", address, c.vi[27], count, (uint32_t)c.r[31].lo,
+                     empty ? "  ** micro memoria VAZIA: o microprograma nao foi carregado **" : "");
+
+        if (log)
+        {
+            const uint32_t* m = reinterpret_cast<const uint32_t*>(g_vu0_micro);
+
+            for (uint32_t i = 0; i < 40 && ((address >> 3) + i) < 512; i++)
+                std::fprintf(stderr, "    %04X: %08X %08X\n", (unsigned)(((address >> 3) + i) * 8), m[((address >> 3) + i) * 2 + 1], m[((address >> 3) + i) * 2]);
+        }
     }
 
+    vu0_run(c, address);
     c.vi[29] &= ~1u;   // VPU_STAT.VBS0: VU0 ocioso
 }
 
@@ -5276,6 +6384,162 @@ uint32_t ps2_mfc0(Ctx&, int reg)
 }
 
 void ps2_mtc0(Ctx&, int, uint32_t) {}
+
+// ---- janela do jogo (Win32/GDI): mostra o quadro que o GS por software desenhou ----
+// Fica no fim do arquivo de proposito: <windows.h> define macros que nao devem vazar para o resto do runtime.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#endif
+
+namespace
+{
+    HWND g_hwnd = nullptr;
+    volatile bool g_redraw = false;
+
+    LRESULT CALLBACK ps2_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+    {
+        switch (m)
+        {
+            case WM_CLOSE:
+            case WM_DESTROY:
+                std::fflush(stderr);
+                std::_Exit(0);
+
+            case WM_ERASEBKGND:
+                return 1;
+
+            case WM_PAINT:
+            {
+                PAINTSTRUCT ps;
+                BeginPaint(h, &ps);
+                EndPaint(h, &ps);
+                g_redraw = true;
+                return 0;
+            }
+
+            default:
+                break;
+        }
+
+        return DefWindowProcA(h, m, w, l);
+    }
+
+    void ps2_window_thread()
+    {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = ps2_wndproc;
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = "Ps2GameWindow";
+        RegisterClassA(&wc);
+
+        RECT r = { 0, 0, 640, 448 };
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+
+        HWND hw = CreateWindowExA(0, "Ps2GameWindow", "Shadow Hearts", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+
+        if (hw == nullptr)
+        {
+            std::fprintf(stderr, "  [janela] CreateWindow falhou (%lu)\n", (unsigned long)GetLastError());
+            return;
+        }
+
+        g_hwnd = hw;
+
+        unsigned seen = 0;
+        std::vector<uint32_t> pix;
+        uint32_t w = 0, h = 0;
+        unsigned last_flips = g_gs_flips.load();
+        std::chrono::steady_clock::time_point last_title = std::chrono::steady_clock::now();
+
+        for (;;)
+        {
+            MSG msg;
+
+            while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            }
+
+            const std::chrono::steady_clock::time_point tnow = std::chrono::steady_clock::now();
+
+            if (tnow - last_title >= std::chrono::seconds(1))
+            {
+                const unsigned f = g_gs_flips.load();
+                char title[96];
+                std::snprintf(title, sizeof title, "Shadow Hearts - %u trocas de buffer/s", f - last_flips);
+                SetWindowTextA(hw, title);
+                last_flips = f;
+                last_title = tnow;
+            }
+
+            unsigned seq = g_win_seq.load();
+            bool fresh = seq != seen;
+
+            if (fresh)
+            {
+                std::lock_guard<std::mutex> lk(g_win_mu);
+                pix = g_win_pix;
+                w = g_win_w;
+                h = g_win_h;
+                seen = seq;
+            }
+
+            if ((fresh || g_redraw) && !pix.empty())
+            {
+                g_redraw = false;
+
+                BITMAPINFO bi = {};
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = (LONG)w;
+                bi.bmiHeader.biHeight = -(LONG)h;       // de cima para baixo
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+
+                RECT cr;
+                GetClientRect(hw, &cr);
+                HDC dc = GetDC(hw);
+                StretchDIBits(dc, 0, 0, cr.right, cr.bottom, 0, 0, (int)w, (int)h, pix.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+                ReleaseDC(hw, dc);
+            }
+            else
+            {
+                Sleep(2);
+            }
+        }
+    }
+}
+
+void ps2_window_start()
+{
+    if (g_gswin)
+        std::thread(ps2_window_thread).detach();
+}
+
+bool ps2_key_down(int vk)
+{
+    if (g_hwnd != nullptr && GetForegroundWindow() != g_hwnd)
+        return false;
+
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+#else
+void ps2_window_start() {}
+bool ps2_key_down(int) { return false; }
+#endif
 """;
 
     public static string FunctionName(ElfSymbol function)
