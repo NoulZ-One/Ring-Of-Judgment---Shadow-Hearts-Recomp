@@ -335,7 +335,7 @@ static inline uint32_t ee_pack(double v)
 
     float r = (float)v;
     if (std::fabs((double)r) > std::fabs(v))
-        r = std::nextafterf(r, 0.0f);
+        r = f32(u32(r) - 1u);   // um ulp para zero (truncamento), sem chamar a libm
 
     uint32_t b = u32(r);
     if ((b & 0x7F800000u) == 0) b &= 0x80000000u;
@@ -1069,13 +1069,25 @@ static uint8_t g_vu0_data[4096];
 static uint8_t g_vu1_micro[16384];
 static uint8_t g_vu1_data[16384];
 uint32_t g_vif1_top = 0, g_vif1_itop = 0;
+static bool g_vu0_dirty = true, g_vu1_dirty = true;   // micro memoria mudou desde a ultima analise
+static bool g_vu0_flags = true, g_vu1_flags = true;   // algum programa le MAC/status (FSAND, FMAND...)?
 
 // Perfil (impresso a cada 2 s no resumo [gs]): tempo no DMA do GS/VIF, nos microprogramas e na janela.
-uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0;
+static const bool g_perf = std::getenv("PS2_PERF") != nullptr;   // relatorio [prof] sem precisar de PS2_GIFLOG
+std::atomic<bool> g_cap_request{false};   // F9: grava o trace dos proximos vsyncs em gs_captura_N.txt (sem custo quando nao usado)
+uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0, g_prof_raster_ns = 0, g_prof_img_ns = 0;
 static inline uint64_t prof_now()
 {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+struct ProfScope
+{
+    uint64_t& acc;
+    uint64_t t0;
+    explicit ProfScope(uint64_t& a) : acc(a), t0(prof_now()) {}
+    ~ProfScope() { acc += prof_now() - t0; }
+};
 void vu0_run(Ctx& c, uint32_t byte_addr);
 void vu1_run(uint32_t byte_addr);
 uint32_t g_vu0_pc_get();
@@ -1165,6 +1177,10 @@ void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
     if (uint8_t* vp = vu0_mem_ptr(phys, size))
     {
         std::memcpy(vp, &value, (size_t)size);
+
+        if (vp >= g_vu0_micro && vp < g_vu0_micro + sizeof g_vu0_micro) g_vu0_dirty = true;
+        else if (vp >= g_vu1_micro && vp < g_vu1_micro + sizeof g_vu1_micro) g_vu1_dirty = true;
+
         return;
     }
 
@@ -2439,6 +2455,9 @@ bool ps2_iso_open(const char* path)
 }
 
 // Ctrl+C: mostra o que o jogo estava fazendo (util quando ele fica preso em um laco).
+void ps2_install_crash_filter();   // filtro de excecoes do Windows (definido no fim do arquivo)
+void ps2_win_tune();               // resolucao do timer e anti-throttling do Windows (definido no fim do arquivo)
+
 static void on_interrupt(int)
 {
     std::fprintf(stderr, "\ninterrompido (Ctrl+C). Threads:\n");
@@ -2582,8 +2601,8 @@ static void irq_tick_thread()
 }
 
 // ---- entrada do controle: teclado (Windows) e roteiro por variavel de ambiente ----
-//   Teclado (so com a janela do jogo em foco): Enter=START, Backspace=SELECT, setas=direcional, Z=X(cruz), X=O(bola), A=quadrado, S=triangulo,
-//            Q=L1, W=R1, 1=L2, 2=R2.
+//   Teclado (so com a janela do jogo em foco): Enter=START, Backspace=SELECT, setas=direcional, Z=cruz, X=bola,
+//            C=quadrado, V=triangulo, Q=L1, E=R1, 1=L2, 3=R2, WASD=analogico esquerdo (com diagonais), IJKL=analogico direito.
 //   PS2_PAD_SCRIPT="START@10+0.2,CROSS@14+0.2": BOTAO@segundos+duracao (segundos desde o inicio do programa).
 //   Botoes: SELECT L3 R3 START UP RIGHT DOWN LEFT L2 R2 L1 R1 TRIANGLE CIRCLE CROSS SQUARE.
 void ps2_window_start();          // janela Win32 (definida no fim do arquivo; vazia fora do Windows)
@@ -2597,8 +2616,8 @@ namespace
     {
         { "SELECT",   0x0100, 0x08 }, { "L3",     0x0200, 0 }, { "R3",    0x0400, 0 }, { "START",  0x0800, 0x0D },
         { "UP",       0x1000, 0x26 }, { "RIGHT",  0x2000, 0x27 }, { "DOWN", 0x4000, 0x28 }, { "LEFT", 0x8000, 0x25 },
-        { "L2",       0x0001, 0x31 }, { "R2",     0x0002, 0x32 }, { "L1",   0x0004, 0x51 }, { "R1",   0x0008, 0x57 },
-        { "TRIANGLE", 0x0010, 0x53 }, { "CIRCLE", 0x0020, 0x58 }, { "CROSS", 0x0040, 0x5A }, { "SQUARE", 0x0080, 0x41 }
+        { "L2",       0x0001, 0x31 }, { "R2",     0x0002, 0x33 }, { "L1",   0x0004, 0x51 }, { "R1",   0x0008, 0x45 },
+        { "TRIANGLE", 0x0010, 0x56 }, { "CIRCLE", 0x0020, 0x58 }, { "CROSS", 0x0040, 0x5A }, { "SQUARE", 0x0080, 0x43 }
     };
 
     struct PadScriptEntry { uint16_t bit; double start; double end; };
@@ -2676,7 +2695,34 @@ static void pad_input_thread()
             last = pressed;
         }
 
-        ps2_pad_set_state(0, (uint16_t)~pressed, 0x80, 0x80, 0x80, 0x80);
+        auto axis = [](int neg, int pos) -> uint8_t
+        {
+            const bool n = ps2_key_down(neg), p = ps2_key_down(pos);
+            return (uint8_t)(n == p ? 0x80 : (n ? 0x00 : 0xFF));
+        };
+
+        const uint8_t lx = axis('A', 'D'), ly = axis('W', 'S'), rx = axis('J', 'L'), ry = axis('I', 'K');
+
+        static uint32_t last_sticks = 0x80808080u;
+        const uint32_t sticks = ((uint32_t)lx << 24) | ((uint32_t)ly << 16) | ((uint32_t)rx << 8) | ry;
+
+        if (sticks != last_sticks)
+        {
+            std::fprintf(stderr, "  [pad] analogico esq=(%02X,%02X) dir=(%02X,%02X)\n", lx, ly, rx, ry);
+            last_sticks = sticks;
+        }
+
+        {
+            static bool f9_last = false;
+            const bool f9 = ps2_key_down(0x78);   // VK_F9
+
+            if (f9 && !f9_last)
+                g_cap_request = true;
+
+            f9_last = f9;
+        }
+
+        ps2_pad_set_state(0, (uint16_t)~pressed, rx, ry, lx, ly);
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 }
@@ -2687,6 +2733,9 @@ void ps2_iso_open_default(int argc, char** argv)
 {
     std::signal(SIGINT, on_interrupt);
     std::signal(SIGSEGV, on_crash);
+    std::signal(SIGABRT, on_crash);
+    ps2_install_crash_filter();
+    ps2_win_tune();
     std::signal(SIGFPE, on_crash);
     std::signal(SIGILL, on_crash);
 
@@ -3850,6 +3899,11 @@ namespace
     uint32_t g_vram[1u << 20];                       // 4 MB
     uint8_t g_blk32[4][8], g_blk16[8][4], g_blk8[4][8], g_blk4[8][4];
     uint8_t g_col32[8][8], g_col16[8][16], g_col8[16][16];
+
+    // Z-buffer: blocos em ordem propria (PSMZ32 / PSMZ16 / PSMZ16S). O jogo usa Z16S (ZBP=140) com teste GEQUAL.
+    static const uint8_t g_blk32z[4][8] = { { 24, 25, 28, 29, 8, 9, 12, 13 }, { 26, 27, 30, 31, 10, 11, 14, 15 }, { 16, 17, 20, 21, 0, 1, 4, 5 }, { 18, 19, 22, 23, 2, 3, 6, 7 } };
+    static const uint8_t g_blk16z[8][4] = { { 24, 26, 16, 18 }, { 25, 27, 17, 19 }, { 28, 30, 20, 22 }, { 29, 31, 21, 23 }, { 8, 10, 0, 2 }, { 9, 11, 1, 3 }, { 12, 14, 4, 6 }, { 13, 15, 5, 7 } };
+    static const uint8_t g_blk16sz[8][4] = { { 24, 26, 8, 10 }, { 25, 27, 9, 11 }, { 16, 18, 0, 2 }, { 17, 19, 1, 3 }, { 28, 30, 12, 14 }, { 29, 31, 13, 15 }, { 20, 22, 4, 6 }, { 21, 23, 5, 7 } };
     uint16_t g_col4[16][32];
     bool g_gs_tables_ready = false;
 
@@ -3942,6 +3996,24 @@ namespace
         return ((page << 12) + ((bp & 31u) << 7) + ((uint32_t)g_blk16[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
     }
 
+    inline uint32_t ix_z32(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
+    {
+        uint32_t page = (bp >> 5) + (y >> 5) * bw + (x >> 6);
+        return ((page << 11) + ((bp & 31u) << 6) + ((uint32_t)g_blk32z[(y >> 3) & 3][(x >> 3) & 7] << 6) + g_col32[y & 7][x & 7]) & 0xFFFFFu;
+    }
+
+    inline uint32_t ix_z16(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)     // indice de meia-palavra
+    {
+        uint32_t page = (bp >> 5) + (y >> 6) * bw + (x >> 6);
+        return ((page << 12) + ((bp & 31u) << 7) + ((uint32_t)g_blk16z[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
+    }
+
+    inline uint32_t ix_z16s(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)    // indice de meia-palavra
+    {
+        uint32_t page = (bp >> 5) + (y >> 6) * bw + (x >> 6);
+        return ((page << 12) + ((bp & 31u) << 7) + ((uint32_t)g_blk16sz[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
+    }
+
     inline uint32_t ix_t8(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de byte
     {
         uint32_t pw = bw >> 1 ? bw >> 1 : 1;
@@ -3968,6 +4040,14 @@ namespace
             {
                 uint16_t v;
                 std::memcpy(&v, vram8() + (size_t)ix_ct16(bp, bw, x, y) * 2, 2);
+                return v;
+            }
+            case 0x30: return g_vram[ix_z32(bp, bw, x, y)];
+            case 0x31: return g_vram[ix_z32(bp, bw, x, y)] & 0xFFFFFFu;
+            case 0x32: case 0x3A:
+            {
+                uint16_t v;
+                std::memcpy(&v, vram8() + (size_t)(psm == 0x32 ? ix_z16(bp, bw, x, y) : ix_z16s(bp, bw, x, y)) * 2, 2);
                 return v;
             }
             case 0x13: return vram8()[ix_t8(bp, bw, x, y)];
@@ -3998,6 +4078,19 @@ namespace
             {
                 uint16_t h = (uint16_t)v;
                 std::memcpy(vram8() + (size_t)ix_ct16(bp, bw, x, y) * 2, &h, 2);
+                break;
+            }
+            case 0x30: g_vram[ix_z32(bp, bw, x, y)] = v; break;
+            case 0x31:
+            {
+                uint32_t& d = g_vram[ix_z32(bp, bw, x, y)];
+                d = (d & 0xFF000000u) | (v & 0xFFFFFFu);
+                break;
+            }
+            case 0x32: case 0x3A:
+            {
+                uint16_t h = (uint16_t)v;
+                std::memcpy(vram8() + (size_t)(psm == 0x32 ? ix_z16(bp, bw, x, y) : ix_z16s(bp, bw, x, y)) * 2, &h, 2);
                 break;
             }
             case 0x13: vram8()[ix_t8(bp, bw, x, y)] = (uint8_t)v; break;
@@ -4038,6 +4131,9 @@ namespace
     struct GsVertex
     {
         float x = 0, y = 0, r = 0, g = 0, b = 0, a = 0, u = 0, v = 0;
+        float us = 0, vs = 0, q = 1;   // S*largura, T*altura e Q crus (modo ST): interpolados e divididos por pixel
+        uint32_t z = 0;                // Z do vertice (24 bits em XYZF, 32 em XYZ)
+        bool persp = false;
     };
 
     struct GsState
@@ -4076,6 +4172,11 @@ namespace
         uint32_t r = (v & 31) << 3, g = ((v >> 5) & 31) << 3, b = ((v >> 10) & 31) << 3;
         return r | (g << 8) | (b << 16) | ((v & 0x8000) ? 0x80000000u : 0u);
     }
+
+    // Origem (cbp+1) de cada grupo de 16 entradas do buffer de CLUT; 0 = nunca carregado, 0xFFFFFFFF = formato fora do CT32.
+    uint32_t g_clut_prov[32] = {};
+    uint32_t g_clutfix_reloads = 0;
+    const bool g_clutfix = std::getenv("PS2_NOCLUTFIX") == nullptr;
 
     void gs_load_clut(uint64_t tex0)
     {
@@ -4116,40 +4217,132 @@ namespace
 
             g_st.clut[is4 ? ((csa * 16 + i) & 0x1FFu) : i] = gs_clut_color(cpsm, raw);   // CSA = posicao no buffer
         }
+
+        const uint32_t prov = (cpsm == 0x00 || cpsm == 0x01) ? cbp + 1u : 0xFFFFFFFFu;
+
+        if (is4)
+            g_clut_prov[csa & 31u] = prov;
+        else
+            for (int g = 0; g < 16; g++)
+                g_clut_prov[g] = prov;
+    }
+
+    // CLD=0 manda usar a CLUT "ja carregada", mas o buffer e unico e outras cargas (8 bits, ou 4 bits em CSA 0) o sobrescrevem.
+    // Se o desenho aponta um CBP diferente do que o grupo realmente contem, recarrega da VRAM (PS2_NOCLUTFIX=1 desliga).
+    void gs_clut_ensure(uint64_t tex0)
+    {
+        const uint32_t psm = (uint32_t)((tex0 >> 20) & 0x3F), cpsm = (uint32_t)((tex0 >> 51) & 0xF);
+
+        if (!g_clutfix || (cpsm != 0x00 && cpsm != 0x01))
+            return;
+
+        const bool is4 = psm == 0x14 || psm == 0x24 || psm == 0x2C, is8 = psm == 0x13 || psm == 0x1B;
+
+        if (!is4 && !is8)
+            return;
+
+        const uint32_t cbp = (uint32_t)((tex0 >> 37) & 0x3FFF), csa = (uint32_t)((tex0 >> 56) & 0x1F), want = cbp + 1u;
+        bool stale = false;
+
+        if (is4)
+            stale = g_clut_prov[csa & 31u] != want;
+        else
+            for (int g = 0; g < 16 && !stale; g++)
+                stale = g_clut_prov[g] != want;
+
+        if (!stale)
+            return;
+
+        if (g_clutfix_reloads++ < 6)
+            std::fprintf(stderr, "  [clut] recarga: psm=0x%02X cbp=%u csa=%u (o buffer tinha outra origem)\n", psm, cbp, csa);
+
+        // Recarrega as 256 entradas (imagem 16x16 de CT32 no CBP): a CLUT da fonte guarda uma paleta de 16 cores por CSA
+        // (branco em CSA 0, ciano em CSA 1...). Os 16 primeiros itens coincidem com a carga de 4 bits.
+        gs_load_clut((tex0 & ~(0x3Full << 20) & ~(0x1Full << 56)) | (0x13ull << 20));
     }
 
     // Cor do texel (RGBA 8 bits; alpha 0x80 = opaco como no GS)
-    uint32_t gs_texel(const GsCtx& c, int iu, int iv)
+    // floor/ceil sem chamar a libm (a chamada por pixel era o maior custo do rasterizador). Fora de +-1e9 devolvem 0.
+    static inline int fast_floor(float f)
     {
-        uint32_t tbp = (uint32_t)(c.tex0 & 0x3FFF), tbw = (uint32_t)((c.tex0 >> 14) & 0x3F);
-        uint32_t psm = (uint32_t)((c.tex0 >> 20) & 0x3F);
-        int tw = (int)((c.tex0 >> 26) & 0xF), th = (int)((c.tex0 >> 30) & 0xF);
-        int w = 1 << tw, h = 1 << th;
+        if (!(f > -1e9f && f < 1e9f))
+            return 0;
 
-        auto wrap = [](int v, int size, unsigned mode, int minv, int maxv)
+        const int i = (int)f;
+        return (float)i > f ? i - 1 : i;
+    }
+
+    static inline int fast_ceil(float f)
+    {
+        if (!(f > -1e9f && f < 1e9f))
+            return 0;
+
+        const int i = (int)f;
+        return (float)i < f ? i + 1 : i;
+    }
+
+    // Parametros da textura decodificados uma vez por primitiva (o TEX0/CLAMP/TEX1 nao mudam dentro dela).
+    struct TexInfo
+    {
+        uint32_t tbp = 0, tbw = 0, psm = 0, csa16 = 0, a0 = 0, a1 = 0;
+        int w = 1, h = 1, uminv = 0, umaxv = 0, vminv = 0, vmaxv = 0;
+        unsigned umode = 0, vmode = 0, tfx = 0;
+        bool tcc = false, aem = false, linear = false;
+    };
+
+    void gs_tex_info(const GsCtx& c, TexInfo& t)
+    {
+        gs_clut_ensure(c.tex0);
+
+        t.tbp = (uint32_t)(c.tex0 & 0x3FFF);
+        t.tbw = (uint32_t)((c.tex0 >> 14) & 0x3F);
+        t.psm = (uint32_t)((c.tex0 >> 20) & 0x3F);
+        t.w = 1 << (int)((c.tex0 >> 26) & 0xF);
+        t.h = 1 << (int)((c.tex0 >> 30) & 0xF);
+        t.umode = (unsigned)(c.clamp & 3);
+        t.vmode = (unsigned)((c.clamp >> 2) & 3);
+        t.uminv = (int)((c.clamp >> 4) & 0x3FF);
+        t.umaxv = (int)((c.clamp >> 14) & 0x3FF);
+        t.vminv = (int)((c.clamp >> 24) & 0x3FF);
+        t.vmaxv = (int)((c.clamp >> 34) & 0x3FF);
+        t.csa16 = ((uint32_t)(c.tex0 >> 56) & 0x1Fu) * 16u;
+        t.tcc = ((c.tex0 >> 34) & 1) != 0;
+        t.tfx = (unsigned)((c.tex0 >> 35) & 3);
+        t.a0 = (uint32_t)(g_st.texa & 0xFF);
+        t.a1 = (uint32_t)((g_st.texa >> 32) & 0xFF);
+        t.aem = (g_st.texa & 0x8000) != 0;
+
+        const unsigned mmag = (unsigned)((c.tex1 >> 5) & 1), mmin = (unsigned)((c.tex1 >> 6) & 7);
+        static const bool nobilinear = std::getenv("PS2_NOBILINEAR") != nullptr;
+        t.linear = !nobilinear && (mmag != 0 || mmin == 1 || mmin == 4 || mmin == 5);
+    }
+
+    static inline int gs_tex_wrap(int v, int size, unsigned mode, int minv, int maxv)
+    {
+        switch (mode)
         {
-            switch (mode)
-            {
-                case 0: return v & (size - 1);
-                case 1: return v < 0 ? 0 : (v >= size ? size - 1 : v);
-                case 2: return v < minv ? minv : (v > maxv ? maxv : v);
-                default: return (v & minv) | maxv;
-            }
-        };
+            case 0: return v & (size - 1);
+            case 1: return v < 0 ? 0 : (v >= size ? size - 1 : v);
+            case 2: return v < minv ? minv : (v > maxv ? maxv : v);
+            default: return (v & minv) | maxv;
+        }
+    }
 
-        iu = wrap(iu, w, (unsigned)(c.clamp & 3), (int)((c.clamp >> 4) & 0x3FF), (int)((c.clamp >> 14) & 0x3FF));
-        iv = wrap(iv, h, (unsigned)((c.clamp >> 2) & 3), (int)((c.clamp >> 24) & 0x3FF), (int)((c.clamp >> 34) & 0x3FF));
+    uint32_t gs_texel(const TexInfo& t, int iu, int iv)
+    {
+        iu = gs_tex_wrap(iu, t.w, t.umode, t.uminv, t.umaxv);
+        iv = gs_tex_wrap(iv, t.h, t.vmode, t.vminv, t.vmaxv);
 
-        uint32_t raw = gs_read_px(psm, tbp, tbw, (uint32_t)iu, (uint32_t)iv);
+        const uint32_t raw = gs_read_px(t.psm, t.tbp, t.tbw, (uint32_t)iu, (uint32_t)iv);
 
-        switch (psm)
+        switch (t.psm)
         {
             case 0x00: return raw;
             case 0x01:
             {
-                uint32_t a = (uint32_t)(g_st.texa & 0xFF);
+                uint32_t a = t.a0;
 
-                if ((g_st.texa & 0x8000) && (raw & 0xFFFFFF) == 0)
+                if (t.aem && (raw & 0xFFFFFF) == 0)
                     a = 0;
 
                 return (raw & 0xFFFFFFu) | (a << 24);
@@ -4157,41 +4350,135 @@ namespace
             case 0x02: case 0x0A:
             {
                 uint32_t r = (raw & 31) << 3, g = ((raw >> 5) & 31) << 3, b = ((raw >> 10) & 31) << 3;
-                uint32_t a = (raw & 0x8000) ? (uint32_t)((g_st.texa >> 32) & 0xFF) : (uint32_t)(g_st.texa & 0xFF);
+                uint32_t a = (raw & 0x8000) ? t.a1 : t.a0;
 
-                if ((g_st.texa & 0x8000) && (raw & 0x7FFF) == 0)
+                if (t.aem && (raw & 0x7FFF) == 0)
                     a = 0;
 
                 return r | (g << 8) | (b << 16) | (a << 24);
             }
             case 0x13: case 0x1B: return g_st.clut[raw & 0xFF];
-            case 0x14: case 0x24: case 0x2C: return g_st.clut[(((uint32_t)(c.tex0 >> 56) & 0x1Fu) * 16 + (raw & 0xFu)) & 0x1FFu];
+            case 0x14: case 0x24: case 0x2C: return g_st.clut[(t.csa16 + (raw & 0xFu)) & 0x1FFu];
             default: return 0xFF00FF | 0x80000000u;   // formato nao suportado: magenta
         }
     }
 
-    void gs_pixel(int ci, int x, int y, float fr, float fg, float fb, float fa, float u, float v)
+    // Amostra a textura em (u, v) (coordenadas em texels): vizinho mais proximo ou bilinear (TEX1.MMAG/MMIN).
+    uint32_t gs_sample(const TexInfo& t, float u, float v)
+    {
+        if (!t.linear)
+            return gs_texel(t, (int)fast_floor(u), (int)fast_floor(v));
+
+        const float fu = u - 0.5f, fv = v - 0.5f;
+        const int iu = (int)fast_floor(fu), iv = (int)fast_floor(fv);
+        const int wu = (int)((fu - (float)iu) * 256.0f), wv = (int)((fv - (float)iv) * 256.0f);
+
+        if (wu < 4 && wv < 4)    // alinhado ao texel (mapeamento 1:1): sem mistura
+            return gs_texel(t, iu, iv);
+
+        const uint32_t t00 = gs_texel(t, iu, iv), t10 = gs_texel(t, iu + 1, iv), t01 = gs_texel(t, iu, iv + 1), t11 = gs_texel(t, iu + 1, iv + 1);
+        uint32_t out = 0;
+
+        for (int sh = 0; sh < 32; sh += 8)
+        {
+            const int c00 = (int)((t00 >> sh) & 0xFF), c10 = (int)((t10 >> sh) & 0xFF), c01 = (int)((t01 >> sh) & 0xFF), c11 = (int)((t11 >> sh) & 0xFF);
+            const int top = c00 * (256 - wu) + c10 * wu, bot = c01 * (256 - wu) + c11 * wu;
+            out |= (uint32_t)(((top * (256 - wv) + bot * wv) >> 16) & 0xFF) << sh;
+        }
+
+        return out;
+    }
+
+    // Estado do pixel decodificado uma vez por primitiva (antes era refeito a cada pixel).
+    struct PixCfg
+    {
+        int sx0 = 0, sx1 = 0, sy0 = 0, sy1 = 0;
+        bool tme = false, ate = false, abe = false, is16 = false, need_dst = false, clamp = true;
+        unsigned atst = 1, afail = 0, A = 0, B = 0, C = 0, D = 0;
+        int aref = 0, fix = 0;
+        uint32_t fbp = 0, fbw = 0, fpsm = 0, fbmsk = 0;
+        // Z-buffer: ZBUF (ZBP, PSM, ZMSK) + TEST.ZTE/ZTST. zactive = precisa ler e/ou escrever Z.
+        bool zte = false, zmsk = true, zactive = false;
+        unsigned ztst = 1;
+        uint32_t zbp = 0, zpsm = 0x3A, zmax = 0xFFFF;
+        TexInfo ti;
+    };
+
+    void gs_pix_cfg(int ci, PixCfg& p)
     {
         const GsCtx& c = g_st.ctx[ci];
+        p.sx0 = std::max(0, (int)(c.scissor & 0x7FF)); p.sx1 = (int)((c.scissor >> 16) & 0x7FF);
+        p.sy0 = std::max(0, (int)((c.scissor >> 32) & 0x7FF)); p.sy1 = (int)((c.scissor >> 48) & 0x7FF);
+        p.tme = (g_st.prim & 0x10) != 0;
+        p.abe = (g_st.prim & 0x40) != 0;
+        p.ate = (c.test & 1) != 0;
+        p.atst = (unsigned)((c.test >> 1) & 7);
+        p.aref = (int)((c.test >> 4) & 0xFF);
+        p.afail = (unsigned)((c.test >> 12) & 3);
+        p.fbp = (uint32_t)(c.frame & 0x1FF) * 32; p.fbw = (uint32_t)((c.frame >> 16) & 0x3F); p.fpsm = (uint32_t)((c.frame >> 24) & 0x3F);
+        p.fbmsk = (uint32_t)(c.frame >> 32);
+        p.is16 = p.fpsm == 0x02 || p.fpsm == 0x0A;
+        p.A = (unsigned)(c.alpha & 3); p.B = (unsigned)((c.alpha >> 2) & 3); p.C = (unsigned)((c.alpha >> 4) & 3); p.D = (unsigned)((c.alpha >> 6) & 3);
+        p.fix = (int)((c.alpha >> 32) & 0xFF);
+        p.clamp = (g_st.colclamp & 1) != 0;
+        p.need_dst = p.abe || p.fbmsk != 0 || (p.ate && p.afail == 3) || p.fpsm == 0x01;   // o destino so e lido se influencia o resultado
 
-        // scissor (limites inclusivos)
-        int sx0 = (int)(c.scissor & 0x7FF), sx1 = (int)((c.scissor >> 16) & 0x7FF);
-        int sy0 = (int)((c.scissor >> 32) & 0x7FF), sy1 = (int)((c.scissor >> 48) & 0x7FF);
+        p.zte = ((c.test >> 16) & 1) != 0;
+        p.ztst = (unsigned)((c.test >> 17) & 3);
+        p.zbp = (uint32_t)(c.zbuf & 0x1FF) * 32;
+        p.zpsm = 0x30u | (uint32_t)((c.zbuf >> 24) & 0xF);
+        p.zmsk = ((c.zbuf >> 32) & 1) != 0;
+        p.zmax = p.zpsm == 0x30 ? 0xFFFFFFFFu : (p.zpsm == 0x31 ? 0xFFFFFFu : 0xFFFFu);
+        p.zactive = p.zte && (p.ztst != 1 || !p.zmsk);   // ALWAYS com ZMSK=1 nao le nem escreve nada
 
-        if (x < sx0 || x > sx1 || y < sy0 || y > sy1 || x < 0 || y < 0)
+        if (p.tme)
+            gs_tex_info(c, p.ti);
+    }
+
+    static inline int gs_clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+    static inline int gs_f2i255(float v) { return v <= 0.0f ? 0 : (v >= 255.0f ? 255 : (int)v); }   // limita antes de converter (sem estouro de int)
+
+    static inline uint32_t gs_zread(const PixCfg& pc, uint32_t x, uint32_t y) { return gs_read_px(pc.zpsm, pc.zbp, pc.fbw, x, y); }
+    static inline void gs_zwrite(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z) { gs_write_px(pc.zpsm, pc.zbp, pc.fbw, x, y, z & pc.zmax); }
+
+    // Teste de profundidade. Devolve false se o pixel deve ser descartado; escreve o Z quando permitido.
+    static inline bool gs_ztest(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z, bool z_write_ok)
+    {
+        const uint32_t zt = z & pc.zmax;
+
+        if (pc.ztst >= 2)
+        {
+            const uint32_t zo = gs_zread(pc, x, y) & pc.zmax;
+
+            if (pc.ztst == 2 ? !(zt >= zo) : !(zt > zo))
+                return false;
+        }
+        else if (pc.ztst == 0)
+        {
+            return false;
+        }
+
+        if (z_write_ok && !pc.zmsk)
+            gs_zwrite(pc, x, y, zt);
+
+        return true;
+    }
+
+    void gs_pixel(const PixCfg& pc, int x, int y, float fr, float fg, float fb, float fa, float u, float v, uint32_t z = 0)
+    {
+        if (x < pc.sx0 || x > pc.sx1 || y < pc.sy0 || y > pc.sy1)
             return;
 
-        int vr = (int)gs_clampf(fr, 0, 255), vg = (int)gs_clampf(fg, 0, 255), vb = (int)gs_clampf(fb, 0, 255), va = (int)gs_clampf(fa, 0, 255);
+        int vr = gs_f2i255(fr), vg = gs_f2i255(fg), vb = gs_f2i255(fb), va = gs_f2i255(fa);
         int r = vr, g = vg, b = vb, a = va;
 
-        if (g_st.prim & 0x10)   // TME
+        if (pc.tme)
         {
-            uint32_t t = gs_texel(c, (int)std::floor(u), (int)std::floor(v));
-            int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
-            bool tcc = ((c.tex0 >> 34) & 1) != 0;
-            unsigned tfx = (unsigned)((c.tex0 >> 35) & 3);
+            const uint32_t t = gs_sample(pc.ti, u, v);
+            const int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
+            const bool tcc = pc.ti.tcc;
 
-            switch (tfx)
+            switch (pc.ti.tfx)
             {
                 case 0:   // MODULATE
                     r = std::min(255, tr * vr >> 7); g = std::min(255, tg * vg >> 7); b = std::min(255, tb * vb >> 7);
@@ -4202,104 +4489,137 @@ namespace
                     break;
                 default:  // HIGHLIGHT / HIGHLIGHT2
                     r = std::min(255, (tr * vr >> 7) + va); g = std::min(255, (tg * vg >> 7) + va); b = std::min(255, (tb * vb >> 7) + va);
-                    a = (tfx == 2 && tcc) ? std::min(255, ta + va) : (tcc ? ta : va);
+                    a = (pc.ti.tfx == 2 && tcc) ? std::min(255, ta + va) : (tcc ? ta : va);
                     break;
             }
         }
 
-        // alpha test
-        bool afail_rgb_only = false;
+        bool afail_rgb_only = false, fb_ok = true, z_write_ok = true;
 
-        if (c.test & 1)
+        if (pc.ate)
         {
-            int aref = (int)((c.test >> 4) & 0xFF);
             bool pass = true;
 
-            switch ((c.test >> 1) & 7)
+            switch (pc.atst)
             {
                 case 0: pass = false; break;
-                case 2: pass = a < aref; break;
-                case 3: pass = a <= aref; break;
-                case 4: pass = a == aref; break;
-                case 5: pass = a >= aref; break;
-                case 6: pass = a > aref; break;
-                case 7: pass = a != aref; break;
+                case 2: pass = a < pc.aref; break;
+                case 3: pass = a <= pc.aref; break;
+                case 4: pass = a == pc.aref; break;
+                case 5: pass = a >= pc.aref; break;
+                case 6: pass = a > pc.aref; break;
+                case 7: pass = a != pc.aref; break;
                 default: break;
             }
 
             if (!pass)
             {
-                // AFAIL: 0 KEEP, 1 FB_ONLY, 2 ZB_ONLY, 3 RGB_ONLY (nao ha Z buffer aqui: ZB_ONLY nao escreve nada)
-                unsigned afail = (unsigned)((c.test >> 12) & 3);
-
-                if (afail == 0 || afail == 2)
-                    return;
-
-                afail_rgb_only = afail == 3;
+                // AFAIL: 0 KEEP (nada), 1 FB_ONLY (cor, sem Z), 2 ZB_ONLY (so Z), 3 RGB_ONLY (RGB, sem alfa e sem Z)
+                switch (pc.afail)
+                {
+                    case 0: return;
+                    case 1: z_write_ok = false; break;
+                    case 2: fb_ok = false; break;
+                    default: z_write_ok = false; afail_rgb_only = true; break;
+                }
             }
         }
 
-        uint32_t fbp = (uint32_t)(c.frame & 0x1FF) * 32, fbw = (uint32_t)((c.frame >> 16) & 0x3F), fpsm = (uint32_t)((c.frame >> 24) & 0x3F);
-        uint32_t fbmsk = (uint32_t)(c.frame >> 32);
-        uint32_t dst = gs_read_px(fpsm, fbp, fbw, (uint32_t)x, (uint32_t)y);
-        int dr, dg, db, da;
+        if (pc.zactive && !gs_ztest(pc, (uint32_t)x, (uint32_t)y, z, z_write_ok))
+            return;
 
-        if (fpsm == 0x02 || fpsm == 0x0A)
-        {
-            dr = (int)((dst & 31) << 3); dg = (int)(((dst >> 5) & 31) << 3); db = (int)(((dst >> 10) & 31) << 3);
-            da = (dst & 0x8000) ? 0x80 : 0;
-        }
-        else
-        {
-            dr = (int)(dst & 0xFF); dg = (int)((dst >> 8) & 0xFF); db = (int)((dst >> 16) & 0xFF); da = (int)((dst >> 24) & 0xFF);
-        }
+        if (!fb_ok)
+            return;
 
-        if (g_st.prim & 0x40)   // ABE: (A - B) * C >> 7 + D
-        {
-            auto pick = [&](unsigned sel, int cs, int cd) { return sel == 0 ? cs : (sel == 1 ? cd : 0); };
-            unsigned A = (unsigned)(c.alpha & 3), B = (unsigned)((c.alpha >> 2) & 3), C = (unsigned)((c.alpha >> 4) & 3), D = (unsigned)((c.alpha >> 6) & 3);
-            int fix = (int)((c.alpha >> 32) & 0xFF);
-            int cf = C == 0 ? a : (C == 1 ? da : fix);
-            int nr = (((pick(A, r, dr) - pick(B, r, dr)) * cf) >> 7) + pick(D, r, dr);
-            int ng = (((pick(A, g, dg) - pick(B, g, dg)) * cf) >> 7) + pick(D, g, dg);
-            int nb = (((pick(A, b, db) - pick(B, b, db)) * cf) >> 7) + pick(D, b, db);
+        uint32_t dst = 0;
+        int dr = 0, dg = 0, db = 0, da = 0;
 
-            if (g_st.colclamp & 1)
+        if (pc.need_dst)
+        {
+            dst = gs_read_px(pc.fpsm, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+
+            if (pc.is16)
             {
-                r = nr < 0 ? 0 : (nr > 255 ? 255 : nr); g = ng < 0 ? 0 : (ng > 255 ? 255 : ng); b = nb < 0 ? 0 : (nb > 255 ? 255 : nb);
+                dr = (int)((dst & 31) << 3); dg = (int)(((dst >> 5) & 31) << 3); db = (int)(((dst >> 10) & 31) << 3);
+                da = (dst & 0x8000) ? 0x80 : 0;
             }
             else
             {
-                r = nr & 0xFF; g = ng & 0xFF; b = nb & 0xFF;
+                dr = (int)(dst & 0xFF); dg = (int)((dst >> 8) & 0xFF); db = (int)((dst >> 16) & 0xFF); da = (int)((dst >> 24) & 0xFF);
             }
         }
 
-        uint32_t out;
+        if (pc.abe)   // (A - B) * C >> 7 + D
+        {
+            auto pick = [](unsigned sel, int cs, int cd) { return sel == 0 ? cs : (sel == 1 ? cd : 0); };
+            const int cf = pc.C == 0 ? a : (pc.C == 1 ? da : pc.fix);
+            const int nr = (((pick(pc.A, r, dr) - pick(pc.B, r, dr)) * cf) >> 7) + pick(pc.D, r, dr);
+            const int ng = (((pick(pc.A, g, dg) - pick(pc.B, g, dg)) * cf) >> 7) + pick(pc.D, g, dg);
+            const int nb = (((pick(pc.A, b, db) - pick(pc.B, b, db)) * cf) >> 7) + pick(pc.D, b, db);
 
-        if (fpsm == 0x02 || fpsm == 0x0A)
-            out = (uint32_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >= 0x80) ? 0x8000 : 0));
-        else
-            out = (uint32_t)(r | (g << 8) | (b << 16) | (a << 24));
+            if (pc.clamp) { r = gs_clamp255(nr); g = gs_clamp255(ng); b = gs_clamp255(nb); }
+            else { r = nr & 0xFF; g = ng & 0xFF; b = nb & 0xFF; }
+        }
+
+        uint32_t out = pc.is16 ? (uint32_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | ((a >= 0x80) ? 0x8000 : 0))
+                               : (uint32_t)(r | (g << 8) | (b << 16) | (a << 24));
 
         if (afail_rgb_only)   // AFAIL = RGB_ONLY: o alfa do destino e mantido
-            out = (fpsm == 0x02 || fpsm == 0x0A) ? ((out & 0x7FFFu) | (dst & 0x8000u)) : ((out & 0x00FFFFFFu) | (dst & 0xFF000000u));
+            out = pc.is16 ? ((out & 0x7FFFu) | (dst & 0x8000u)) : ((out & 0x00FFFFFFu) | (dst & 0xFF000000u));
 
-        if (fbmsk != 0)
-            out = (dst & fbmsk) | (out & ~fbmsk);
+        if (pc.fbmsk != 0)
+            out = (dst & pc.fbmsk) | (out & ~pc.fbmsk);
 
-        gs_write_px(fpsm, fbp, fbw, (uint32_t)x, (uint32_t)y, out);
+        if (pc.fpsm == 0x00)
+            g_vram[ix_ct32(pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y)] = out;
+        else
+            gs_write_px(pc.fpsm, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y, out);
+    }
+
+    // Versao avulsa (pontos): decodifica o estado a cada chamada.
+    void gs_pixel(int ci, int x, int y, float fr, float fg, float fb, float fa, float u, float v, uint32_t z = 0)
+    {
+        PixCfg pc;
+        gs_pix_cfg(ci, pc);
+        gs_pixel(pc, x, y, fr, fg, fb, fa, u, v, z);
     }
 
     // Diagnostico do GS. Dois modos:
     //  PS2_GSTRACE=<quantos> [PS2_GSTRACE_SKIP=<n>]: imprime o estado de cada desenho (sprite/triangulo), a partir do n-esimo.
     //  PS2_GSTRACE_DUMP=1: guarda os ultimos desenhos e, a cada dump de quadro (PS2_GSDUMP), imprime os dos 2 ultimos vsyncs.
     static std::deque<std::pair<unsigned, std::string>> g_trace_ring;
+
+    // O trace detalhado vai para gs_trace.txt (escrita em arquivo e rapida). Imprimir milhares de linhas no console/pipe do
+    // PowerShell travava o jogo por varios segundos a cada dump. PS2_GSTRACE_STDERR=1 volta a imprimir no stderr.
+    static FILE* gs_trace_out()
+    {
+        static FILE* f = nullptr;
+        static bool tried = false;
+
+        if (std::getenv("PS2_GSTRACE_STDERR") != nullptr)
+            return stderr;
+
+        if (!tried)
+        {
+            tried = true;
+            f = std::fopen("gs_trace.txt", "w");
+
+            if (f != nullptr)
+                std::fprintf(stderr, "  [gs] trace detalhado em gs_trace.txt\n");
+        }
+
+        return f != nullptr ? f : stderr;
+    }
     static std::string g_trace_chain;   // quem disparou o DMA que esta sendo processado (ver gs_trace_set_caller)
     static unsigned long g_trace_draws = 0;   // total de sprites/triangulos desenhados (conta sempre)
     // Por kick de DMA (so quando o trace esta ligado): vertices chutados, triangulos de area zero e primeiro/ultimo vertice.
     static unsigned long g_trace_vtx = 0, g_trace_degen = 0;
     static char g_trace_v0[200] = "", g_trace_vn[200] = "";
     static char g_trace_all[1200] = "";   // todos os vertices (ate 8) do kick: raw XY (12.4) + posicao + uv
+
+    static std::set<unsigned> g_cap_cbps;   // CBPs de CLUT usados pelos desenhos da captura
+    static bool g_cap_active = false;     // captura por F9 em andamento
+    static unsigned g_cap_until = 0, g_cap_count = 0;
 
     static bool gs_trace_enabled()
     {
@@ -4308,7 +4628,7 @@ namespace
         if (on < 0)
             on = (std::getenv("PS2_GSTRACE") != nullptr || std::getenv("PS2_GSTRACE_DUMP") != nullptr) ? 1 : 0;
 
-        return on == 1;
+        return on == 1 || g_cap_active;
     }
 
     // Cadeia de chamadores de quem escreveu no CHCR do DMA: $ra e, varrendo a pilha, enderecos de retorno plausiveis
@@ -4373,40 +4693,120 @@ namespace
 
         g_trace_draws++;
 
-        if (count <= 0 && !ring)
+        const bool rec = ring || g_cap_active;
+
+        if (g_cap_active)
+            g_cap_cbps.insert((unsigned)((g_st.ctx[ci].tex0 >> 37) & 0x3FFF));
+
+        if (count <= 0 && !rec)
             return;
 
         long n = seen++;
         bool direct = count > 0 && n >= skip;
 
-        if (!direct && !ring)
+        if (!direct && !rec)
             return;
 
         if (direct)
             count--;
 
         const GsCtx& c = g_st.ctx[ci];
-        char buf[1700];
+        char buf[2600];
         std::snprintf(buf, sizeof(buf),
             "  [gs] draw #%ld vs=%u %s ctx=%d prim=0x%03X (%.1f,%.1f)-(%.1f,%.1f) tex0: tbp=%u tbw=%u psm=0x%02X tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%X csa=%u cld=%u"
-            " | tex1=0x%llX clamp=0x%llX alpha=0x%llX test=0x%llX texa=0x%llX | frame: fbp=%u fbw=%u psm=0x%02X fbmsk=0x%08X | chamada: %s",
+            " | tex1=0x%llX clamp=0x%llX alpha=0x%llX test=0x%llX texa=0x%llX | frame: fbp=%u fbw=%u psm=0x%02X fbmsk=0x%08X | v0=%s vn=%s scissor=0x%llX ofs=0x%llX zbuf=0x%llX | chamada: %s",
             n, g_gs_vsyncs, kind, ci, (unsigned)g_st.prim, x0, y0, x1, y1,
             (unsigned)(c.tex0 & 0x3FFF), (unsigned)((c.tex0 >> 14) & 0x3F), (unsigned)((c.tex0 >> 20) & 0x3F),
             (unsigned)((c.tex0 >> 26) & 0xF), (unsigned)((c.tex0 >> 30) & 0xF), (unsigned)((c.tex0 >> 34) & 1), (unsigned)((c.tex0 >> 35) & 3),
             (unsigned)((c.tex0 >> 37) & 0x3FFF), (unsigned)((c.tex0 >> 51) & 0xF), (unsigned)((c.tex0 >> 56) & 0x1F), (unsigned)(c.tex0 >> 61),
             (unsigned long long)c.tex1, (unsigned long long)c.clamp, (unsigned long long)c.alpha, (unsigned long long)c.test, (unsigned long long)g_st.texa,
             (unsigned)(c.frame & 0x1FF), (unsigned)((c.frame >> 16) & 0x3F), (unsigned)((c.frame >> 24) & 0x3F), (unsigned)(c.frame >> 32),
+            g_trace_v0, g_trace_vn, (unsigned long long)c.scissor, (unsigned long long)c.xyoffset, (unsigned long long)c.zbuf,
             g_trace_chain.c_str());
 
         if (direct)
-            std::fprintf(stderr, "%s\n", buf);
+            std::fprintf(gs_trace_out(), "%s\n", buf);
 
-        if (ring)
+        if (rec)
         {
             g_trace_ring.emplace_back(g_gs_vsyncs, std::string(buf));
 
-            if (g_trace_ring.size() > 1200)
+            if (g_trace_ring.size() > 6000)
                 g_trace_ring.pop_front();
+        }
+    }
+
+    // Captura por F9: liga o trace por 3 vsyncs e grava tudo em gs_captura_N.txt (no vsync, com o lock do GS).
+    static void gs_capture_poll()
+    {
+        if (!g_cap_active && g_cap_request.exchange(false))
+        {
+            g_cap_active = true;
+            g_cap_until = g_gs_vsyncs + 3;
+            g_trace_ring.clear();
+            std::fprintf(stderr, "  [captura] F9: gravando os proximos 3 vsyncs...\n");
+            return;
+        }
+
+        if (g_cap_active && g_gs_vsyncs >= g_cap_until)
+        {
+            g_cap_active = false;
+            char name[64];
+            std::snprintf(name, sizeof name, "gs_captura_%u.txt", ++g_cap_count);
+            FILE* f = std::fopen(name, "w");
+
+            if (f != nullptr)
+            {
+                std::fprintf(f, "captura vsync %u..%u, %zu desenhos\n", g_cap_until - 3, g_cap_until, g_trace_ring.size());
+
+                for (const auto& e : g_trace_ring)
+                    std::fprintf(f, "%s\n", e.second.c_str());
+
+                // estado da CLUT: buffer interno (512 entradas) e o que esta na VRAM no CBP de cada contexto
+                std::fprintf(f, "\n== CLUT buffer interno (RGBA32, 16 por linha) ==\n");
+
+                for (int i = 0; i < 256; i += 16)
+                {
+                    std::fprintf(f, "%3d:", i);
+
+                    for (int k = 0; k < 16; k++)
+                        std::fprintf(f, " %08X", (unsigned)g_st.clut[i + k]);
+
+                    std::fprintf(f, "\n");
+                }
+
+                std::fprintf(f, "\n== CLUT na VRAM (16 entradas de 4 bits, 8x2 CT32) em cada CBP usado nos desenhos ==\n");
+
+                for (unsigned cb : g_cap_cbps)
+                {
+                    std::fprintf(f, "cbp=%5u:", cb);
+
+                    for (int i = 0; i < 16; i++)
+                        std::fprintf(f, " %08X", (unsigned)g_vram[ix_ct32(cb, 1, (uint32_t)(i & 7), (uint32_t)(i >> 3))]);
+
+                    std::fprintf(f, "\n");
+                }
+
+                g_cap_cbps.clear();
+
+                for (int ci = 0; ci < 2; ci++)
+                {
+                    const uint64_t t0 = g_st.ctx[ci].tex0;
+                    const unsigned cbp = (unsigned)((t0 >> 37) & 0x3FFF), cpsm = (unsigned)((t0 >> 51) & 0xF);
+                    std::fprintf(f, "\n== contexto %d: tex0=0x%016llX tbp=%u psm=0x%02X cbp=%u cpsm=0x%X csa=%u cld=%u; VRAM no CBP (8x2, CT32):\n",
+                        ci, (unsigned long long)t0, (unsigned)(t0 & 0x3FFF), (unsigned)((t0 >> 20) & 0x3F), cbp, cpsm, (unsigned)((t0 >> 56) & 0x1F), (unsigned)(t0 >> 61));
+
+                    for (int i = 0; i < 16; i++)
+                        std::fprintf(f, " %08X", (unsigned)g_vram[ix_ct32(cbp, 1, (uint32_t)(i & 7), (uint32_t)(i >> 3))]);
+
+                    std::fprintf(f, "\n");
+                }
+
+                std::fclose(f);
+            }
+
+            std::fprintf(stderr, "  [captura] %s gravado (%zu desenhos)\n", name, g_trace_ring.size());
+            g_trace_ring.clear();
         }
     }
 
@@ -4438,13 +4838,292 @@ namespace
         if (g_trace_ring.empty())
             return;
 
-        std::fprintf(stderr, "  [gs] desenhos recentes antes do dump %u (vsync %u):\n", index, g_gs_vsyncs);
+        FILE* out = gs_trace_out();
+        std::fprintf(out, "  [gs] desenhos recentes antes do dump %u (vsync %u):\n", index, g_gs_vsyncs);
 
         for (const auto& e : g_trace_ring)
             if (e.first + 2 >= g_gs_vsyncs)
-                std::fprintf(stderr, "%s\n", e.second.c_str());
+                std::fprintf(out, "%s\n", e.second.c_str());
+
+        if (out != stderr)
+            std::fflush(out);
 
         g_trace_ring.clear();
+    }
+
+    // ---- caminho rapido (sprites grandes e triangulos 2D de cor plana) ----
+    // A textura (so a janela de texels que a primitiva usa) e decodificada uma vez para memoria linear, ja com a CLUT e o
+    // TEXA aplicados, e as linhas sao desenhadas por um laco sem decisoes por pixel. Cobre: textura de 4/8/16/24/32 bits,
+    // repeticao ou clamp simples, MODULATE/DECAL, qualquer blend (A,B,C,D), alpha test e FBMSK, destino de 32 bits.
+    // O resto segue o caminho generico. PS2_NOFASTSPRITE=1 desliga.
+    bool g_nofastsprite = std::getenv("PS2_NOFASTSPRITE") != nullptr;
+
+    struct FastRaster
+    {
+        const PixCfg* pc = nullptr;
+        std::vector<uint32_t> lin;
+        int ox = 0, oy = 0, ww = 1, wh = 1;
+        int W = 1, H = 1, wmask = 0, hmask = 0;
+        bool linear = false, std_blend = false, tcc = false, decal = false;
+        int vr = 0, vg = 0, vb = 0, va = 0;
+
+        static bool tex_ok(const TexInfo& t)
+        {
+            return (t.psm == 0x00 || t.psm == 0x01 || t.psm == 0x02 || t.psm == 0x0A || t.psm == 0x13 || t.psm == 0x14 || t.psm == 0x1B || t.psm == 0x24 || t.psm == 0x2C)
+                && t.umode <= 1 && t.vmode <= 1 && t.tfx <= 1;
+        }
+
+        int wrapx(int v) const { return pc->ti.umode == 0 ? (v & wmask) : (v < 0 ? 0 : (v >= W ? W - 1 : v)); }
+        int wrapy(int v) const { return pc->ti.vmode == 0 ? (v & hmask) : (v < 0 ? 0 : (v >= H ? H - 1 : v)); }
+
+        // umin..vmax: extensao (em texels) das coordenadas que a primitiva vai amostrar
+        bool setup(const PixCfg& cfg, float cr, float cg, float cb, float ca, float umin, float umax, float vmin, float vmax)
+        {
+            pc = &cfg;
+
+            if (cfg.fpsm != 0x00)
+                return false;
+
+            std_blend = cfg.abe && cfg.A == 0 && cfg.B == 1 && cfg.C == 0 && cfg.D == 1;
+            vr = gs_f2i255(cr); vg = gs_f2i255(cg); vb = gs_f2i255(cb); va = gs_f2i255(ca);
+
+            if (!cfg.tme)
+                return true;
+
+            const TexInfo& ti = cfg.ti;
+
+            if (!tex_ok(ti))
+                return false;
+
+            W = ti.w; H = ti.h; wmask = W - 1; hmask = H - 1;
+            linear = ti.linear; tcc = ti.tcc; decal = ti.tfx == 1;
+
+            // janela de texels (com folga para o bilinear); com repeticao e coordenadas fora da textura, decodifica tudo
+            const int m = linear ? 2 : 1;
+            int x0 = fast_floor(umin) - m, x1 = fast_ceil(umax) + m, y0 = fast_floor(vmin) - m, y1 = fast_ceil(vmax) + m;
+
+            if (ti.umode == 0 && (x0 < 0 || x1 >= W)) { x0 = 0; x1 = W - 1; }
+            if (ti.vmode == 0 && (y0 < 0 || y1 >= H)) { y0 = 0; y1 = H - 1; }
+
+            x0 = std::max(0, std::min(x0, W - 1)); x1 = std::max(0, std::min(x1, W - 1));
+            y0 = std::max(0, std::min(y0, H - 1)); y1 = std::max(0, std::min(y1, H - 1));
+
+            if (x1 < x0) x1 = x0;
+            if (y1 < y0) y1 = y0;
+
+            ox = x0; oy = y0; ww = x1 - x0 + 1; wh = y1 - y0 + 1;
+
+            if ((long long)ww * wh > 1048576)
+                return false;
+
+            lin.resize((size_t)ww * (size_t)wh);
+
+            for (int y = 0; y < wh; y++)
+                for (int x = 0; x < ww; x++)
+                    lin[(size_t)y * (size_t)ww + (size_t)x] = gs_texel(ti, ox + x, oy + y);
+
+            return true;
+        }
+
+        inline uint32_t fetch(int iu, int iv) const
+        {
+            return lin[(size_t)((wrapy(iv) - oy) * ww + (wrapx(iu) - ox))];
+        }
+
+        // u,v no centro do pixel xs; du,dv por pixel
+        void row(int y, int xs, int xe, float u, float du, float v, float dv, float z0, float dz) const
+        {
+            const PixCfg& c = *pc;
+            const bool tme = c.tme;
+            const uint32_t fbp = c.fbp, fbw = c.fbw, fbmsk = c.fbmsk;
+
+            // v constante na linha (sprites): calcula as linhas da textura uma vez
+            const bool vconst = dv == 0.0f;
+            int rowA = 0, rowB = 0, wvc = 0;
+
+            if (tme && vconst)
+            {
+                if (linear)
+                {
+                    const float fvv = v - 0.5f;
+                    const int iv = fast_floor(fvv);
+                    wvc = (int)((fvv - (float)iv) * 256.0f);
+                    rowA = (wrapy(iv) - oy) * ww;
+                    rowB = (wrapy(iv + 1) - oy) * ww;
+                }
+                else
+                {
+                    rowA = (wrapy(fast_floor(v)) - oy) * ww;
+                }
+            }
+
+            for (int x = xs; x <= xe; x++)
+            {
+                const float uc = u + du * (float)(x - xs), vc = v + dv * (float)(x - xs);   // multiplicacao (sem acumular erro)
+                int r = vr, g = vg, bl = vb, al = va;
+
+                if (tme)
+                {
+                    uint32_t t;
+
+                    if (linear)
+                    {
+                        const float fu = uc - 0.5f;
+                        const int iu = fast_floor(fu);
+                        const int wu = (int)((fu - (float)iu) * 256.0f);
+                        const int x0i = wrapx(iu) - ox;
+                        int ra = rowA, rb = rowB, wv = wvc;
+
+                        if (!vconst)
+                        {
+                            const float fvv = vc - 0.5f;
+                            const int iv = fast_floor(fvv);
+                            wv = (int)((fvv - (float)iv) * 256.0f);
+                            ra = (wrapy(iv) - oy) * ww;
+                            rb = (wrapy(iv + 1) - oy) * ww;
+                        }
+
+                        if (wu < 4 && wv < 4)
+                        {
+                            t = lin[(size_t)(ra + x0i)];
+                        }
+                        else
+                        {
+                            const int x1i = wrapx(iu + 1) - ox;
+                            const uint32_t t00 = lin[(size_t)(ra + x0i)], t10 = lin[(size_t)(ra + x1i)];
+                            const uint32_t t01 = lin[(size_t)(rb + x0i)], t11 = lin[(size_t)(rb + x1i)];
+                            t = 0;
+
+                            for (int sh = 0; sh < 32; sh += 8)
+                            {
+                                const int c00 = (int)((t00 >> sh) & 0xFF), c10 = (int)((t10 >> sh) & 0xFF);
+                                const int c01 = (int)((t01 >> sh) & 0xFF), c11 = (int)((t11 >> sh) & 0xFF);
+                                const int top = c00 * (256 - wu) + c10 * wu, bot = c01 * (256 - wu) + c11 * wu;
+                                t |= (uint32_t)(((top * (256 - wv) + bot * wv) >> 16) & 0xFF) << sh;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const int ra = vconst ? rowA : (wrapy(fast_floor(vc)) - oy) * ww;
+                        t = lin[(size_t)(ra + wrapx(fast_floor(uc)) - ox)];
+                    }
+
+                    const int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
+
+                    if (decal)
+                    {
+                        r = tr; g = tg; bl = tb; al = tcc ? ta : va;
+                    }
+                    else
+                    {
+                        r = std::min(255, tr * vr >> 7); g = std::min(255, tg * vg >> 7); bl = std::min(255, tb * vb >> 7);
+                        al = tcc ? std::min(255, ta * va >> 7) : va;
+                    }
+                }
+
+                bool afail_rgb_only = false, fb_ok = true, z_write_ok = true;
+
+                if (c.ate)
+                {
+                    bool pass = true;
+
+                    switch (c.atst)
+                    {
+                        case 0: pass = false; break;
+                        case 2: pass = al < c.aref; break;
+                        case 3: pass = al <= c.aref; break;
+                        case 4: pass = al == c.aref; break;
+                        case 5: pass = al >= c.aref; break;
+                        case 6: pass = al > c.aref; break;
+                        case 7: pass = al != c.aref; break;
+                        default: break;
+                    }
+
+                    if (!pass)
+                    {
+                        switch (c.afail)
+                        {
+                            case 0: continue;
+                            case 1: z_write_ok = false; break;
+                            case 2: fb_ok = false; break;
+                            default: z_write_ok = false; afail_rgb_only = true; break;
+                        }
+                    }
+                }
+
+                if (c.zactive)
+                {
+                    const float zf = z0 + dz * (float)(x - xs);
+                    const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
+
+                    if (!gs_ztest(c, (uint32_t)x, (uint32_t)y, zi, z_write_ok))
+                        continue;
+                }
+
+                if (!fb_ok)
+                    continue;
+
+                uint32_t* dp = &g_vram[ix_ct32(fbp, fbw, (uint32_t)x, (uint32_t)y)];
+                const uint32_t dst = c.need_dst ? *dp : 0;
+
+                if (c.abe)
+                {
+                    const int dr = (int)(dst & 0xFF), dg = (int)((dst >> 8) & 0xFF), db = (int)((dst >> 16) & 0xFF);
+                    int nr, ng, nb;
+
+                    if (std_blend)
+                    {
+                        nr = ((r - dr) * al >> 7) + dr; ng = ((g - dg) * al >> 7) + dg; nb = ((bl - db) * al >> 7) + db;
+                    }
+                    else
+                    {
+                        const int da = (int)((dst >> 24) & 0xFF);
+                        const int cf = c.C == 0 ? al : (c.C == 1 ? da : c.fix);
+                        const int ar = c.A == 0 ? r : (c.A == 1 ? dr : 0), br = c.B == 0 ? r : (c.B == 1 ? dr : 0), dd_r = c.D == 0 ? r : (c.D == 1 ? dr : 0);
+                        const int ag = c.A == 0 ? g : (c.A == 1 ? dg : 0), bg = c.B == 0 ? g : (c.B == 1 ? dg : 0), dd_g = c.D == 0 ? g : (c.D == 1 ? dg : 0);
+                        const int ab = c.A == 0 ? bl : (c.A == 1 ? db : 0), bb = c.B == 0 ? bl : (c.B == 1 ? db : 0), dd_b = c.D == 0 ? bl : (c.D == 1 ? db : 0);
+                        nr = (((ar - br) * cf) >> 7) + dd_r; ng = (((ag - bg) * cf) >> 7) + dd_g; nb = (((ab - bb) * cf) >> 7) + dd_b;
+                    }
+
+                    if (c.clamp) { r = gs_clamp255(nr); g = gs_clamp255(ng); bl = gs_clamp255(nb); }
+                    else { r = nr & 0xFF; g = ng & 0xFF; bl = nb & 0xFF; }
+                }
+
+                uint32_t out = (uint32_t)(r | (g << 8) | (bl << 16) | (al << 24));
+
+                if (afail_rgb_only)
+                    out = (out & 0x00FFFFFFu) | (dst & 0xFF000000u);
+
+                if (fbmsk != 0)
+                    out = (dst & fbmsk) | (out & ~fbmsk);
+
+                *dp = out;
+            }
+        }
+    };
+
+    bool gs_sprite_fast(const PixCfg& pc, const GsVertex& a, const GsVertex& b, int px0, int px1, int py0, int py1)
+    {
+        if (g_nofastsprite)
+            return false;
+
+        static thread_local FastRaster fr;
+        const float du = (b.u - a.u) / (b.x - a.x);
+        const float u_first = a.u + du * ((float)px0 + 0.5f - a.x), u_last = a.u + du * ((float)(px1 - 1) + 0.5f - a.x);
+        const float iyr = 1.0f / (b.y - a.y);
+        const float v_first = a.v + (b.v - a.v) * (((float)py0 + 0.5f - a.y) * iyr), v_last = a.v + (b.v - a.v) * (((float)(py1 - 1) + 0.5f - a.y) * iyr);
+
+        if (!fr.setup(pc, b.r, b.g, b.b, b.a, std::min(u_first, u_last), std::max(u_first, u_last), std::min(v_first, v_last), std::max(v_first, v_last)))
+            return false;
+
+        for (int y = py0; y < py1; y++)
+        {
+            const float v = a.v + (b.v - a.v) * (((float)y + 0.5f - a.y) * iyr);
+            fr.row(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
+        }
+
+        return true;
     }
 
     void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
@@ -4456,16 +5135,33 @@ namespace
 
         gs_trace_draw("sprite", ci, x0, y0, x1, y1);
 
-        int px0 = (int)std::ceil(x0 - 0.5f), px1 = (int)std::ceil(x1 - 0.5f);
-        int py0 = (int)std::ceil(y0 - 0.5f), py1 = (int)std::ceil(y1 - 0.5f);
+        const ProfScope prof(g_prof_raster_ns);
+        int px0 = (int)fast_ceil(x0 - 0.5f), px1 = (int)fast_ceil(x1 - 0.5f);
+        int py0 = (int)fast_ceil(y0 - 0.5f), py1 = (int)fast_ceil(y1 - 0.5f);
+
+        PixCfg pc;
+        gs_pix_cfg(ci, pc);
+
+        // recorta ao scissor uma vez (em vez de testar pixel a pixel)
+        px0 = std::max(px0, pc.sx0); px1 = std::min(px1, pc.sx1 + 1);
+        py0 = std::max(py0, pc.sy0); py1 = std::min(py1, pc.sy1 + 1);
+
+        if ((long long)(px1 - px0) * (long long)(py1 - py0) >= 2048 && gs_sprite_fast(pc, a, b, px0, px1, py0, py1))
+            return;
+
+        const float ixr = 1.0f / (b.x - a.x), iyr = 1.0f / (b.y - a.y);
 
         for (int y = py0; y < py1; y++)
+        {
+            const float fv = ((float)y + 0.5f - a.y) * iyr;
+            const float vv = a.v + (b.v - a.v) * fv;
+
             for (int x = px0; x < px1; x++)
             {
-                float fu = ((float)x + 0.5f - a.x) / (b.x - a.x);
-                float fv = ((float)y + 0.5f - a.y) / (b.y - a.y);
-                gs_pixel(ci, x, y, b.r, b.g, b.b, b.a, a.u + (b.u - a.u) * fu, a.v + (b.v - a.v) * fv);
+                const float fu = ((float)x + 0.5f - a.x) * ixr;
+                gs_pixel(pc, x, y, b.r, b.g, b.b, b.a, a.u + (b.u - a.u) * fu, vv, b.z);
             }
+        }
     }
 
     void gs_draw_triangle(int ci, const GsVertex& a, const GsVertex& b, const GsVertex& c)
@@ -4480,26 +5176,97 @@ namespace
 
         gs_trace_draw("tri", ci, std::min(a.x, std::min(b.x, c.x)), std::min(a.y, std::min(b.y, c.y)), std::max(a.x, std::max(b.x, c.x)), std::max(a.y, std::max(b.y, c.y)));
 
-        int minx = (int)std::floor(std::min(a.x, std::min(b.x, c.x))), maxx = (int)std::ceil(std::max(a.x, std::max(b.x, c.x)));
-        int miny = (int)std::floor(std::min(a.y, std::min(b.y, c.y))), maxy = (int)std::ceil(std::max(a.y, std::max(b.y, c.y)));
+        const ProfScope prof(g_prof_raster_ns);
+        int minx = (int)fast_floor(std::min(a.x, std::min(b.x, c.x))), maxx = (int)fast_ceil(std::max(a.x, std::max(b.x, c.x)));
+        int miny = (int)fast_floor(std::min(a.y, std::min(b.y, c.y))), maxy = (int)fast_ceil(std::max(a.y, std::max(b.y, c.y)));
 
         minx = std::max(minx, 0); miny = std::max(miny, 0);
         maxx = std::min(maxx, 2047); maxy = std::min(maxy, 2047);
 
+        PixCfg pc;
+        gs_pix_cfg(ci, pc);
+        minx = std::max(minx, pc.sx0); maxx = std::min(maxx, pc.sx1);
+        miny = std::max(miny, pc.sy0); maxy = std::min(maxy, pc.sy1);
+
+        const bool persp = a.persp && b.persp && c.persp;
+
+        // Triangulos 2D grandes de cor plana (quads de UI, fundos): usa o caminho rapido por linha.
+        bool use_fast = false;
+        static thread_local FastRaster fr;
+
+        if (!g_nofastsprite && !persp && (long long)(maxx - minx + 1) * (long long)(maxy - miny + 1) >= 1024
+            && a.r == b.r && b.r == c.r && a.g == b.g && b.g == c.g && a.b == b.b && b.b == c.b && a.a == b.a && b.a == c.a)
+        {
+            use_fast = fr.setup(pc, c.r, c.g, c.b, c.a, std::min(a.u, std::min(b.u, c.u)), std::max(a.u, std::max(b.u, c.u)),
+                std::min(a.v, std::min(b.v, c.v)), std::max(a.v, std::max(b.v, c.v)));
+        }
+
+        // Pesos baricentricos lineares em px: w0 = k0 + s0*px, w1 = k1 + s1*px, w2 = 1 - w0 - w1. Para cada linha
+        // resolve o intervalo de px com os tres pesos >= 0 e percorre so ele.
+        const float inv = 1.0f / area;
+        const float s0 = (b.y - c.y) * inv, s1 = (c.y - a.y) * inv, s2 = -(s0 + s1);
+        const float c0 = (b.x * c.y - b.y * c.x) * inv, d0 = (c.x - b.x) * inv;
+        const float c1 = (c.x * a.y - c.y * a.x) * inv, d1 = (a.x - c.x) * inv;
+
         for (int y = miny; y <= maxy; y++)
-            for (int x = minx; x <= maxx; x++)
+        {
+            const float py = (float)y + 0.5f;
+            const float k0 = c0 + d0 * py, k1 = c1 + d1 * py, k2 = 1.0f - k0 - k1;
+            const float ks[3] = { k0, k1, k2 }, ss[3] = { s0, s1, s2 };
+            float lo = -1e30f, hi = 1e30f;
+            bool empty = false;
+
+            for (int i = 0; i < 3; i++)
             {
-                float px = (float)x + 0.5f, py = (float)y + 0.5f;
-                float w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area;
-                float w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area;
-                float w2 = 1.0f - w0 - w1;
-
-                if (w0 < 0 || w1 < 0 || w2 < 0)
-                    continue;
-
-                gs_pixel(ci, x, y, a.r * w0 + b.r * w1 + c.r * w2, a.g * w0 + b.g * w1 + c.g * w2, a.b * w0 + b.b * w1 + c.b * w2,
-                    a.a * w0 + b.a * w1 + c.a * w2, a.u * w0 + b.u * w1 + c.u * w2, a.v * w0 + b.v * w1 + c.v * w2);
+                if (ss[i] > 1e-9f) lo = std::max(lo, -ks[i] / ss[i]);
+                else if (ss[i] < -1e-9f) hi = std::min(hi, -ks[i] / ss[i]);
+                else if (ks[i] < 0.0f) empty = true;
             }
+
+            if (empty || lo > hi)
+                continue;
+
+            const int xs = std::max(minx, (int)fast_ceil(lo - 0.5f - 1e-4f)), xe = std::min(maxx, (int)fast_floor(hi - 0.5f + 1e-4f));
+
+            if (use_fast)
+            {
+                if (xs <= xe)
+                {
+                    const float px = (float)xs + 0.5f;
+                    const float w0 = k0 + s0 * px, w1 = k1 + s1 * px, w2 = 1.0f - w0 - w1;
+                    fr.row(y, xs, xe, a.u * w0 + b.u * w1 + c.u * w2, a.u * s0 + b.u * s1 + c.u * s2,
+                        a.v * w0 + b.v * w1 + c.v * w2, a.v * s0 + b.v * s1 + c.v * s2,
+                        (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2, (float)a.z * s0 + (float)b.z * s1 + (float)c.z * s2);
+                }
+
+                continue;
+            }
+
+            for (int x = xs; x <= xe; x++)
+            {
+                const float px = (float)x + 0.5f;
+                const float w0 = k0 + s0 * px, w1 = k1 + s1 * px, w2 = 1.0f - w0 - w1;
+                float u, v;
+
+                if (persp)
+                {
+                    float q = a.q * w0 + b.q * w1 + c.q * w2;
+                    q = q != 0.0f ? 1.0f / q : 1.0f;
+                    u = (a.us * w0 + b.us * w1 + c.us * w2) * q;
+                    v = (a.vs * w0 + b.vs * w1 + c.vs * w2) * q;
+                }
+                else
+                {
+                    u = a.u * w0 + b.u * w1 + c.u * w2;
+                    v = a.v * w0 + b.v * w1 + c.v * w2;
+                }
+
+                const float zf = (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2;
+                const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
+                gs_pixel(pc, x, y, a.r * w0 + b.r * w1 + c.r * w2, a.g * w0 + b.g * w1 + c.g * w2, a.b * w0 + b.b * w1 + c.b * w2,
+                    a.a * w0 + b.a * w1 + c.a * w2, u, v, zi);
+            }
+        }
     }
 
     // Campos do interlacado: o jogo desenha os quadros alternados com um deslocamento de meia linha (o campo
@@ -4509,7 +5276,7 @@ namespace
     float g_half_vote[512] = {};
     std::atomic<unsigned> g_gs_flips{0};   // trocas do buffer exibido (DISPFB): aproximam os quadros do jogo
 
-    void gs_vertex(uint64_t data, bool kick)
+    void gs_vertex(uint64_t data, bool kick, bool xyzf = false)
     {
         int ci = (int)((g_st.prim >> 9) & 1);
         const GsCtx& c = g_st.ctx[ci];
@@ -4517,13 +5284,7 @@ namespace
         float ofx = (float)(c.xyoffset & 0xFFFF), ofy = (float)((c.xyoffset >> 32) & 0xFFFF);
         v.x = ((float)(data & 0xFFFF) - ofx) / 16.0f;
         v.y = ((float)((data >> 16) & 0xFFFF) - ofy) / 16.0f;
-
-        if ((g_st.prim & 7) == 6)
-        {
-            int n = (int)std::floor(v.y * 2.0f + 0.5f);
-            float& vote = g_half_vote[c.frame & 0x1FF];
-            vote = vote * 0.9f + ((n & 1) ? 1.0f : -1.0f);
-        }
+        v.z = xyzf ? (uint32_t)((data >> 32) & 0xFFFFFFu) : (uint32_t)(data >> 32);
 
         v.r = (float)(g_st.rgbaq & 0xFF);
         v.g = (float)((g_st.rgbaq >> 8) & 0xFF);
@@ -4548,6 +5309,10 @@ namespace
 
             v.u = s / q * (float)tw;
             v.v = t / q * (float)th;
+            v.us = s * (float)tw;
+            v.vs = t * (float)th;
+            v.q = q;
+            v.persp = true;
         }
 
         unsigned type = (unsigned)(g_st.prim & 7);
@@ -4563,6 +5328,19 @@ namespace
         }
 
         g_st.q[g_st.nq++] = v;
+
+        if (type == 6 && g_st.nq == 1)
+        {
+            // primeiro vertice do sprite: Y em meia linha (2*Y impar) = quadro "impar"; OFY com fracao tambem conta
+            const int n = (int)std::floor(v.y * 2.0f + 0.5f);
+            float& vote = g_half_vote[c.frame & 0x1FF];
+            vote += (n & 1) ? 1.0f : -1.0f;
+
+            if (((c.xyoffset >> 32) & 0xF) >= 8)
+                vote += 4.0f;
+
+            vote = vote > 64.0f ? 64.0f : (vote < -64.0f ? -64.0f : vote);
+        }
 
         if (kick && gs_trace_enabled())
         {
@@ -4589,7 +5367,7 @@ namespace
         else if (type >= 3)
             gs_draw_triangle(ci, g_st.q[0], g_st.q[1], g_st.q[2]);
         else if (type == 0)
-            gs_pixel(ci, (int)v.x, (int)v.y, v.r, v.g, v.b, v.a, v.u, v.v);
+            gs_pixel(ci, (int)v.x, (int)v.y, v.r, v.g, v.b, v.a, v.u, v.v, v.z);
         else
             g_st.unsupported++;   // linhas: ainda nao
 
@@ -4642,6 +5420,12 @@ namespace
         }
     }
 
+    // Formatos de Z se acumulam no upload como os de cor de mesmo tamanho (32/24/16 bits)
+    static inline uint32_t gs_color_fmt(uint32_t psm)
+    {
+        return psm == 0x30 ? 0x00u : (psm == 0x31 ? 0x01u : ((psm == 0x32 || psm == 0x3A) ? 0x02u : psm));
+    }
+
     void gs_core_image(uint64_t lo, uint64_t hi)
     {
         if (!g_st.xfer)
@@ -4654,7 +5438,7 @@ namespace
         // Caminho rapido: quadword inteiro de pixels completos (32, 16, 8 e 4 bits), sem passar pelo buffer de bytes.
         if (g_st.npend == 0)
         {
-            const uint32_t fpsm = g_st.dpsm;
+            const uint32_t fpsm = gs_color_fmt(g_st.dpsm);
 
             if (fpsm == 0x00)
             {
@@ -4703,7 +5487,7 @@ namespace
         for (int i = 0; i < 16 && g_st.xfer; i++)
         {
             g_st.pend[g_st.npend++] = bytes[i];
-            uint32_t psm = g_st.dpsm;
+            uint32_t psm = gs_color_fmt(g_st.dpsm);
 
             if (psm == 0x00 && g_st.npend == 4)
             {
@@ -4747,8 +5531,10 @@ namespace
             case 0x01: g_st.rgbaq = data; break;
             case 0x02: g_st.st = data; break;
             case 0x03: g_st.uv = data; break;
-            case 0x04: case 0x05: gs_vertex(data, true); break;
-            case 0x0C: case 0x0D: gs_vertex(data, false); break;
+            case 0x04: gs_vertex(data, true, true); break;
+            case 0x05: gs_vertex(data, true, false); break;
+            case 0x0C: gs_vertex(data, false, true); break;
+            case 0x0D: gs_vertex(data, false, false); break;
             case 0x06: case 0x07:
             {
                 GsCtx& c = g_st.ctx[reg - 6];
@@ -4843,24 +5629,71 @@ namespace
         if (!gs_display_params(d))
             return;
 
+        // Campo: o jogo desloca meia linha (OFY / Y dos sprites) nos quadros "impares". Por padrao so os quadros "pares" sao
+        // mostrados (eliminou o tremor nos testes); PS2_FIELDLOCK=0 mostra todos, com a compensacao de PS2_FIELDSHIFT linhas
+        // de saida (padrao 1; pode ser negativo) nos impares.
+        static const bool fieldlock = !(std::getenv("PS2_FIELDLOCK") != nullptr && std::getenv("PS2_FIELDLOCK")[0] == '0');
+
+        if (fieldlock && d.magv > 1 && g_half_vote[(d.fbp / 32) & 0x1FF] > 0.0f)
+            return;
+
         const uint64_t prof_t0 = prof_now();
         std::vector<uint32_t> pix((size_t)d.w * d.h);
         const bool c16 = d.psm == 0x02 || d.psm == 0x0A;
 
-        // campo impar (meia linha acima no buffer): desce (MAGV / 2) linhas de saida; PS2_NOFIELDFIX=1 desliga
+        // campo impar: desloca PS2_FIELDSHIFT * (MAGV / 2) linhas de saida; PS2_NOFIELDFIX=1 desliga
         static const bool nofix = std::getenv("PS2_NOFIELDFIX") != nullptr;
+        static const int fieldshift = std::getenv("PS2_FIELDSHIFT") != nullptr ? std::atoi(std::getenv("PS2_FIELDSHIFT")) : 1;
         const bool half = !nofix && d.magv > 1 && g_half_vote[(d.fbp / 32) & 0x1FF] > 0.0f;
-        const uint32_t shift = half ? d.magv / 2 : 0;
+        const int shift = half ? fieldshift * (int)(d.magv / 2) : 0;
+        const uint32_t nlines = (d.h + d.magv - 1) / d.magv;
+        static const bool nosmoothv = std::getenv("PS2_NOSMOOTHV") != nullptr;
 
-        for (uint32_t by = 0; by * d.magv < d.h; by++)
+        if (!nosmoothv && shift == 0 && d.magv == 2 && nlines >= 2)
         {
-            const uint32_t r0 = by == 0 ? 0 : by * d.magv + shift;
-            const uint32_t r1 = std::min(d.h, (by + 1) * d.magv + shift);
+            // linhas pares = linha da fonte; impares = media das duas vizinhas (em vez de duplicar: bordas menos "quadradas")
+            std::vector<uint32_t> L((size_t)nlines * d.w);
 
-            if (r0 >= r1)
+            for (uint32_t by = 0; by < nlines; by++)
+                for (uint32_t x = 0; x < d.w; x++)
+                {
+                    uint32_t v = gs_read_px(d.psm, d.fbp, d.fbw, d.dbx + x, d.dby + by);
+                    L[(size_t)by * d.w + x] = c16 ? ((((v & 31u) << 3) << 16) | ((((v >> 5) & 31u) << 3) << 8) | (((v >> 10) & 31u) << 3))
+                                                  : (((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu));
+                }
+
+            for (uint32_t r = 0; r < d.h; r++)
+            {
+                const uint32_t* a = &L[(size_t)std::min(r / 2, nlines - 1) * d.w];
+                uint32_t* o = &pix[(size_t)r * d.w];
+
+                if ((r & 1u) == 0)
+                {
+                    std::memcpy(o, a, (size_t)d.w * sizeof(uint32_t));
+                }
+                else
+                {
+                    const uint32_t* b = &L[(size_t)std::min(r / 2 + 1, nlines - 1) * d.w];
+
+                    for (uint32_t x = 0; x < d.w; x++)
+                        o[x] = ((a[x] & 0xFEFEFEFEu) >> 1) + ((b[x] & 0xFEFEFEFEu) >> 1) + (a[x] & b[x] & 0x01010101u);
+                }
+            }
+        }
+        else
+        for (uint32_t by = 0; by < nlines; by++)
+        {
+            int r0 = (int)(by * d.magv) + shift, r1 = r0 + (int)d.magv;
+
+            if (by == 0) r0 = 0;                 // a primeira linha cobre o topo
+            if (by + 1 == nlines) r1 = (int)d.h; // a ultima cobre o fim
+
+            const int lo = std::max(0, r0), hi = std::min((int)d.h, r1);
+
+            if (lo >= hi)
                 continue;
 
-            uint32_t* row = &pix[(size_t)r0 * d.w];
+            uint32_t* row = &pix[(size_t)lo * d.w];
 
             for (uint32_t x = 0; x < d.w; x++)
             {
@@ -4872,7 +5705,7 @@ namespace
                     row[x] = ((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu);
             }
 
-            for (uint32_t r = r0 + 1; r < r1; r++)
+            for (int r = lo + 1; r < hi; r++)
                 std::memcpy(&pix[(size_t)r * d.w], row, (size_t)d.w * sizeof(uint32_t));
         }
 
@@ -4996,6 +5829,7 @@ namespace
             {
                 image_left--;
                 g_gs.image_qw++;
+                const ProfScope prof(g_prof_img_ns);
                 gs_core_image(lo, hi);
                 return;
             }
@@ -5282,6 +6116,8 @@ namespace
             if (mpg_left != 0)
             {
                 std::memcpy((unit ? g_vu1_micro : g_vu0_micro) + (mpg_addr & (unit ? 0x3FFFu : 0xFFFu)), &w, 4);
+
+                if (unit) g_vu1_dirty = true; else g_vu0_dirty = true;
                 mpg_addr += 4;
                 mpg_left--;
                 return;
@@ -5508,7 +6344,10 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
     if (g_gsrun && phys >= 0x12000000u && phys < 0x12000100u && (phys & 7u) == 0)
     {
         if ((phys == 0x12000070u || phys == 0x12000090u) && (value & 0x1FFu) != (g_gs_priv[(phys - 0x12000000u) >> 3] & 0x1FFu))
+        {
             g_gs_flips.fetch_add(1);
+            g_half_vote[g_gs_priv[(phys - 0x12000000u) >> 3] & 0x1FFu] = 0.0f;   // o buffer que sai da tela e o proximo alvo: vota de novo
+        }
 
         g_gs_priv[(phys - 0x12000000u) >> 3] = value;
         return;
@@ -5557,12 +6396,32 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
 }
 
 // Resumo a cada 120 vsyncs (2 s): o que o jogo mandou desenhar nesse intervalo.
+// Relatorio de desempenho a cada 120 vsyncs (PS2_PERF=1 ou PS2_GIFLOG=1): onde o tempo de emulacao foi gasto.
+static void gs_prof_report()
+{
+        static uint64_t last_dma = 0, last_vu = 0, last_pr = 0, last_ras = 0, last_img = 0, last_wall = 0;
+        static unsigned last_flips = 0;
+        const uint64_t now = prof_now();
+        const unsigned flips = g_gs_flips.load();
+
+        if (last_wall != 0)
+            std::fprintf(stderr, "  [prof] %.1f s: DMA/GS=%llu ms (microprogramas=%llu raster=%llu upload=%llu) janela=%llu ms | trocas de buffer=%u\n",
+                (double)(now - last_wall) / 1e9, (unsigned long long)((g_prof_dma_ns - last_dma) / 1000000u),
+                (unsigned long long)((g_prof_vu_ns - last_vu) / 1000000u), (unsigned long long)((g_prof_raster_ns - last_ras) / 1000000u),
+                (unsigned long long)((g_prof_img_ns - last_img) / 1000000u), (unsigned long long)((g_prof_present_ns - last_pr) / 1000000u),
+                flips - last_flips);
+
+        last_dma = g_prof_dma_ns; last_vu = g_prof_vu_ns; last_pr = g_prof_present_ns; last_ras = g_prof_raster_ns; last_img = g_prof_img_ns;
+        last_wall = now; last_flips = flips;
+}
+
 void ps2_gs_vsync()
 {
     if (!g_gsrun)
         return;
 
     ++g_gs_vsyncs;
+    gs_capture_poll();
 
     if (g_gswin)
     {
@@ -5589,6 +6448,14 @@ void ps2_gs_vsync()
         }
     }
 
+    static const bool g_perf_on = g_perf;
+
+    if (g_perf_on && g_gs_vsyncs % 120u == 0)
+    {
+        std::lock_guard<std::mutex> lk(g_gs_mu);
+        gs_prof_report();
+    }
+
     if (!g_giflog || g_gs_vsyncs % 120u != 0)
         return;
 
@@ -5601,20 +6468,8 @@ void ps2_gs_vsync()
         (unsigned long long)g_gs.direct_qw, (unsigned long long)g_gs.mpg_words, (unsigned long long)g_gs.unpack_cmds,
         (unsigned long long)g_gs.mscal, (unsigned long long)g_gs.xgkicks, (unsigned long long)g_gs.xgkick_qw);
 
-    {
-        static uint64_t last_dma = 0, last_vu = 0, last_pr = 0, last_wall = 0;
-        static unsigned last_flips = 0;
-        const uint64_t now = prof_now();
-        const unsigned flips = g_gs_flips.load();
-
-        if (last_wall != 0)
-            std::fprintf(stderr, "  [prof] %.1f s: DMA/GS=%llu ms (microprogramas=%llu ms) janela=%llu ms | trocas de buffer=%u\n",
-                (double)(now - last_wall) / 1e9, (unsigned long long)((g_prof_dma_ns - last_dma) / 1000000u),
-                (unsigned long long)((g_prof_vu_ns - last_vu) / 1000000u), (unsigned long long)((g_prof_present_ns - last_pr) / 1000000u),
-                flips - last_flips);
-
-        last_dma = g_prof_dma_ns; last_vu = g_prof_vu_ns; last_pr = g_prof_present_ns; last_wall = now; last_flips = flips;
-    }
+    if (!g_perf)
+        gs_prof_report();
 
     std::fprintf(stderr, "  [gs] 2s: PRIM:");
 
@@ -5695,9 +6550,33 @@ static unsigned g_vu0_runs = 0, g_vu1_runs = 0;
 
 static inline uint32_t* um_q(const VuUnit& u, uint32_t index) { return reinterpret_cast<uint32_t*>(u.data) + ((index & u.dmask) * 4u); }
 
+static bool g_um_flags = true;   // calcula MAC/status? (so se algum programa carregado os le)
+
+// Algum programa le MAC/status? (FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR). Se nenhum le, o calculo e dispensavel.
+static bool um_scan_flag_readers(const uint8_t* micro, uint32_t pairs)
+{
+    const uint32_t* m = reinterpret_cast<const uint32_t*>(micro);
+
+    for (uint32_t i = 0; i < pairs; i++)
+    {
+        if (m[i * 2 + 1] & 0x80000000u)
+            continue;   // bit I: a palavra lower e um float
+
+        const uint32_t op = m[i * 2] >> 25;
+
+        if (op == 0x14 || op == 0x16 || op == 0x17 || op == 0x18 || op == 0x1A || op == 0x1B)
+            return true;
+    }
+
+    return false;
+}
+
 // Flags MAC/status a partir dos resultados exatos (antes de empacotar) das faixas escritas.
 static void um_flags(Ctx& c, const double* r, int dest)
 {
+    if (!g_um_flags)
+        return;
+
     uint32_t sign = 0, zero = 0, unf = 0, ovf = 0;
 
     for (int l = 0; l < 4; l++)
@@ -5723,9 +6602,79 @@ static void um_flags(Ctx& c, const double* r, int dest)
     c.vi[16] = (c.vi[16] & 0xFF0u) | st | (st << 6);
 }
 
+// Caminho rapido (sem flags): aritmetica em float com a semantica do VU (denormal vira zero, Inf/NaN viram +-FLT_MAX).
+// Difere do caminho exato por no maximo 1 ulp (arredonda em vez de truncar).
+static inline float um_f(uint32_t b)
+{
+    const uint32_t e = b & 0x7F800000u;
+
+    if (e == 0) b &= 0x80000000u;
+    else if (e == 0x7F800000u) b = (b & 0x80000000u) | 0x7F7FFFFFu;
+
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
+}
+
+static inline uint32_t um_p(float r)
+{
+    uint32_t b;
+    std::memcpy(&b, &r, 4);
+    const uint32_t e = b & 0x7F800000u;
+
+    if (e == 0) return b & 0x80000000u;
+    if (e == 0x7F800000u) return (b & 0x80000000u) | 0x7F7FFFFFu;
+    return b;
+}
+
+static void um_arith_fast(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc)
+{
+    float bq = 0.0f;
+
+    if (src == VU_SRC_Q) bq = um_f(c.vi[22]);
+    else if (src == VU_SRC_I) bq = um_f(c.vi[21]);
+    else if (src >= VU_SRC_X && src <= VU_SRC_W) bq = um_f(c.vf[ft][src - VU_SRC_X]);
+
+    uint32_t out[4];
+
+    for (int l = 0; l < 4; l++)
+    {
+        if (!(dest & (8 >> l)))
+            continue;
+
+        const uint32_t ab = c.vf[fs][l];
+        const float a = um_f(ab);
+        const float b = src == VU_SRC_VEC ? um_f(c.vf[ft][l]) : bq;
+
+        switch (op)
+        {
+            case VU_ADD:  out[l] = um_p(a + b); break;
+            case VU_SUB:  out[l] = um_p(a - b); break;
+            case VU_MUL:  out[l] = um_p(a * b); break;
+            case VU_MADD: out[l] = um_p(um_f(c.vacc[l]) + a * b); break;
+            case VU_MSUB: out[l] = um_p(um_f(c.vacc[l]) - a * b); break;
+            case VU_MAX:  out[l] = a > b ? ab : (src == VU_SRC_VEC ? c.vf[ft][l] : um_p(b)); break;
+            default:      out[l] = a < b ? ab : (src == VU_SRC_VEC ? c.vf[ft][l] : um_p(b)); break;
+        }
+    }
+
+    for (int l = 0; l < 4; l++)
+    {
+        if (!(dest & (8 >> l))) continue;
+        if (to_acc) c.vacc[l] = out[l];
+        else if (fd != 0) c.vf[fd][l] = out[l];
+    }
+}
+
 // Igual a vu_arith, mas atualiza MAC/status (os programas ramificam por eles).
 static void um_arith(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc)
 {
+    if (!g_um_flags)
+    {
+        um_arith_fast(c, op, src, dest, fd, fs, ft, to_acc);
+        return;
+    }
+
     double res[4];
     uint32_t out[4];
 
@@ -5849,10 +6798,13 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
     uint32_t q_val = 0;
     int q_cd = 0;
     unsigned steps = 0;
+    const unsigned kMaxSteps = 300000u, kTraceFrom = kMaxSteps - 64u;
+    struct UmRec { uint32_t pc, lo, hi; } ring[64];
+    unsigned ring_n = 0;
 
     c.vf[0][0] = 0; c.vf[0][1] = 0; c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u;
 
-    for (; steps < 1000000u; steps++)
+    for (; steps < kMaxSteps; steps++)
     {
         if (q_cd > 0 && --q_cd == 0)
             c.vi[22] = q_val;
@@ -5860,6 +6812,9 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
         const uint32_t cur = pc;
         const uint32_t lo = mem[cur * 2], hi = mem[cur * 2 + 1];
         pc = (pc + 1) & u.imask;
+
+        if (steps >= kTraceFrom)
+            ring[ring_n++ & 63u] = { cur, lo, hi };
 
         const bool was_delay = pend_cd > 0;
         const bool stop_after = end_pending;
@@ -6120,8 +7075,58 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
     if (q_cd > 0)
         c.vi[22] = q_val;
 
-    if (steps >= 1000000u)
-        std::fprintf(stderr, "  [VU%d] programa em 0x%04X nao terminou em 1e6 instrucoes: abortado\n", u.vu1 ? 1 : 0, byte_addr);
+    if (steps >= kMaxSteps)
+    {
+        std::fprintf(stderr, "  [VU%d] programa em 0x%04X nao terminou em %u instrucoes: abortado\n", u.vu1 ? 1 : 0, byte_addr, kMaxSteps);
+
+        // despeja o laco (ultimas 64 instrucoes) e os registradores, uma vez por endereco
+        static uint32_t dumped[8];
+        static unsigned dumped_n = 0;
+        bool seen = false;
+
+        for (unsigned i = 0; i < dumped_n; i++)
+            if (dumped[i] == byte_addr) seen = true;
+
+        if (!seen && dumped_n < 8)
+        {
+            dumped[dumped_n++] = byte_addr;
+            char name[64];
+            std::snprintf(name, sizeof name, "vu%d_laco_0x%04X.txt", u.vu1 ? 1 : 0, byte_addr);
+
+            if (FILE* f = std::fopen(name, "w"))
+            {
+                std::fprintf(f, "VU%d: programa em 0x%04X nao terminou em %u pares. pc=%u\n", u.vu1 ? 1 : 0, byte_addr, kMaxSteps, pc);
+                std::fprintf(f, "VI:");
+
+                for (int i = 0; i < 32; i++)
+                    std::fprintf(f, " vi%02d=%04X", i, (unsigned)(c.vi[i] & 0xFFFFFFu));
+
+                std::fprintf(f, "\nMAC=%04X status=%03X clip=%06X Q=%08X I=%08X P=%08X\n", (unsigned)(c.vi[17] & 0xFFFF), (unsigned)(c.vi[16] & 0xFFF), (unsigned)(c.vi[18] & 0xFFFFFF), c.vi[22], c.vi[21], c.vi[23]);
+
+                for (int i = 0; i < 32; i++)
+                    std::fprintf(f, "vf%02d = %08X %08X %08X %08X\n", i, c.vf[i][0], c.vf[i][1], c.vf[i][2], c.vf[i][3]);
+
+                std::fprintf(f, "\nultimos 64 pares executados (endereco  upper lower):\n");
+
+                for (unsigned k = 0; k < 64; k++)
+                {
+                    const UmRec& r = ring[(ring_n + k) & 63u];
+                    std::fprintf(f, "%04X: %08X %08X\n", (unsigned)(r.pc * 8u), r.hi, r.lo);
+                }
+
+                std::fprintf(f, "\nprograma (a partir do endereco inicial, 96 pares):\n");
+
+                for (unsigned k = 0; k < 96; k++)
+                {
+                    const uint32_t a = ((byte_addr >> 3) + k) & u.imask;
+                    std::fprintf(f, "%04X: %08X %08X\n", (unsigned)(a * 8u), mem[a * 2 + 1], mem[a * 2]);
+                }
+
+                std::fclose(f);
+                std::fprintf(stderr, "  [VU%d] laco gravado em %s\n", u.vu1 ? 1 : 0, name);
+            }
+        }
+    }
 
     u.pc = pc;
 }
@@ -6132,6 +7137,10 @@ static Ctx g_vu1_regs;
 void vu0_run(Ctx& c, uint32_t byte_addr)
 {
     g_vu0_runs++;
+
+    if (g_vu0_dirty) { g_vu0_flags = um_scan_flag_readers(g_vu0_micro, 512); g_vu0_dirty = false; }
+
+    g_um_flags = g_vu0_flags;
     const uint64_t pt0 = prof_now();
     VuUnit u = { &c, g_vu0_micro, g_vu0_data, 0x1FFu, 0xFFu, false, g_vu0_pc };
     vu_run(u, byte_addr);
@@ -6142,6 +7151,10 @@ void vu0_run(Ctx& c, uint32_t byte_addr)
 void vu1_run(uint32_t byte_addr)
 {
     g_vu1_runs++;
+
+    if (g_vu1_dirty) { g_vu1_flags = um_scan_flag_readers(g_vu1_micro, 2048); g_vu1_dirty = false; }
+
+    g_um_flags = g_vu1_flags;
     const uint64_t pt0 = prof_now();
     VuUnit u = { &g_vu1_regs, g_vu1_micro, g_vu1_data, 0x7FFu, 0x3FFu, true, g_vu1_pc };
     vu_run(u, byte_addr);
@@ -6485,6 +7498,48 @@ namespace
                 last_title = tnow;
             }
 
+            {
+                static bool f10_last = false;
+                const bool f10 = ps2_key_down(0x79);   // VK_F10: grava gs_shot_N.bmp (640x448, sem escala)
+
+                if (f10 && !f10_last && !pix.empty())
+                {
+                    static unsigned shots = 0;
+                    char name[64];
+                    std::snprintf(name, sizeof name, "gs_shot_%u.bmp", ++shots);
+                    FILE* f = std::fopen(name, "wb");
+
+                    if (f != nullptr)
+                    {
+                        const uint32_t row = (w * 3 + 3) & ~3u, img = row * h;
+                        unsigned char hdr[54] = { 'B', 'M' };
+                        const uint32_t fsz = 54 + img, off = 54, dib = 40, planes_bpp = (24u << 16) | 1u;
+                        std::memcpy(hdr + 2, &fsz, 4); std::memcpy(hdr + 10, &off, 4); std::memcpy(hdr + 14, &dib, 4);
+                        std::memcpy(hdr + 18, &w, 4);
+                        const int32_t nh = -(int32_t)h;   // de cima para baixo
+                        std::memcpy(hdr + 22, &nh, 4); std::memcpy(hdr + 26, &planes_bpp, 4); std::memcpy(hdr + 34, &img, 4);
+                        std::fwrite(hdr, 1, 54, f);
+                        std::vector<unsigned char> line(row, 0);
+
+                        for (uint32_t y = 0; y < h; y++)
+                        {
+                            for (uint32_t x = 0; x < w; x++)
+                            {
+                                const uint32_t p = pix[(size_t)y * w + x];
+                                line[x * 3] = (unsigned char)(p & 0xFF); line[x * 3 + 1] = (unsigned char)((p >> 8) & 0xFF); line[x * 3 + 2] = (unsigned char)((p >> 16) & 0xFF);
+                            }
+
+                            std::fwrite(line.data(), 1, row, f);
+                        }
+
+                        std::fclose(f);
+                        std::fprintf(stderr, "  [captura] %s gravado\n", name);
+                    }
+                }
+
+                f10_last = f10;
+            }
+
             unsigned seq = g_win_seq.load();
             bool fresh = seq != seen;
 
@@ -6512,7 +7567,43 @@ namespace
                 RECT cr;
                 GetClientRect(hw, &cr);
                 HDC dc = GetDC(hw);
-                StretchDIBits(dc, 0, 0, cr.right, cr.bottom, 0, 0, (int)w, (int)h, pix.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+                static const bool smooth = std::getenv("PS2_NOSMOOTH") == nullptr;
+
+                if (smooth)
+                {
+                    SetStretchBltMode(dc, HALFTONE);    // suaviza o aumento da imagem (em vez de quadrados)
+                    SetBrushOrgEx(dc, 0, 0, nullptr);
+                }
+
+                // O PS2 mostra 4:3 (PS2_ASPECT=16:9 ou "stretch" mudam). O resto da janela fica preto.
+                static const char* asp = std::getenv("PS2_ASPECT");
+                double aspect = 4.0 / 3.0;
+
+                if (asp != nullptr)
+                    aspect = std::strcmp(asp, "16:9") == 0 ? 16.0 / 9.0 : (std::strcmp(asp, "stretch") == 0 ? 0.0 : aspect);
+
+                int dx = 0, dy = 0, dw = (int)cr.right, dh = (int)cr.bottom;
+
+                if (aspect > 0.0 && dw > 0 && dh > 0)
+                {
+                    if ((double)dw / (double)dh > aspect) { dw = (int)((double)dh * aspect); dx = ((int)cr.right - dw) / 2; }
+                    else { dh = (int)((double)dw / aspect); dy = ((int)cr.bottom - dh) / 2; }
+                }
+
+                // So as barras (areas fora da imagem) sao pintadas de preto; pintar a janela toda antes de cada quadro piscava.
+                if (dx > 0)
+                {
+                    PatBlt(dc, 0, 0, dx, (int)cr.bottom, BLACKNESS);
+                    PatBlt(dc, dx + dw, 0, (int)cr.right - dx - dw, (int)cr.bottom, BLACKNESS);
+                }
+
+                if (dy > 0)
+                {
+                    PatBlt(dc, 0, 0, (int)cr.right, dy, BLACKNESS);
+                    PatBlt(dc, 0, dy + dh, (int)cr.right, (int)cr.bottom - dy - dh, BLACKNESS);
+                }
+
+                StretchDIBits(dc, dx, dy, dw, dh, 0, 0, (int)w, (int)h, pix.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
                 ReleaseDC(hw, dc);
             }
             else
@@ -6529,6 +7620,64 @@ void ps2_window_start()
         std::thread(ps2_window_thread).detach();
 }
 
+// Excecoes que o signal() do C nao pega (estouro de pilha, divisao inteira por zero, instrucao ilegal...).
+static LONG WINAPI ps2_exception_filter(EXCEPTION_POINTERS* ep)
+{
+    std::fprintf(stderr, "\n  [CRASH] excecao do Windows 0x%08lX no endereco %p\n",
+        (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+
+    if (ep->ExceptionRecord->ExceptionCode == 0xC00000FDu)
+        std::fprintf(stderr, "  (estouro de pilha: tente aumentar --stack ou procure recursao no jogo)\n");
+
+    std::fflush(stderr);
+    on_crash(SIGSEGV);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void ps2_install_crash_filter()
+{
+    SetUnhandledExceptionFilter(ps2_exception_filter);
+}
+
+// O runtime espera com sleep_for(1 ms) (escalonador ocioso e tique do vsync). No Windows um sleep de 1 ms dura ~15,6 ms
+// por padrao, e em janelas nao focadas/ocultas o sistema ainda agrupa os timers. Pede 0,5 ms de resolucao, desliga o
+// "power throttling" do processo e sobe um pouco a prioridade, para o jogo nao ser desacelerado pelo proprio sistema.
+void ps2_win_tune()
+{
+    typedef LONG (NTAPI * NtSetTimerResolutionFn)(ULONG, BOOLEAN, PULONG);
+    typedef BOOL (WINAPI * SetProcessInformationFn)(HANDLE, int, LPVOID, DWORD);
+
+    if (std::getenv("PS2_NOTUNE") != nullptr)
+        return;
+
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+
+    if (nt != nullptr)
+    {
+        NtSetTimerResolutionFn f = reinterpret_cast<NtSetTimerResolutionFn>(reinterpret_cast<void*>(GetProcAddress(nt, "NtSetTimerResolution")));
+
+        if (f != nullptr)
+        {
+            ULONG cur = 0;
+            f(5000, TRUE, &cur);
+            std::fprintf(stderr, "  [win] resolucao do timer: %.2f ms\n", (double)cur / 10000.0);
+        }
+    }
+
+    struct ProcPowerThrottling { ULONG Version; ULONG ControlMask; ULONG StateMask; } st = { 1, 0x5, 0 };   // EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, ambos desligados
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+
+    if (k != nullptr)
+    {
+        SetProcessInformationFn sp = reinterpret_cast<SetProcessInformationFn>(reinterpret_cast<void*>(GetProcAddress(k, "SetProcessInformation")));
+
+        if (sp != nullptr)
+            sp(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st);
+    }
+
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+}
+
 bool ps2_key_down(int vk)
 {
     if (g_hwnd != nullptr && GetForegroundWindow() != g_hwnd)
@@ -6539,6 +7688,8 @@ bool ps2_key_down(int vk)
 #else
 void ps2_window_start() {}
 bool ps2_key_down(int) { return false; }
+void ps2_install_crash_filter() {}
+void ps2_win_tune() {}
 #endif
 """;
 
