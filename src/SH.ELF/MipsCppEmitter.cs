@@ -17,6 +17,7 @@ public static class MipsCppEmitter
 
     // Runtime minimo que o codigo gerado espera. Sem aspas duplas aqui dentro.
     public const string RuntimeHeader = @"#pragma once
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -56,10 +57,10 @@ extern volatile uint32_t g_loop_mark;
 
 // Interrupcoes (vsync, timer 0): a thread de tique do host liga g_irq_pending; o codigo gerado
 // confere a flag em cada rotulo de desvio e entrega a interrupcao ali.
-extern volatile int g_irq_pending;
+extern std::atomic<uint32_t> g_irq_pending;
 void ps2_irq_poll(Ctx& c);
 void ps2_irq_idle(Ctx& c);   // entrega interrupcoes quando todas as threads estao esperando
-#define PS2_POLL_IRQ(c) do { if (g_irq_pending) ps2_irq_poll(c); } while (0)
+#define PS2_POLL_IRQ(c) do { if (g_irq_pending.load(std::memory_order_relaxed)) ps2_irq_poll(c); } while (0)
 
 // ---- memoria do EE ----
 // 0..1FFFFFFF e kseg0/kseg1 (80000000..BFFFFFFF) sao a RAM de 32 MB; 2xxxxxxx e 3xxxxxxx
@@ -420,6 +421,56 @@ static inline void vu_qmtc2(Ctx& c, int vf, Reg128 r)
     if (vf != 0) std::memcpy(c.vf[vf], &r, 16);
 }
 
+extern const bool g_rotation_caller_trace;
+void rotation_caller_record(const Ctx& c, uint32_t axis);
+
+extern const bool g_move_callback_trace;
+extern const bool g_field_clock_trace;
+void field_clock_record(uint32_t delta_bits);
+
+struct MoveCallbackTrace;
+void move_callback_begin(const Ctx& c, MoveCallbackTrace& trace);
+void move_callback_end(const Ctx& c, const MoveCallbackTrace& trace);
+
+struct MoveCallbackTrace
+{
+    const Ctx& ctx;
+    uint32_t vector, object, caller;
+    unsigned attempts;
+    double input_length, position_x, position_z;
+    bool input_valid, position_valid;
+
+    explicit MoveCallbackTrace(const Ctx& c) : ctx(c)
+    {
+        if (g_move_callback_trace)
+        {
+            attempts = 0;
+            move_callback_begin(ctx, *this);
+        }
+    }
+
+    // Executa apos o delay slot de retorno, com o v0 definitivo.
+    ~MoveCallbackTrace()
+    {
+        if (g_move_callback_trace)
+            move_callback_end(ctx, *this);
+    }
+
+    void attempt()
+    {
+        if (g_move_callback_trace)
+            ++attempts;
+    }
+};
+
+enum class Vu0StatusEvent : unsigned
+{
+    Div, Sqrt, Rsqrt, WaitQ, ReadStatus, WriteStatus, MicroDiv, MicroSqrt,
+    MicroRsqrt, MicroReadStatus, Count
+};
+extern const bool g_vu0_status_trace;
+void vu0_status_record(Vu0StatusEvent event, uint32_t pc, uint32_t value);
+
 static inline uint32_t vu_cfc2(Ctx& c, int r)
 {
     if (r == 0) return 0;
@@ -685,6 +736,68 @@ static inline void mmi_pexew(Ctx& c, int rd, int rt) { V128 b = V(c.r[rt]), o; o
 static inline void mmi_pmfhi(Ctx& c, int rd) { Reg128 o = { c.hi, c.hi1 }; c.r[rd] = o; }
 static inline void mmi_pmflo(Ctx& c, int rd) { Reg128 o = { c.lo, c.lo1 }; c.r[rd] = o; }
 
+// PMULTH / PMADDH / PMSUBH: 8 produtos de halfword com sinal em 8 palavras de 32 bits:
+// LO = {p0, p1, p4, p5}, HI = {p2, p3, p6, p7} (LO/HI em pipeline 0 = palavras 0-1, HI1/LO1 = palavras 2-3).
+// rd (se nao for $zero) recebe {LO0, HI0, LO2, HI2} = {p0, p2, p4, p6}. mode: 0 = grava, 1 = soma, 2 = subtrai.
+static inline void mmi_mulh_t(Ctx& c, int rd, int rs, int rt, int mode)
+{
+    V128 a = V(c.r[rs]), b = V(c.r[rt]);
+    uint32_t lo[4] = { (uint32_t)c.lo, (uint32_t)(c.lo >> 32), (uint32_t)c.lo1, (uint32_t)(c.lo1 >> 32) };
+    uint32_t hi[4] = { (uint32_t)c.hi, (uint32_t)(c.hi >> 32), (uint32_t)c.hi1, (uint32_t)(c.hi1 >> 32) };
+    uint32_t p[8];
+
+    for (int i = 0; i < 8; i++)
+        p[i] = (uint32_t)((int32_t)(int16_t)a.h[i] * (int32_t)(int16_t)b.h[i]);
+
+    uint32_t* dst[8] = { &lo[0], &lo[1], &hi[0], &hi[1], &lo[2], &lo[3], &hi[2], &hi[3] };
+
+    for (int i = 0; i < 8; i++)
+    {
+        if (mode == 0) *dst[i] = p[i];
+        else if (mode == 1) *dst[i] += p[i];
+        else *dst[i] -= p[i];
+    }
+
+    c.lo = (uint64_t)lo[0] | ((uint64_t)lo[1] << 32);
+    c.lo1 = (uint64_t)lo[2] | ((uint64_t)lo[3] << 32);
+    c.hi = (uint64_t)hi[0] | ((uint64_t)hi[1] << 32);
+    c.hi1 = (uint64_t)hi[2] | ((uint64_t)hi[3] << 32);
+
+    if (rd != 0)
+    {
+        Reg128 o = { (uint64_t)lo[0] | ((uint64_t)hi[0] << 32), (uint64_t)lo[2] | ((uint64_t)hi[2] << 32) };
+        c.r[rd] = o;
+    }
+}
+static inline void mmi_pmulth(Ctx& c, int rd, int rs, int rt) { mmi_mulh_t(c, rd, rs, rt, 0); }
+static inline void mmi_pmaddh(Ctx& c, int rd, int rs, int rt) { mmi_mulh_t(c, rd, rs, rt, 1); }
+static inline void mmi_pmsubh(Ctx& c, int rd, int rs, int rt) { mmi_mulh_t(c, rd, rs, rt, 2); }
+
+// PMULTW / PMADDW / PMSUBW: dois produtos 32x32 com sinal (palavras 0 e 2), cada um em 64 bits:
+// pipeline 0 -> (HI, LO), pipeline 1 -> (HI1, LO1); rd.lo / rd.hi recebem os resultados de 64 bits.
+static inline void mmi_mulw_t(Ctx& c, int rd, int rs, int rt, int mode)
+{
+    uint64_t* H[2] = { &c.hi, &c.hi1 };
+    uint64_t* L[2] = { &c.lo, &c.lo1 };
+    uint64_t res[2];
+
+    for (int k = 0; k < 2; k++)
+    {
+        uint64_t ra = k == 0 ? c.r[rs].lo : c.r[rs].hi, rb = k == 0 ? c.r[rt].lo : c.r[rt].hi;
+        int64_t prod = (int64_t)(int32_t)(uint32_t)ra * (int64_t)(int32_t)(uint32_t)rb;
+        int64_t acc = (int64_t)(((uint64_t)(uint32_t)*H[k] << 32) | (uint32_t)*L[k]);
+        int64_t t = mode == 0 ? prod : (mode == 1 ? acc + prod : acc - prod);
+        *L[k] = S32((uint32_t)t);
+        *H[k] = S32((uint32_t)((uint64_t)t >> 32));
+        res[k] = (uint64_t)t;
+    }
+
+    if (rd != 0) { Reg128 o = { res[0], res[1] }; c.r[rd] = o; }
+}
+static inline void mmi_pmultw(Ctx& c, int rd, int rs, int rt) { mmi_mulw_t(c, rd, rs, rt, 0); }
+static inline void mmi_pmaddw(Ctx& c, int rd, int rs, int rt) { mmi_mulw_t(c, rd, rs, rt, 1); }
+static inline void mmi_pmsubw(Ctx& c, int rd, int rs, int rt) { mmi_mulw_t(c, rd, rs, rt, 2); }
+
 // MADD: (HI, LO) += rs * rt, com sinal; o EE tambem grava LO em rd.
 static inline void ee_madd(Ctx& c, int rd, int rs, int rt)
 {
@@ -771,6 +884,9 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 #include <set>
 #include <thread>
 #include <vector>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 const char* ps2_syscall_name(int number);   // gerado em ps2_syscall_names.cpp
 
@@ -941,13 +1057,93 @@ static uint32_t g_poll_address = 0;
 static unsigned g_poll_count = 0;
 
 // ---- estado das interrupcoes (compartilhado entre o modelo de hardware, os syscalls e o tique) ----
-volatile int g_irq_pending = 0;
-static std::atomic<uint32_t> g_irq_flags(0);   // bit 0 = VBLANK_START (causa 2), bit 1 = TIMER0 (causa 9)
-static uint64_t g_timer0_mode = 0;
-static uint64_t g_timer0_comp = 0;
+// Os dois contadores sao publicados no mesmo CAS e consumidos no mesmo exchange.
+static constexpr unsigned irq_timer0_bits = 8;
+static constexpr uint32_t irq_timer0_mask = (1u << irq_timer0_bits) - 1u;
+static constexpr uint32_t irq_vblank_max = UINT32_MAX >> irq_timer0_bits;
+std::atomic<uint32_t> g_irq_pending{0};
+static std::atomic<uint64_t> g_vsync_gen(0), g_vsync_del(0);   // VBLANKs gerados pelo relogio / entregues ao jogo (diagnostico do slow-motion)
+static const bool g_vsync_catchup = std::getenv("PS2_VSYNC_CATCHUP") != nullptr;   // entrega VBLANKs atrasados (ate 4 por vez)
+static std::atomic<uint64_t> g_timer0_mode{0}, g_timer0_comp{0};
+static std::atomic<uint64_t> g_timer0_periods{0}, g_timer0_delivered{0};
+static std::atomic<uint64_t> g_irq_wakes{0}, g_timer0_posts{0}, g_timer0_merged{0};
+// O tique amostra a etapa do EE quando um sinal encontra o bit ocupado.
+enum class Timer0EeStage : unsigned { Other, Vif0, Vif1, Gif, Vblank, Timer0, Count };
+static const bool g_timer0_trace_stages = [] {
+    const char* value = std::getenv("PS2_TIMER0_TRACE_STAGES");
+    return value && std::strcmp(value, "1") == 0;
+}();
+static std::atomic<Timer0EeStage> g_timer0_ee_stage{Timer0EeStage::Other};
+static std::atomic<uint64_t> g_timer0_merges_by_stage[(unsigned)Timer0EeStage::Count]{};
+
+class Timer0StageScope
+{
+    Timer0EeStage previous = Timer0EeStage::Other;
+public:
+    explicit Timer0StageScope(Timer0EeStage stage)
+    {
+        if (g_timer0_trace_stages)
+            previous = g_timer0_ee_stage.exchange(stage, std::memory_order_relaxed);
+    }
+    ~Timer0StageScope()
+    {
+        if (g_timer0_trace_stages)
+            g_timer0_ee_stage.store(previous, std::memory_order_relaxed);
+    }
+};
+
+static void timer0_count_merge()
+{
+    g_timer0_merged.fetch_add(1, std::memory_order_relaxed);
+    if (g_timer0_trace_stages)
+    {
+        const unsigned stage = (unsigned)g_timer0_ee_stage.load(std::memory_order_relaxed);
+        g_timer0_merges_by_stage[stage].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static uint64_t g_timer0_sys_ticks_recovered = 0; // So o EE atualiza e le.
+static uint64_t g_timer0_dma_delivered = 0;  // So o EE atualiza e le este contador.
+static const bool g_timer0_dma_poll = [] {
+    const char* value = std::getenv("PS2_TIMER0_DMA_POLL");
+    return value && std::strcmp(value, "1") == 0;
+}();
+static const bool g_gs_timer_clock = [] {
+    const char* value = std::getenv("PS2_GS_TIMER_CLOCK");
+    return !value || std::strcmp(value, "1") == 0;
+}();
+
+static const bool g_timer0_elapsed = g_gs_timer_clock && [] {
+    const char* value = std::getenv("PS2_TIMER0_ELAPSED");
+    return !value || std::strcmp(value, "1") == 0;
+}();
+
+// Bits CLKS do Timer 0. O caminho legado conserva a frequencia usada antes.
+static uint64_t timer0_bus_hz(uint64_t mode)
+{
+    constexpr uint64_t bus_hz = 147456000ull;
+    switch (mode & 3u)
+    {
+        case 0: return bus_hz;
+        case 1: return bus_hz / 16u;
+        case 2: return bus_hz / 256u;
+        default: return 0; // HBlank requer eventos do GS.
+    }
+}
+
+static uint64_t timer0_clock_hz(uint64_t mode)
+{
+    return g_gs_timer_clock ? timer0_bus_hz(mode) : 576000ull;
+}
+
+static std::atomic<bool> g_irq_wait_highres_active{false};
+static const bool g_timer0_phase = [] {
+    const char* value = std::getenv("PS2_TIMER0_PHASE");
+    return !value || std::strcmp(value, "1") == 0;
+}();
 static uint32_t g_vsync_flag1 = 0;             // SetVSyncFlag: o kernel escreve 1 aqui a cada vsync
 static uint32_t g_vsync_flag2 = 0;             // ... e o CSR aqui (64 bits)
-static uint32_t g_intc_mask = 0;               // bit = causa habilitada por EnableIntc
+static std::atomic<uint32_t> g_intc_mask{0};               // bit = causa habilitada por EnableIntc
 static bool g_in_irq = false;
 
 struct IntcHandler
@@ -1070,24 +1266,129 @@ static uint8_t g_vu1_micro[16384];
 static uint8_t g_vu1_data[16384];
 uint32_t g_vif1_top = 0, g_vif1_itop = 0;
 static bool g_vu0_dirty = true, g_vu1_dirty = true;   // micro memoria mudou desde a ultima analise
+// O EE e o MPG no DMA sincrono sao os dois caminhos de escrita.
+static uint64_t g_vu1_micro_revision = 1;
+static void vu1_micro_written()
+{
+    ++g_vu1_micro_revision;
+    g_vu1_dirty = true;
+}
 static bool g_vu0_flags = true, g_vu1_flags = true;   // algum programa le MAC/status (FSAND, FMAND...)?
 
 // Perfil (impresso a cada 2 s no resumo [gs]): tempo no DMA do GS/VIF, nos microprogramas e na janela.
-static const bool g_perf = std::getenv("PS2_PERF") != nullptr;   // relatorio [prof] sem precisar de PS2_GIFLOG
+// Opcoes de inicializacao: evita consultar o ambiente por vetor ou instrucao.
+static const bool g_vu_header_trace = std::getenv("PS2_VU_HEADER_TRACE") != nullptr;
+static const bool g_vu_flag_test = std::getenv("PS2_VU_FLAG_TEST") != nullptr;
+static const bool g_vu_count_trace = std::getenv("PS2_VU_COUNT_TRACE") != nullptr;
+static const bool g_vu1_fast = std::getenv("PS2_VU1_FAST") != nullptr;
+static const bool g_sprite_generic_rows = std::getenv("PS2_GS_SPRITE_GENERIC_ROWS") != nullptr;
+static const bool g_sprite_wide_fast = [] {
+    const char* value = std::getenv("PS2_GS_SPRITE_WIDE_FAST");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}();
+// Permite comparar o decodificador especializado com o caminho anterior.
+static const bool g_sprite_tex_decode = [] {
+    const char* value = std::getenv("PS2_GS_SPRITE_TEX_DECODE");
+    return !value || std::strcmp(value, "0") != 0;
+}();
+static const bool g_sprite_columns = std::getenv("PS2_GS_SPRITE_COLUMNS") != nullptr;
+// Normalizacao experimental antes da cobertura e interpolacao dos pixels.
+static const bool g_field_raster = [] {
+    const char* value = std::getenv("PS2_GS_FIELD_RASTER");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+static const bool g_field_raster_train = [] {
+    const char* value = std::getenv("PS2_GS_FIELD_RASTER_TRAIN");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+static const bool g_field_train_diag = [] {
+    const char* value = std::getenv("PS2_GS_FIELD_TRAIN_DIAG");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+static const bool g_perf_gs = std::getenv("PS2_PERF_GS") != nullptr;
+static const bool g_field_audit = [] {
+    const char* value = std::getenv("PS2_GS_FIELD_AUDIT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+static const bool g_gs_tri_texture_specialize = std::getenv("PS2_GS_TRI_TEXTURE_SPECIALIZE") != nullptr;
+static const bool g_gs_tri_effects_fast = [] {
+    const char* value = std::getenv("PS2_GS_TRI_EFFECTS_FAST");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}();
+static const bool g_gs_tri_early_z = std::getenv("PS2_GS_TRI_EARLY_Z") != nullptr;
+static const bool g_perf_vif1 = std::getenv("PS2_PERF_VIF1") != nullptr;
+static const bool g_vif1_unpack_fast = std::getenv("PS2_VIF1_UNPACK_FAST") != nullptr;
+static const bool g_perf_cadence = [] {
+    const char* value = std::getenv("PS2_PERF_CADENCE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+static const bool g_perf = g_perf_cadence || g_perf_vif1 || g_perf_gs || g_field_audit || std::getenv("PS2_PERF") != nullptr;   // relatorio [prof] sem precisar de PS2_GIFLOG
 std::atomic<bool> g_cap_request{false};   // F9: grava o trace dos proximos vsyncs em gs_captura_N.txt (sem custo quando nao usado)
-uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0, g_prof_raster_ns = 0, g_prof_img_ns = 0;
+// A medicao por quadword e opcional: duas consultas ao relogio
+// a cada 16 bytes podem dominar o custo de enfileirar a imagem.
+static const bool g_prof_image_qword = [] {
+    const char* value = std::getenv("PS2_GS_PROFILE_IMAGE_QWORD");
+    return !value || std::strcmp(value, "0") != 0;
+}();
+// 1 preserva a medicao completa. Potencias de dois permitem
+// escolher a amostra sem divisao no caminho de cada quadword.
+static const unsigned g_prof_image_stride = [] {
+    const char* value = std::getenv("PS2_GS_IMAGE_PROFILE_STRIDE");
+    if (!value || std::strcmp(value, "2") == 0) return 2u;
+    if (value && std::strcmp(value, "4") == 0) return 4u;
+    return 1u;
+}();
+static uint64_t g_prof_image_samples = 0;
+
+uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0, g_prof_img_ns = 0;
+// O GS assincrono registra o tempo no worker e o EE le o perfil.
+static std::atomic<uint64_t> g_prof_tri_ns{0}, g_prof_sprite_ns{0};
+static std::atomic<uint64_t> g_prof_sprite_fast_pixels{0}, g_prof_sprite_generic_pixels{0};
 static inline uint64_t prof_now()
 {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-struct ProfScope
+// Estas metricas pertencem ao EE. O escalonador so executa uma
+// thread convidada por vez, inclusive durante o tratamento de IRQ.
+struct CadenceEeProfile
 {
-    uint64_t& acc;
-    uint64_t t0;
-    explicit ProfScope(uint64_t& a) : acc(a), t0(prof_now()) {}
-    ~ProfScope() { acc += prof_now() - t0; }
+    uint64_t idle_sleep_ns = 0, dma_vif1_ns = 0, dma_gif_ns = 0;
+    unsigned idle_sleeps = 0, idle_vblanks = 0, batches = 0, multiple = 0, max_pending = 0;
+    uint64_t dropped = 0;
 };
+static CadenceEeProfile g_cadence_ee;
+
+// VIF1 e VU1 rodam dentro da mesma regiao de DMA protegida por g_gs_mu.
+struct Vu1Profile
+{
+    uint64_t calls = 0, pairs = 0, ns = 0, kick_ns = 0;
+};
+static Vu1Profile g_prof_vu1[2048];
+static uint64_t g_prof_kick_ns = 0;
+static const char* const g_vu_aot_mode = std::getenv("PS2_VU1_AOT_CAPTURE");
+static const bool g_vu_aot_capture = g_vu_aot_mode != nullptr;
+static const bool g_vu_aot_revision_cache = [] {
+    const char* value = std::getenv("PS2_VU1_AOT_REVISION_CACHE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+static uint64_t g_prof_aot_revision_hits = 0;
+static const bool g_vu_aot_enabled = std::getenv("PS2_VU1_AOT") != nullptr;
+static const bool g_vu_aot_capture_0658_only = g_vu_aot_capture && std::strcmp(g_vu_aot_mode, "auto-0658") == 0;
+static std::atomic<bool> g_vu_aot_armed{g_vu_aot_capture_0658_only ||
+    (g_vu_aot_capture && std::strcmp(g_vu_aot_mode, "auto") == 0)};
+static uint64_t g_prof_aot_pairs = 0, g_prof_aot_match = 0, g_prof_aot_mismatch = 0, g_prof_aot_missing = 0;
+static uint64_t g_prof_aot_partial_pairs = 0;
+static uint64_t g_prof_unpack_ns = 0, g_prof_unpack_calls = 0, g_prof_unpack_words = 0;
+
+struct RasterProfScope
+{
+    std::atomic<uint64_t>& acc;
+    uint64_t start;
+    explicit RasterProfScope(std::atomic<uint64_t>& a) : acc(a), start(prof_now()) {}
+    ~RasterProfScope() { acc.fetch_add(prof_now() - start, std::memory_order_relaxed); }
+};
+
 void vu0_run(Ctx& c, uint32_t byte_addr);
 void vu1_run(uint32_t byte_addr);
 uint32_t g_vu0_pc_get();
@@ -1144,6 +1445,12 @@ uint64_t ps2_hw_read(Ctx&, uint32_t phys, int size)
         gs_vsync_update();
 
         uint64_t csr = 0x2ull | (g_gs_vsint ? 0x8ull : 0ull) | ((uint64_t)g_gs_field << 13);
+        if (g_gs_timer_clock)
+        {
+            // Revisao e ID do GS selecionado. Shadow Hearts le REV no boot
+            // para escolher o valor de comparacao do Timer 0.
+            csr |= (0x1Bull << 16) | (0x55ull << 24);
+        }
         uint64_t value = csr >> ((phys & 7u) * 8u);
 
         if (size < 8)
@@ -1171,6 +1478,7 @@ uint64_t ps2_hw_read(Ctx&, uint32_t phys, int size)
 }
 
 void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value);
+static void irq_poll_timer0_at_dma(Ctx& c);
 
 void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
 {
@@ -1179,10 +1487,18 @@ void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
         std::memcpy(vp, &value, (size_t)size);
 
         if (vp >= g_vu0_micro && vp < g_vu0_micro + sizeof g_vu0_micro) g_vu0_dirty = true;
-        else if (vp >= g_vu1_micro && vp < g_vu1_micro + sizeof g_vu1_micro) g_vu1_dirty = true;
+        else if (phys >= 0x11008000u && phys < 0x1100C000u) vu1_micro_written();
 
         return;
     }
+
+    // STR em VIF1/GIF inicia trabalho sincrono no EE. O ponto anterior
+    // ainda pode entregar um Timer 0 antes do trabalho; o posterior
+    // executa depois de liberar o lock do GS e concluir a escrita.
+    const bool check_timer0 = g_timer0_dma_poll && (value & 0x100u) &&
+        (phys == 0x10009000u || phys == 0x1000A000u);
+    if (check_timer0)
+        irq_poll_timer0_at_dma(c);
 
     ps2_dma_write(c, phys, value);
 
@@ -1192,7 +1508,15 @@ void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
 
     // Timer 0: modo (+0x10) e valor de comparacao (+0x20); a interrupcao sai quando o jogo liga CUE e CMPE
     if (phys == 0x10000010u)
-        g_timer0_mode = (value & ~0xC00ull) | (g_timer0_mode & 0xC00ull & ~value);
+    {
+        // Bits de status sao limpos com escrita de 1. Preserve um evento
+        // que a thread do relogio publique durante a escrita do EE.
+        uint64_t mode = g_timer0_mode.load();
+        while (!g_timer0_mode.compare_exchange_weak(mode,
+            (value & ~0xC00ull) | (mode & 0xC00ull & ~value)))
+        {
+        }
+    }
 
     if (phys == 0x10000020u)
         g_timer0_comp = value;
@@ -1205,6 +1529,9 @@ void ps2_hw_write(Ctx& c, uint32_t phys, uint64_t value, int size)
 
     g_poll_address = 0;
     g_poll_count = 0;
+
+    if (check_timer0)
+        irq_poll_timer0_at_dma(c);
 }
 
 void ps2_bad_address(Ctx&, uint32_t address, int write)
@@ -1426,7 +1753,13 @@ namespace
         for (int spins = 0; next == 0 && spins < 3000; spins++)
         {
             lk.unlock();
+            const uint64_t idle_start = g_perf_cadence ? prof_now() : 0;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (g_perf_cadence)
+            {
+                ++g_cadence_ee.idle_sleeps;
+                g_cadence_ee.idle_sleep_ns += prof_now() - idle_start;
+            }
 
             if (thr(me).ctx)
                 ps2_irq_idle(*thr(me).ctx);
@@ -2031,6 +2364,8 @@ static unsigned g_syscall_repeat = 0;
 static uint32_t g_user_syscall[512];   // funcoes instaladas por SetSyscall, indice = numero + 256
 
 static std::atomic<uint64_t> g_activity(0);   // sobe a cada syscall; o vigia olha se parou
+volatile uint32_t g_dbg_dma[6] = {};   // onde o EE esta dentro do DMA (pulso): canal, indice da tag, TADR, id, QWC, ativo
+volatile uint32_t g_dbg_vu[3] = {};    // microprograma do VU1 em execucao: endereco, passos, ativo
 volatile uint32_t g_loop_mark = 0;             // ultimo rotulo de desvio executado (so com PS2_TRACE)
 
 static void print_loop_mark()
@@ -2520,6 +2855,9 @@ static void watchdog_thread(unsigned seconds)
             std::fprintf(stderr, "  [pulso %us] syscalls=%llu funcoes chamadas=%u ultima=%s marca=0x%08X\n", elapsed,
                 (unsigned long long)now, g_ring_pos, e ? e->name : "?", g_loop_mark);
             hw_hist_peek(6);
+            std::fprintf(stderr, "    [onde] dma: %s canal=%u tag#=%u tadr=0x%08X id=%u qwc=%u | vu1: %s prog=0x%X passos=%u\n",
+                g_dbg_dma[5] ? "DENTRO" : "fora", g_dbg_dma[0], g_dbg_dma[1], g_dbg_dma[2], g_dbg_dma[3], g_dbg_dma[4],
+                g_dbg_vu[2] ? "RODANDO" : "parado", g_dbg_vu[0], g_dbg_vu[1]);
 #else
             std::fprintf(stderr, "  [pulso %us] syscalls=%llu\n", elapsed, (unsigned long long)now);
 #endif
@@ -2554,48 +2892,102 @@ static void watchdog_thread(unsigned seconds)
     }
 }
 
+// Agenda comparacoes do Timer 0 no relogio monotono do host. Em modo
+// fixo, um despertar atrasado nao desloca o prazo da proxima comparacao.
+struct Timer0Schedule
+{
+    uint64_t next = 0;
+    uint64_t last_period = 0;
+
+    uint64_t poll(uint64_t now, uint64_t period, bool fixed_phase)
+    {
+        if (period == 0)
+        {
+            next = last_period = 0;
+            return 0;
+        }
+        if (next == 0 || (fixed_phase && period != last_period))
+        {
+            last_period = period;
+            next = now + period;
+            return fixed_phase ? 0 : 1;
+        }
+        if (now < next)
+            return 0;
+
+        const uint64_t elapsed = 1 + (now - next) / period;
+        next = fixed_phase ? next + elapsed * period : now + period;
+        return elapsed;
+    }
+};
+
 // Tique de interrupcoes: VBLANK a ~59,94 Hz e timer 0 (quando o jogo o liga) a cada 1 ms.
+// Implementacao Win32 junto com as outras APIs de janela.
+static void irq_wait_tick();
+
+static uint32_t irq_add_pending(uint32_t pending, uint32_t vblanks, uint64_t timer_events)
+{
+    const uint32_t count = std::min((pending >> irq_timer0_bits) + vblanks, irq_vblank_max);
+    const uint32_t old_timer = pending & irq_timer0_mask;
+    const uint32_t timer = g_timer0_elapsed
+        ? old_timer + (uint32_t)std::min<uint64_t>(timer_events, irq_timer0_mask - old_timer)
+        : old_timer | (timer_events != 0 ? 1u : 0u);
+    return (count << irq_timer0_bits) | timer;
+}
+
 static void irq_tick_thread()
 {
     const uint64_t period = 16683333ull;
     uint64_t next_vsync = hw_now_ns() + period;
-    uint64_t t0_next = 0;
+    Timer0Schedule timer0;
 
     for (;;)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        irq_wait_tick();
+        g_irq_wakes.fetch_add(1, std::memory_order_relaxed);
 
         uint64_t now = hw_now_ns();
-        uint32_t flags = 0;
-
-        while (now >= next_vsync)
+        uint32_t vblanks = 0;
+        if (now >= next_vsync)
         {
-            next_vsync += period;
-            flags |= 1u;
+            const uint64_t elapsed = 1 + (now - next_vsync) / period;
+            next_vsync += elapsed * period;
+            g_vsync_gen.fetch_add(elapsed, std::memory_order_relaxed);
+            vblanks = (uint32_t)std::min<uint64_t>(elapsed, irq_vblank_max);
         }
 
-        // CUE (bit 7) e CMPE (bit 8) ligados e causa 9 habilitada: dispara a cada "comparacao" ticks
-        // do contador (576 kHz); o handler limpa o EQUF escrevendo 1 no bit 10 do modo.
-        if ((g_timer0_mode & 0x180ull) == 0x180ull && g_timer0_comp != 0 && (g_intc_mask & (1u << 9)))
+        // CUE (bit 7), CMPE (bit 8) e causa 9 habilitados.
+        const uint64_t mode = g_timer0_mode.load();
+        const uint64_t compare = g_timer0_comp.load() & 0xFFFFull;
+        const bool timer0_enabled = (mode & 0x180ull) == 0x180ull &&
+            (g_intc_mask.load() & (1u << 9));
+        const uint64_t clock_hz = timer0_clock_hz(mode);
+        const uint64_t period_ns = timer0_enabled && clock_hz
+            ? compare * 1000000000ull / clock_hz : 0;
+        const uint64_t periods = timer0.poll(now, period_ns, g_timer0_phase);
+        if (periods != 0)
         {
-            uint64_t t0_period = (uint64_t)g_timer0_comp * 1000000000ull / 576000ull;
+            g_timer0_periods.fetch_add(periods, std::memory_order_relaxed);
+            g_timer0_mode.fetch_or(0x400ull);
+        }
 
-            if (t0_next == 0 || now >= t0_next)
+        if (vblanks || periods)
+        {
+            uint32_t pending = g_irq_pending.load(std::memory_order_relaxed);
+            uint32_t next;
+            do
             {
-                t0_next = now + t0_period;
-                g_timer0_mode |= 0x400ull;
-                flags |= 2u;
+                next = irq_add_pending(pending, vblanks, periods);
             }
-        }
-        else
-        {
-            t0_next = 0;
-        }
-
-        if (flags)
-        {
-            g_irq_flags |= flags;
-            g_irq_pending = 1;
+            while (!g_irq_pending.compare_exchange_weak(pending, next,
+                std::memory_order_release, std::memory_order_relaxed));
+            if (periods)
+            {
+                // O CAS deixa em pending o estado imediatamente anterior a publicacao.
+                g_timer0_posts.fetch_add(1, std::memory_order_relaxed);
+                if (pending & irq_timer0_mask)
+                    timer0_count_merge();
+            }
         }
     }
 }
@@ -2607,6 +2999,7 @@ static void irq_tick_thread()
 //   Botoes: SELECT L3 R3 START UP RIGHT DOWN LEFT L2 R2 L1 R1 TRIANGLE CIRCLE CROSS SQUARE.
 void ps2_window_start();          // janela Win32 (definida no fim do arquivo; vazia fora do Windows)
 bool ps2_key_down(int vk);        // tecla apertada (so conta com a janela do jogo em foco)
+bool ps2_xinput_state(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* sticks);   // controle XInput (Xbox e compativeis); false se nao houver
 
 namespace
 {
@@ -2619,6 +3012,47 @@ namespace
         { "L2",       0x0001, 0x31 }, { "R2",     0x0002, 0x33 }, { "L1",   0x0004, 0x51 }, { "R1",   0x0008, 0x45 },
         { "TRIANGLE", 0x0010, 0x56 }, { "CIRCLE", 0x0020, 0x58 }, { "CROSS", 0x0040, 0x5A }, { "SQUARE", 0x0080, 0x43 }
     };
+
+    // XInput -> botoes do PS2. A=X(cruz), B=O(bolinha), X=quadrado, Y=triangulo, LB/RB=L1/R1, gatilhos=L2/R2, Back=Select.
+    // Controles DualShock 4 / DualSense / Switch Pro entram por aqui via Steam Input, DS4Windows, DualSenseX ou BetterJoy
+    // (eles se apresentam ao Windows como controle Xbox).
+    uint16_t pad_buttons_from_xinput(uint16_t xb, uint8_t lt, uint8_t rt)
+    {
+        uint16_t p = 0;
+
+        if (xb & 0x0001) p |= 0x1000;   // cima
+        if (xb & 0x0008) p |= 0x2000;   // direita
+        if (xb & 0x0002) p |= 0x4000;   // baixo
+        if (xb & 0x0004) p |= 0x8000;   // esquerda
+        if (xb & 0x0010) p |= 0x0800;   // Start
+        if (xb & 0x0020) p |= 0x0100;   // Select (Back)
+        if (xb & 0x0040) p |= 0x0200;   // L3
+        if (xb & 0x0080) p |= 0x0400;   // R3
+        if (xb & 0x0100) p |= 0x0004;   // L1
+        if (xb & 0x0200) p |= 0x0008;   // R1
+        if (xb & 0x1000) p |= 0x0040;   // A -> cruz
+        if (xb & 0x2000) p |= 0x0020;   // B -> bolinha
+        if (xb & 0x4000) p |= 0x0080;   // X -> quadrado
+        if (xb & 0x8000) p |= 0x0010;   // Y -> triangulo
+        if (lt > 30) p |= 0x0001;       // L2
+        if (rt > 30) p |= 0x0002;       // R2
+        return p;
+    }
+
+    // eixo do XInput (-32768..32767, cima positivo) -> byte do PS2 (0x80 no centro). Retorna false dentro da zona morta.
+    bool pad_axis_from_xinput(int16_t v, int dead, bool invert, uint8_t& out)
+    {
+        const int a = v < 0 ? -(int)v : (int)v;
+
+        if (a < dead)
+            return false;
+
+        int d = (int)(((long long)(a - dead) * 127) / (32767 - dead));
+        d = d > 127 ? 127 : d;
+        const int signed_v = (v < 0 ? -d : d) * (invert ? -1 : 1);
+        out = (uint8_t)(0x80 + signed_v);
+        return true;
+    }
 
     struct PadScriptEntry { uint16_t bit; double start; double end; };
 
@@ -2666,6 +3100,12 @@ namespace
     }
 }
 
+// Ative somente ao comparar o teclado com os pacotes lidos pelo jogo.
+static const bool g_pad_read_trace = [] {
+    const char* value = std::getenv("PS2_PAD_READ_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+
 static void pad_input_thread()
 {
     const std::vector<PadScriptEntry> script = pad_parse_script(std::getenv("PS2_PAD_SCRIPT"));
@@ -2689,6 +3129,14 @@ static void pad_input_thread()
                 pressed |= b.bit;
         }
 
+        uint16_t gp_buttons = 0;
+        uint8_t gp_lt = 0, gp_rt = 0;
+        int16_t gp_sticks[4] = {};
+        const bool has_gamepad = ps2_xinput_state(&gp_buttons, &gp_lt, &gp_rt, gp_sticks);
+
+        if (has_gamepad)
+            pressed |= pad_buttons_from_xinput(gp_buttons, gp_lt, gp_rt);
+
         if (pressed != last)
         {
             std::fprintf(stderr, "  [pad] botoes = 0x%04X\n", (unsigned)pressed);
@@ -2701,14 +3149,26 @@ static void pad_input_thread()
             return (uint8_t)(n == p ? 0x80 : (n ? 0x00 : 0xFF));
         };
 
-        const uint8_t lx = axis('A', 'D'), ly = axis('W', 'S'), rx = axis('J', 'L'), ry = axis('I', 'K');
+        uint8_t lx = axis('A', 'D'), ly = axis('W', 'S'), rx = axis('J', 'L'), ry = axis('I', 'K');
+
+        if (has_gamepad)
+        {
+            pad_axis_from_xinput(gp_sticks[0], 7849, false, lx);
+            pad_axis_from_xinput(gp_sticks[1], 7849, true, ly);
+            pad_axis_from_xinput(gp_sticks[2], 8689, false, rx);
+            pad_axis_from_xinput(gp_sticks[3], 8689, true, ry);
+        }
 
         static uint32_t last_sticks = 0x80808080u;
         const uint32_t sticks = ((uint32_t)lx << 24) | ((uint32_t)ly << 16) | ((uint32_t)rx << 8) | ry;
 
         if (sticks != last_sticks)
         {
-            std::fprintf(stderr, "  [pad] analogico esq=(%02X,%02X) dir=(%02X,%02X)\n", lx, ly, rx, ry);
+            if (g_pad_read_trace)
+                std::fprintf(stderr, "  [pad fonte] t_ms=%llu esq=(%02X,%02X) dir=(%02X,%02X)\n",
+                    (unsigned long long)(hw_now_ns() / 1000000u), lx, ly, rx, ry);
+            else
+                std::fprintf(stderr, "  [pad] analogico esq=(%02X,%02X) dir=(%02X,%02X)\n", lx, ly, rx, ry);
             last_sticks = sticks;
         }
 
@@ -2720,6 +3180,8 @@ static void pad_input_thread()
                 g_cap_request = true;
 
             f9_last = f9;
+            if (g_vu_aot_capture && ps2_key_down(0x77) && !g_vu_aot_armed.exchange(true))
+                std::fprintf(stderr, "  [VU1 AOT] F8: capturando as proximas chamadas em 0x0350, 0x0078 e 0x0658\n");
         }
 
         ps2_pad_set_state(0, (uint16_t)~pressed, rx, ry, lx, ly);
@@ -3747,6 +4209,225 @@ void ps2_pad_set_state(int port, uint16_t buttons_active_low, uint8_t right_x, u
 }
 
 // libpad: argumentos em a0..a3, retorno em v0.
+extern const bool g_rotation_caller_trace = [] {
+    const char* value = std::getenv("PS2_ROTATION_CALLER_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+
+namespace
+{
+    // Classifica pela ultima amostra do analogico que o jogo leu.
+    // O EE atualiza estes contadores e imprime o resumo.
+    bool g_rotation_pad_active = false;
+    uint64_t g_rotation_pad_reads[2]{};
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_rotation_callers[2];
+}
+
+void rotation_caller_record(const Ctx& c, uint32_t axis)
+{
+    const uint32_t link = (uint32_t)c.r[31].lo;
+    // JAL grava PC+8. Em tail calls, o link ainda e o do chamador anterior.
+    const uint32_t caller = link >= 8 ? link - 8 : 0;
+    ++g_rotation_callers[g_rotation_pad_active][{caller, axis}];
+}
+
+static void rotation_caller_report()
+{
+    if (!g_rotation_caller_trace)
+        return;
+
+    for (unsigned active = 0; active < 2; ++active)
+    {
+        auto& callers = g_rotation_callers[active];
+        using Entry = std::map<std::pair<uint32_t, uint32_t>, uint64_t>::value_type;
+        std::vector<const Entry*> ordered;
+        for (const auto& entry : callers)
+            ordered.push_back(&entry);
+        const size_t shown = std::min<size_t>(8, ordered.size());
+        std::partial_sort(ordered.begin(), ordered.begin() + shown, ordered.end(),
+            [](const Entry* a, const Entry* b) {
+                return a->second != b->second ? a->second > b->second : a->first < b->first;
+            });
+        std::fprintf(stderr, "  [prof rotacao] analogico=%u leituras=%llu locais=%zu\n",
+            active, (unsigned long long)g_rotation_pad_reads[active], callers.size());
+        for (size_t i = 0; i < shown; ++i)
+        {
+            const auto& [site, count] = *ordered[i];
+            const auto* fn = site.first ? find_containing(site.first) : nullptr;
+            std::fprintf(stderr, "  [prof rotacao local] analogico=%u eixo=%c pc_link=%08X funcao=%08X nome=%s chamadas=%llu\n",
+                active, (int)site.second, site.first, fn ? fn->address : 0u,
+                fn && fn->name ? fn->name : "?", (unsigned long long)count);
+        }
+        g_rotation_pad_reads[active] = 0;
+        callers.clear();
+    }
+}
+
+extern const bool g_field_clock_trace = [] {
+    const char* value = std::getenv("PS2_FIELD_CLOCK_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+
+namespace
+{
+    unsigned g_field_clock_samples = 0;
+    unsigned g_field_clock_invalid = 0;
+    double g_field_clock_seconds = 0;
+}
+
+void field_clock_record(uint32_t delta_bits)
+{
+    float delta;
+    std::memcpy(&delta, &delta_bits, sizeof delta);
+    if (std::isfinite(delta) && delta >= 0)
+    {
+        ++g_field_clock_samples;
+        g_field_clock_seconds += delta;
+    }
+    else
+    {
+        ++g_field_clock_invalid;
+    }
+}
+
+static void field_clock_report(double seconds)
+{
+    if (!g_field_clock_trace)
+        return;
+
+    if (seconds > 0)
+    {
+        const uint64_t mode = g_timer0_mode.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "  [prof relogio campo] correcao=%u modo=0x%llX clock_hz=%llu amostras=%u invalidas=%u "
+            "tempo_jogo_s=%.4f tempo_real_s=%.4f tempo_jogo_por_s=%.3f\n",
+            (unsigned)g_gs_timer_clock, (unsigned long long)mode,
+            (unsigned long long)timer0_clock_hz(mode), g_field_clock_samples,
+            g_field_clock_invalid, g_field_clock_seconds, seconds, g_field_clock_seconds / seconds);
+    }
+    g_field_clock_samples = g_field_clock_invalid = 0;
+    g_field_clock_seconds = 0;
+}
+
+extern const bool g_move_callback_trace = [] {
+    const char* value = std::getenv("PS2_MOVE_CALLBACK_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+
+namespace
+{
+    struct MoveVector
+    {
+        double x = 0, z = 0;
+        bool valid = false;
+    };
+
+    struct MoveCallbackCounts
+    {
+        unsigned calls = 0, accepted = 0, attempts = 0, max_attempts = 0;
+        unsigned retries = 0, exhausted = 0, vector_pairs = 0, position_pairs = 0;
+        double in_xz = 0, out_xz = 0, field80_xz = 0;
+    };
+
+    // Os callbacks e o resumo de VBlank rodam no EE. Agrupe por modelo e chamador.
+    std::map<std::pair<uint32_t, uint32_t>, MoveCallbackCounts> g_move_callbacks;
+
+    MoveVector move_vector_xz(const Ctx& c, uint32_t address)
+    {
+        const uint32_t physical = ee_phys(address);
+        // Leia apenas RAM sem invocar MMIO ou alterar o estado do EE.
+        if (!c.mem || physical == 0 || physical > (32u << 20) - 12u)
+            return {};
+        float x, z;
+        std::memcpy(&x, c.mem + physical, sizeof x);
+        std::memcpy(&z, c.mem + physical + 8, sizeof z);
+        return {x, z, std::isfinite(x) && std::isfinite(z)};
+    }
+
+    static void move_callback_report(double seconds)
+    {
+        if (!g_move_callback_trace)
+            return;
+
+        std::fprintf(stderr, "  [prof movimento] janela=%.3fs grupos=%zu\n",
+            seconds, g_move_callbacks.size());
+        if (seconds > 0)
+        {
+            for (const auto& [key, stats] : g_move_callbacks)
+            {
+                std::fprintf(stderr,
+                    "  [prof movimento modelo] obj=%08X pc_link=%08X chamadas=%u aceitas=%u recusadas=%u aceitas/s=%.2f "
+                    "tentativas=%u max_tentativas=%u chamadas_com_retry=%u limite=%u "
+                    "pares_vetor=%u entrada_xz_media=%.4f saida_xz_media=%.4f "
+                    "pares_campo80=%u delta_campo80_xz_medio=%.4f campo80_xz/s=%.4f\n",
+                    key.first, key.second, stats.calls, stats.accepted, stats.calls - stats.accepted,
+                    stats.accepted / seconds, stats.attempts, stats.max_attempts,
+                    stats.retries, stats.exhausted, stats.vector_pairs,
+                    stats.vector_pairs ? stats.in_xz / stats.vector_pairs : 0.0,
+                    stats.vector_pairs ? stats.out_xz / stats.vector_pairs : 0.0,
+                    stats.position_pairs,
+                    stats.position_pairs ? stats.field80_xz / stats.position_pairs : 0.0,
+                    stats.field80_xz / seconds);
+            }
+        }
+        g_move_callbacks.clear();
+    }
+}
+
+void move_callback_begin(const Ctx& c, MoveCallbackTrace& trace)
+{
+    trace.vector = (uint32_t)c.r[4].lo;
+    trace.object = (uint32_t)c.r[5].lo;
+    const uint32_t link = (uint32_t)c.r[31].lo;
+    trace.caller = link >= 8 ? link - 8 : 0;
+
+    const MoveVector input = move_vector_xz(c, trace.vector);
+    trace.input_valid = input.valid;
+    trace.input_length = std::hypot(input.x, input.z);
+
+    // O callback grava a posicao candidata em obj+0x80 por um SQ alinhado.
+    const MoveVector position = trace.object
+        ? move_vector_xz(c, (trace.object + 0x80u) & ~15u)
+        : MoveVector{};
+    trace.position_valid = position.valid;
+    trace.position_x = position.x;
+    trace.position_z = position.z;
+}
+
+void move_callback_end(const Ctx& c, const MoveCallbackTrace& trace)
+{
+    auto& stats = g_move_callbacks[{trace.object, trace.caller}];
+    ++stats.calls;
+    stats.attempts += trace.attempts;
+    stats.max_attempts = std::max(stats.max_attempts, trace.attempts);
+    stats.retries += trace.attempts > 1;
+
+    if ((uint32_t)c.r[2].lo != 1)
+    {
+        stats.exhausted += trace.attempts == 16;
+        return;
+    }
+
+    ++stats.accepted;
+    const MoveVector output = move_vector_xz(c, trace.vector);
+    if (trace.input_valid && output.valid)
+    {
+        ++stats.vector_pairs;
+        stats.in_xz += trace.input_length;
+        stats.out_xz += std::hypot(output.x, output.z);
+    }
+
+    if (trace.position_valid)
+    {
+        const MoveVector position = move_vector_xz(c, (trace.object + 0x80u) & ~15u);
+        if (position.valid)
+        {
+            ++stats.position_pairs;
+            stats.field80_xz += std::hypot(position.x - trace.position_x, position.z - trace.position_z);
+        }
+    }
+}
+
 void ps2_pad(Ctx& c, int function)
 {
     int port = (int)(int32_t)c.r[4].lo;
@@ -3800,8 +4481,34 @@ void ps2_pad(Ctx& c, int function)
             mwr<uint8_t>(c, out + 2, (uint8_t)(pad.buttons >> 8));  // botoes, ativos em zero
             mwr<uint8_t>(c, out + 3, (uint8_t)(pad.buttons & 0xFF));
 
-            for (uint32_t i = 0; i < 4; i++)
-                mwr<uint8_t>(c, out + 4 + i, pad.sticks[i]);
+            uint8_t axes[4];
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                axes[i] = pad.sticks[i];
+                mwr<uint8_t>(c, out + 4 + i, axes[i]);
+            }
+
+            if (g_rotation_caller_trace)
+            {
+                g_rotation_pad_active = axes[2] != 0x80 || axes[3] != 0x80;
+                ++g_rotation_pad_reads[g_rotation_pad_active];
+            }
+
+            if (g_pad_read_trace)
+            {
+                // Registre os bytes entregues, sem reler a thread de entrada.
+                static uint64_t reads = 0;
+                static unsigned last_left = 0x10000u;
+                const unsigned left = ((unsigned)axes[2] << 8) | axes[3];
+                ++reads;
+                if (left != last_left)
+                {
+                    std::fprintf(stderr, "  [pad lido] t_ms=%llu leitura=%llu esq=(%02X,%02X)\n",
+                        (unsigned long long)(hw_now_ns() / 1000000u),
+                        (unsigned long long)reads, axes[2], axes[3]);
+                    last_left = left;
+                }
+            }
 
             result = 1;
             break;
@@ -3905,6 +4612,9 @@ namespace
     static const uint8_t g_blk16z[8][4] = { { 24, 26, 16, 18 }, { 25, 27, 17, 19 }, { 28, 30, 20, 22 }, { 29, 31, 21, 23 }, { 8, 10, 0, 2 }, { 9, 11, 1, 3 }, { 12, 14, 4, 6 }, { 13, 15, 5, 7 } };
     static const uint8_t g_blk16sz[8][4] = { { 24, 26, 8, 10 }, { 25, 27, 9, 11 }, { 16, 18, 0, 2 }, { 17, 19, 1, 3 }, { 28, 30, 12, 14 }, { 29, 31, 13, 15 }, { 20, 22, 4, 6 }, { 21, 23, 5, 7 } };
     uint16_t g_col4[16][32];
+    // Deslocamentos dentro de uma pagina. A base e o wrap da VRAM
+    // continuam separados para aceitar BP desalinhado e qualquer FBW.
+    static uint16_t g_page_ct32[32][64], g_page_z16s[64][64];
     bool g_gs_tables_ready = false;
 
     void gs_init_tables()
@@ -3942,6 +4652,14 @@ namespace
         for (int y = 0; y < 8; y++)
             for (int x = 0; x < 16; x++)
                 g_col16[y][x] = (uint8_t)(p16a[x] + 4 * (y & 1) + 32 * (y >> 1));
+
+        for (unsigned y = 0; y < 32; ++y)
+            for (unsigned x = 0; x < 64; ++x)
+                g_page_ct32[y][x] = (uint16_t)((g_blk32[y >> 3][x >> 3] << 6) + g_col32[y & 7][x & 7]);
+
+        for (unsigned y = 0; y < 64; ++y)
+            for (unsigned x = 0; x < 64; ++x)
+                g_page_z16s[y][x] = (uint16_t)((g_blk16sz[y >> 3][x >> 4] << 7) + g_col16[y & 7][x & 15]);
 
         for (int y = 0; y < 16; y++)
             for (int x = 0; x < 16; x++)
@@ -3987,7 +4705,7 @@ namespace
     inline uint32_t ix_ct32(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
     {
         uint32_t page = (bp >> 5) + (y >> 5) * bw + (x >> 6);
-        return ((page << 11) + ((bp & 31u) << 6) + ((uint32_t)g_blk32[(y >> 3) & 3][(x >> 3) & 7] << 6) + g_col32[y & 7][x & 7]) & 0xFFFFFu;
+        return ((page << 11) + ((bp & 31u) << 6) + g_page_ct32[y & 31][x & 63]) & 0xFFFFFu;
     }
 
     inline uint32_t ix_ct16(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)    // indice de meia-palavra
@@ -4011,7 +4729,7 @@ namespace
     inline uint32_t ix_z16s(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)    // indice de meia-palavra
     {
         uint32_t page = (bp >> 5) + (y >> 6) * bw + (x >> 6);
-        return ((page << 12) + ((bp & 31u) << 7) + ((uint32_t)g_blk16sz[(y >> 3) & 7][(x >> 4) & 3] << 7) + g_col16[y & 7][x & 15]) & 0x1FFFFFu;
+        return ((page << 12) + ((bp & 31u) << 7) + g_page_z16s[y & 63][x & 63]) & 0x1FFFFFu;
     }
 
     inline uint32_t ix_t8(uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)      // indice de byte
@@ -4030,8 +4748,10 @@ namespace
 
     inline uint8_t* vram8() { return reinterpret_cast<uint8_t*>(g_vram); }
 
-    uint32_t gs_read_px(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
+    template <int fixed_psm = -1>
+    uint32_t gs_read_px(uint32_t runtime_psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
     {
+        const uint32_t psm = fixed_psm >= 0 ? (uint32_t)fixed_psm : runtime_psm;
         switch (psm)
         {
             case 0x00: return g_vram[ix_ct32(bp, bw, x, y)];
@@ -4141,6 +4861,8 @@ namespace
         GsCtx ctx[2];
         uint64_t prim = 0, rgbaq = 0x3F80000000000000ull, st = 0, uv = 0, texa = 0, colclamp = 1;
         uint64_t bitbltbuf = 0, trxpos = 0, trxreg = 0, trxdir = 3;
+        // Incrementado a cada TRXDIR para nao reutilizar um download GS antigo.
+        uint64_t trx_generation = 0;
         GsVertex q[3];
         int nq = 0;
         uint32_t clut[512] = {};   // buffer de CLUT do GS: 256 cores de 32 bits ou 512 de 16 bits
@@ -4288,6 +5010,10 @@ namespace
         int w = 1, h = 1, uminv = 0, umaxv = 0, vminv = 0, vmaxv = 0;
         unsigned umode = 0, vmode = 0, tfx = 0;
         bool tcc = false, aem = false, linear = false;
+        // Teste O: cobertura vertical de dois texels somente para a fonte do menu.
+        // Nao combina quadros/campos e permanece desativado por padrao.
+        bool ui_vpair = false;
+        int ui_vfirst = 0, ui_vspan = 0;
     };
 
     void gs_tex_info(const GsCtx& c, TexInfo& t)
@@ -4328,14 +5054,12 @@ namespace
         }
     }
 
-    uint32_t gs_texel(const TexInfo& t, int iu, int iv)
+    template <int fixed_psm = -1>
+    static inline uint32_t gs_texel_wrapped(const TexInfo& t, int iu, int iv)
     {
-        iu = gs_tex_wrap(iu, t.w, t.umode, t.uminv, t.umaxv);
-        iv = gs_tex_wrap(iv, t.h, t.vmode, t.vminv, t.vmaxv);
+        const uint32_t raw = gs_read_px<fixed_psm>(t.psm, t.tbp, t.tbw, (uint32_t)iu, (uint32_t)iv);
 
-        const uint32_t raw = gs_read_px(t.psm, t.tbp, t.tbw, (uint32_t)iu, (uint32_t)iv);
-
-        switch (t.psm)
+        switch (fixed_psm >= 0 ? (uint32_t)fixed_psm : t.psm)
         {
             case 0x00: return raw;
             case 0x01:
@@ -4363,20 +5087,108 @@ namespace
         }
     }
 
+    template <int fixed_psm = -1>
+    uint32_t gs_texel(const TexInfo& t, int iu, int iv)
+    {
+        return gs_texel_wrapped<fixed_psm>(t,
+            gs_tex_wrap(iu, t.w, t.umode, t.uminv, t.umaxv),
+            gs_tex_wrap(iv, t.h, t.vmode, t.vminv, t.vmaxv));
+    }
+
+    // Os pesos somam 65536. Cada canal acumulado cabe em 24 bits,
+    // entao podemos calcular R/B e G/A em pares com faixas de 32 bits.
+    static inline uint32_t gs_bilinear(uint32_t t00, uint32_t t10, uint32_t t01, uint32_t t11, int wu, int wv)
+    {
+        const unsigned w00 = (256 - wu) * (256 - wv), w10 = wu * (256 - wv);
+        const unsigned w01 = (256 - wu) * wv, w11 = wu * wv;
+        auto pair = [&](uint32_t shift)
+        {
+            auto lanes = [shift](uint32_t color) -> uint64_t
+            {
+                color >>= shift;
+                return (color & 0xFFu) | ((uint64_t)(color & 0xFF0000u) << 16);
+            };
+            const uint64_t sum = lanes(t00) * w00 + lanes(t10) * w10
+                + lanes(t01) * w01 + lanes(t11) * w11;
+            return (uint32_t)(((sum >> 16) & 0xFFu) | ((sum >> 32) & 0xFF0000u));
+        };
+        return pair(0) | (pair(8) << 8);
+    }
+
+    // Filtra os quatro canais de um pixel juntos. A reducao para bytes
+    // ocorre so depois das duas interpolacoes, como no calculo escalar.
+    static inline uint32_t gs_sprite_bilinear(uint32_t t00, uint32_t t10,
+                                             uint32_t t01, uint32_t t11, int wu, int wv)
+    {
+#if defined(__SSE2__) || defined(_M_X64)
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i left = _mm_set_epi32(0, 0, (int)t01, (int)t00);
+        const __m128i right = _mm_set_epi32(0, 0, (int)t11, (int)t10);
+        const __m128i pairs = _mm_unpacklo_epi8(left, right);
+        const __m128i weights_u = _mm_set1_epi32((wu << 16) | (256 - wu));
+        const __m128i bias = _mm_set1_epi32(32768);
+        const __m128i top = _mm_sub_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(pairs, zero), weights_u), bias);
+        const __m128i bottom = _mm_sub_epi32(_mm_madd_epi16(_mm_unpackhi_epi8(pairs, zero), weights_u), bias);
+        // O bias permite guardar os intermediarios de 16 bits como
+        // valores com sinal. Recupera 128 depois do deslocamento final.
+        const __m128i horizontal = _mm_packs_epi32(top, bottom);
+        const __m128i rows = _mm_unpacklo_epi16(horizontal, _mm_srli_si128(horizontal, 8));
+        const __m128i weights_v = _mm_set1_epi32((wv << 16) | (256 - wv));
+        const __m128i vertical = _mm_madd_epi16(rows, weights_v);
+        const __m128i result = _mm_add_epi32(_mm_srai_epi32(vertical, 16), _mm_set1_epi32(128));
+        return (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(result, zero), zero));
+#else
+        return gs_bilinear(t00, t10, t01, t11, wu, wv);
+#endif
+    }
+
     // Amostra a textura em (u, v) (coordenadas em texels): vizinho mais proximo ou bilinear (TEX1.MMAG/MMIN).
+    template <int fixed_psm = -1, bool linear = false>
     uint32_t gs_sample(const TexInfo& t, float u, float v)
     {
-        if (!t.linear)
-            return gs_texel(t, (int)fast_floor(u), (int)fast_floor(v));
+        // Teste O: quando uma fonte de 19 linhas e comprimida a 9,5 pixels no GS,
+        // o modo nearest escolhe so uma das duas linhas do glifo (pares OU impares).
+        // Calculamos a media das duas linhas do par no mesmo atlas. E um teste
+        // visual, NAO uma emulacao fiel da recomposicao de campos do PS2.
+        // Restrito aos sprites de texto marcados por gs_draw_sprite().
+        if (fixed_psm < 0 && t.ui_vpair && t.ui_vspan > 0)
+        {
+            const int tex_u = fast_floor(u);
+            const int rel_v = fast_floor((v - (float)t.ui_vfirst) * 0.5f);
+            const int start = std::max(0, std::min(t.ui_vspan - 1, rel_v * 2));
+            const int next = std::min(t.ui_vspan - 1, start + 1);
+            const uint32_t a = gs_texel<fixed_psm>(t, tex_u, t.ui_vfirst + start);
+            const uint32_t b = gs_texel<fixed_psm>(t, tex_u, t.ui_vfirst + next);
+            // Media sem contaminacao entre canais RGBA, inclusive o alfa.
+            return ((a & 0xFEFEFEFEu) >> 1)
+                 + ((b & 0xFEFEFEFEu) >> 1)
+                 + (a & b & 0x01010101u);
+        }
+
+        if (!(fixed_psm < 0 ? t.linear : linear))
+            return gs_texel<fixed_psm>(t, (int)fast_floor(u), (int)fast_floor(v));
 
         const float fu = u - 0.5f, fv = v - 0.5f;
         const int iu = (int)fast_floor(fu), iv = (int)fast_floor(fv);
         const int wu = (int)((fu - (float)iu) * 256.0f), wv = (int)((fv - (float)iv) * 256.0f);
 
         if (wu < 4 && wv < 4)    // alinhado ao texel (mapeamento 1:1): sem mistura
-            return gs_texel(t, iu, iv);
+            return gs_texel<fixed_psm>(t, iu, iv);
 
-        const uint32_t t00 = gs_texel(t, iu, iv), t10 = gs_texel(t, iu + 1, iv), t01 = gs_texel(t, iu, iv + 1), t11 = gs_texel(t, iu + 1, iv + 1);
+        // Aplica CLAMP/REPEAT uma vez por coordenada e reutiliza texels na borda.
+        const int x0 = gs_tex_wrap(iu, t.w, t.umode, t.uminv, t.umaxv);
+        const int x1 = gs_tex_wrap(iu + 1, t.w, t.umode, t.uminv, t.umaxv);
+        const int y0 = gs_tex_wrap(iv, t.h, t.vmode, t.vminv, t.vmaxv);
+        const int y1 = gs_tex_wrap(iv + 1, t.h, t.vmode, t.vminv, t.vmaxv);
+        const uint32_t t00 = gs_texel_wrapped<fixed_psm>(t, x0, y0);
+        const uint32_t t10 = x1 == x0 ? t00 : gs_texel_wrapped<fixed_psm>(t, x1, y0);
+        const uint32_t t01 = y1 == y0 ? t00 : gs_texel_wrapped<fixed_psm>(t, x0, y1);
+        const uint32_t t11 = y1 == y0 ? t10 : (x1 == x0 ? t01 : gs_texel_wrapped<fixed_psm>(t, x1, y1));
+
+        if ((unsigned)wu <= 256u && (unsigned)wv <= 256u)
+            return gs_bilinear(t00, t10, t01, t11, wu, wv);
+
+        // Mantem o calculo legado para coordenadas fora da faixa de fast_floor.
         uint32_t out = 0;
 
         for (int sh = 0; sh < 32; sh += 8)
@@ -4387,6 +5199,34 @@ namespace
         }
 
         return out;
+    }
+
+    using GsTextureSampler = uint32_t (*)(const TexInfo&, float, float);
+
+    template <int psm>
+    static GsTextureSampler gs_tri_sampler_for(bool linear)
+    {
+        return linear ? &gs_sample<psm, true> : &gs_sample<psm, false>;
+    }
+
+    // Seleciona PSM e filtro por triangulo. Cada texel continua a ser lido
+    // da VRAM em ordem, inclusive quando o destino tambem e a textura.
+    static GsTextureSampler gs_tri_sampler(const TexInfo& t)
+    {
+        if (t.ui_vpair)
+            return nullptr;
+        switch (t.psm)
+        {
+            case 0x00: return gs_tri_sampler_for<0x00>(t.linear);
+            case 0x01: return gs_tri_sampler_for<0x01>(t.linear);
+            case 0x02: case 0x0A: return gs_tri_sampler_for<0x02>(t.linear);
+            case 0x13: return gs_tri_sampler_for<0x13>(t.linear);
+            case 0x14: return gs_tri_sampler_for<0x14>(t.linear);
+            case 0x1B: return gs_tri_sampler_for<0x1B>(t.linear);
+            case 0x24: return gs_tri_sampler_for<0x24>(t.linear);
+            case 0x2C: return gs_tri_sampler_for<0x2C>(t.linear);
+            default: return nullptr;
+        }
     }
 
     // Estado do pixel decodificado uma vez por primitiva (antes era refeito a cada pixel).
@@ -4441,8 +5281,7 @@ namespace
     static inline uint32_t gs_zread(const PixCfg& pc, uint32_t x, uint32_t y) { return gs_read_px(pc.zpsm, pc.zbp, pc.fbw, x, y); }
     static inline void gs_zwrite(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z) { gs_write_px(pc.zpsm, pc.zbp, pc.fbw, x, y, z & pc.zmax); }
 
-    // Teste de profundidade. Devolve false se o pixel deve ser descartado; escreve o Z quando permitido.
-    static inline bool gs_ztest(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z, bool z_write_ok)
+    static inline bool gs_zpass(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z)
     {
         const uint32_t zt = z & pc.zmax;
 
@@ -4458,23 +5297,35 @@ namespace
             return false;
         }
 
+        return true;
+    }
+
+    // O caminho por linhas continua usando teste e escrita juntos.
+    static inline bool gs_ztest(const PixCfg& pc, uint32_t x, uint32_t y, uint32_t z, bool z_write_ok)
+    {
+        if (!gs_zpass(pc, x, y, z))
+            return false;
+
         if (z_write_ok && !pc.zmsk)
-            gs_zwrite(pc, x, y, zt);
+            gs_zwrite(pc, x, y, z);
 
         return true;
     }
 
-    void gs_pixel(const PixCfg& pc, int x, int y, float fr, float fg, float fb, float fa, float u, float v, uint32_t z = 0)
+    // Etapa comum depois do scissor e do teste de leitura de Z. A escrita
+    // de profundidade continua depois de AFAIL, inclusive com alias de VRAM.
+    template <bool source_alpha_fast = false, bool direct_ct32 = false>
+#if defined(__GNUC__)
+    __attribute__((always_inline))
+#endif
+    static inline void gs_shade_pixel(const PixCfg& pc, int x, int y,
+        int vr, int vg, int vb, int va, uint32_t texel, uint32_t z, uint32_t addr = 0, uint8_t* z16s = nullptr)
     {
-        if (x < pc.sx0 || x > pc.sx1 || y < pc.sy0 || y > pc.sy1)
-            return;
-
-        int vr = gs_f2i255(fr), vg = gs_f2i255(fg), vb = gs_f2i255(fb), va = gs_f2i255(fa);
         int r = vr, g = vg, b = vb, a = va;
 
         if (pc.tme)
         {
-            const uint32_t t = gs_sample(pc.ti, u, v);
+            const uint32_t t = texel;
             const int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
             const bool tcc = pc.ti.tcc;
 
@@ -4525,8 +5376,18 @@ namespace
             }
         }
 
-        if (pc.zactive && !gs_ztest(pc, (uint32_t)x, (uint32_t)y, z, z_write_ok))
-            return;
+        if (pc.zactive && z_write_ok && !pc.zmsk)
+        {
+            if (direct_ct32 && z16s != nullptr)
+            {
+                // O teste de profundidade ja resolveu este endereco.
+                // Escreve depois do AFAIL e antes de ler a cor de destino.
+                const uint16_t depth = (uint16_t)z;
+                std::memcpy(z16s, &depth, sizeof(depth));
+            }
+            else
+                gs_zwrite(pc, (uint32_t)x, (uint32_t)y, z);
+        }
 
         if (!fb_ok)
             return;
@@ -4536,7 +5397,7 @@ namespace
 
         if (pc.need_dst)
         {
-            dst = gs_read_px(pc.fpsm, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+            dst = direct_ct32 ? g_vram[addr] : gs_read_px(pc.fpsm, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
 
             if (pc.is16)
             {
@@ -4553,9 +5414,19 @@ namespace
         {
             auto pick = [](unsigned sel, int cs, int cd) { return sel == 0 ? cs : (sel == 1 ? cd : 0); };
             const int cf = pc.C == 0 ? a : (pc.C == 1 ? da : pc.fix);
-            const int nr = (((pick(pc.A, r, dr) - pick(pc.B, r, dr)) * cf) >> 7) + pick(pc.D, r, dr);
-            const int ng = (((pick(pc.A, g, dg) - pick(pc.B, g, dg)) * cf) >> 7) + pick(pc.D, g, dg);
-            const int nb = (((pick(pc.A, b, db) - pick(pc.B, b, db)) * cf) >> 7) + pick(pc.D, b, db);
+            int nr, ng, nb;
+            if (source_alpha_fast && pc.A == 0 && pc.B == 1 && pc.C == 0 && pc.D == 1)
+            {
+                nr = ((r - dr) * a >> 7) + dr;
+                ng = ((g - dg) * a >> 7) + dg;
+                nb = ((b - db) * a >> 7) + db;
+            }
+            else
+            {
+                nr = (((pick(pc.A, r, dr) - pick(pc.B, r, dr)) * cf) >> 7) + pick(pc.D, r, dr);
+                ng = (((pick(pc.A, g, dg) - pick(pc.B, g, dg)) * cf) >> 7) + pick(pc.D, g, dg);
+                nb = (((pick(pc.A, b, db) - pick(pc.B, b, db)) * cf) >> 7) + pick(pc.D, b, db);
+            }
 
             if (pc.clamp) { r = gs_clamp255(nr); g = gs_clamp255(ng); b = gs_clamp255(nb); }
             else { r = nr & 0xFF; g = ng & 0xFF; b = nb & 0xFF; }
@@ -4570,10 +5441,25 @@ namespace
         if (pc.fbmsk != 0)
             out = (dst & pc.fbmsk) | (out & ~pc.fbmsk);
 
-        if (pc.fpsm == 0x00)
+        if (direct_ct32)
+            g_vram[addr] = out;
+        else if (pc.fpsm == 0x00)
             g_vram[ix_ct32(pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y)] = out;
         else
             gs_write_px(pc.fpsm, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y, out);
+    }
+
+    // prechecked indica que o chamador ja verificou scissor e Z.
+    template <bool prechecked = false>
+    void gs_pixel(const PixCfg& pc, int x, int y, float fr, float fg, float fb, float fa, float u, float v, uint32_t z = 0)
+    {
+        if (!prechecked && (x < pc.sx0 || x > pc.sx1 || y < pc.sy0 || y > pc.sy1))
+            return;
+        if (!prechecked && pc.zactive && !gs_zpass(pc, (uint32_t)x, (uint32_t)y, z))
+            return;
+
+        gs_shade_pixel(pc, x, y, gs_f2i255(fr), gs_f2i255(fg), gs_f2i255(fb), gs_f2i255(fa),
+            pc.tme ? gs_sample(pc.ti, u, v) : 0, z);
     }
 
     // Versao avulsa (pontos): decodifica o estado a cada chamada.
@@ -4736,15 +5622,21 @@ namespace
         }
     }
 
-    // Captura por F9: liga o trace por 3 vsyncs e grava tudo em gs_captura_N.txt (no vsync, com o lock do GS).
+    // Captura F9: por padrao 3 VSyncs (legado). Com PS2_GS_CAPTURE_FRAME=1,
+    // espera 60 VSyncs (~1 segundo de video) para capturar comandos de desenho
+    // mesmo quando a batalha gera apenas 4-6 quadros efetivos por segundo.
+    // Esta opcao NAO modifica os pixels, o FIELDLOCK nem os registradores do GS.
     static void gs_capture_poll()
     {
+        static const bool capture_frame = std::getenv("PS2_GS_CAPTURE_FRAME") != nullptr;
         if (!g_cap_active && g_cap_request.exchange(false))
         {
             g_cap_active = true;
-            g_cap_until = g_gs_vsyncs + 3;
+            g_cap_until = g_gs_vsyncs + (capture_frame ? 60u : 3u);
             g_trace_ring.clear();
-            std::fprintf(stderr, "  [captura] F9: gravando os proximos 3 vsyncs...\n");
+            g_cap_cbps.clear();
+            std::fprintf(stderr, "  [captura N] F9: janela=%u vsyncs; aguarde o arquivo gs_captura_N.txt...\n",
+                         capture_frame ? 60u : 3u);
             return;
         }
 
@@ -4757,7 +5649,9 @@ namespace
 
             if (f != nullptr)
             {
-                std::fprintf(f, "captura vsync %u..%u, %zu desenhos\n", g_cap_until - 3, g_cap_until, g_trace_ring.size());
+                std::fprintf(f, "captura vsync %u..%u, %zu desenhos; modo=%s\n",
+                             g_cap_until - (capture_frame ? 60u : 3u), g_cap_until,
+                             g_trace_ring.size(), capture_frame ? "F9_N_60_VSYNC" : "F9_3_VSYNC");
 
                 for (const auto& e : g_trace_ring)
                     std::fprintf(f, "%s\n", e.second.c_str());
@@ -4862,6 +5756,12 @@ namespace
     {
         const PixCfg* pc = nullptr;
         std::vector<uint32_t> lin;
+        struct Column
+        {
+            uint32_t vram_x;
+            int tex_x0, tex_x1, weight;
+        };
+        std::vector<Column> columns;
         int ox = 0, oy = 0, ww = 1, wh = 1;
         int W = 1, H = 1, wmask = 0, hmask = 0;
         bool linear = false, std_blend = false, tcc = false, decal = false;
@@ -4873,11 +5773,25 @@ namespace
                 && t.umode <= 1 && t.vmode <= 1 && t.tfx <= 1;
         }
 
+        // Escolhe o formato antes de percorrer a janela. O swizzle,
+        // o TEXA e a CLUT continuam sendo os mesmos da leitura generica.
+        template <int psm>
+        void decode_sprite_texture(const TexInfo& ti)
+        {
+            for (int y = 0; y < wh; ++y)
+            {
+                uint32_t* row = lin.data() + (size_t)y * ww;
+                for (int x = 0; x < ww; ++x)
+                    row[x] = gs_texel_wrapped<psm>(ti, ox + x, oy + y);
+            }
+        }
+
         int wrapx(int v) const { return pc->ti.umode == 0 ? (v & wmask) : (v < 0 ? 0 : (v >= W ? W - 1 : v)); }
         int wrapy(int v) const { return pc->ti.vmode == 0 ? (v & hmask) : (v < 0 ? 0 : (v >= H ? H - 1 : v)); }
 
         // umin..vmax: extensao (em texels) das coordenadas que a primitiva vai amostrar
-        bool setup(const PixCfg& cfg, float cr, float cg, float cb, float ca, float umin, float umax, float vmin, float vmax)
+        bool setup(const PixCfg& cfg, float cr, float cg, float cb, float ca, float umin, float umax, float vmin, float vmax,
+            bool sprite_columns = false)
         {
             pc = &cfg;
 
@@ -4918,9 +5832,29 @@ namespace
 
             lin.resize((size_t)ww * (size_t)wh);
 
-            for (int y = 0; y < wh; y++)
-                for (int x = 0; x < ww; x++)
-                    lin[(size_t)y * (size_t)ww + (size_t)x] = gs_texel(ti, ox + x, oy + y);
+            if (sprite_columns && g_sprite_tex_decode)
+            {
+                // tex_ok() ja validou os formatos e a janela esta nos limites da textura.
+                switch (ti.psm)
+                {
+                    case 0x00: decode_sprite_texture<0x00>(ti); break;
+                    case 0x01: decode_sprite_texture<0x01>(ti); break;
+                    case 0x02: decode_sprite_texture<0x02>(ti); break;
+                    case 0x0A: decode_sprite_texture<0x0A>(ti); break;
+                    case 0x13: decode_sprite_texture<0x13>(ti); break;
+                    case 0x14: decode_sprite_texture<0x14>(ti); break;
+                    case 0x1B: decode_sprite_texture<0x1B>(ti); break;
+                    case 0x24: decode_sprite_texture<0x24>(ti); break;
+                    case 0x2C: decode_sprite_texture<0x2C>(ti); break;
+                }
+            }
+            else
+            {
+                for (int y = 0; y < wh; ++y)
+                    for (int x = 0; x < ww; ++x)
+                        lin[(size_t)y * ww + x] = sprite_columns
+                            ? gs_texel_wrapped(ti, ox + x, oy + y) : gs_texel(ti, ox + x, oy + y);
+            }
 
             return true;
         }
@@ -4930,7 +5864,33 @@ namespace
             return lin[(size_t)((wrapy(iv) - oy) * ww + (wrapx(iu) - ox))];
         }
 
+        // Sprites reutilizam o mesmo U em todas as linhas.
+        void prepare_sprite_columns(int xs, int xe, float u, float du)
+        {
+            columns.resize((size_t)(xe - xs + 1));
+            for (int x = xs; x <= xe; ++x)
+            {
+                const uint32_t sx = (uint32_t)x;
+                Column& col = columns[(size_t)(x - xs)];
+                // O swizzle CT32 e a soma dos componentes X e Y.
+                col.vram_x = ix_ct32(0, 0, sx, 0);
+                if (pc->tme)
+                {
+                    const float uc = u + du * (float)(x - xs);
+                    const float fu = linear ? uc - 0.5f : uc;
+                    const int iu = fast_floor(fu);
+                    col.tex_x0 = wrapx(iu) - ox;
+                    if (linear)
+                    {
+                        col.tex_x1 = wrapx(iu + 1) - ox;
+                        col.weight = (int)((fu - (float)iu) * 256.0f);
+                    }
+                }
+            }
+        }
+
         // u,v no centro do pixel xs; du,dv por pixel
+        template <bool cached_columns = false>
         void row(int y, int xs, int xe, float u, float du, float v, float dv, float z0, float dz) const
         {
             const PixCfg& c = *pc;
@@ -4957,6 +5917,7 @@ namespace
                 }
             }
 
+            const uint32_t vram_y = cached_columns ? ix_ct32(fbp, fbw, 0, (uint32_t)y) : 0;
             for (int x = xs; x <= xe; x++)
             {
                 const float uc = u + du * (float)(x - xs), vc = v + dv * (float)(x - xs);   // multiplicacao (sem acumular erro)
@@ -4970,8 +5931,9 @@ namespace
                     {
                         const float fu = uc - 0.5f;
                         const int iu = fast_floor(fu);
-                        const int wu = (int)((fu - (float)iu) * 256.0f);
-                        const int x0i = wrapx(iu) - ox;
+                        const int wu = cached_columns ? columns[(size_t)(x - xs)].weight
+                            : (int)((fu - (float)iu) * 256.0f);
+                        const int x0i = cached_columns ? columns[(size_t)(x - xs)].tex_x0 : wrapx(iu) - ox;
                         int ra = rowA, rb = rowB, wv = wvc;
 
                         if (!vconst)
@@ -4989,24 +5951,34 @@ namespace
                         }
                         else
                         {
-                            const int x1i = wrapx(iu + 1) - ox;
+                            const int x1i = cached_columns ? columns[(size_t)(x - xs)].tex_x1 : wrapx(iu + 1) - ox;
                             const uint32_t t00 = lin[(size_t)(ra + x0i)], t10 = lin[(size_t)(ra + x1i)];
                             const uint32_t t01 = lin[(size_t)(rb + x0i)], t11 = lin[(size_t)(rb + x1i)];
                             t = 0;
 
-                            for (int sh = 0; sh < 32; sh += 8)
+                            if (cached_columns && (unsigned)wu <= 256u && (unsigned)wv <= 256u)
                             {
-                                const int c00 = (int)((t00 >> sh) & 0xFF), c10 = (int)((t10 >> sh) & 0xFF);
-                                const int c01 = (int)((t01 >> sh) & 0xFF), c11 = (int)((t11 >> sh) & 0xFF);
-                                const int top = c00 * (256 - wu) + c10 * wu, bot = c01 * (256 - wu) + c11 * wu;
-                                t |= (uint32_t)(((top * (256 - wv) + bot * wv) >> 16) & 0xFF) << sh;
+                                t = g_sprite_wide_fast
+                                    ? gs_sprite_bilinear(t00, t10, t01, t11, wu, wv)
+                                    : gs_bilinear(t00, t10, t01, t11, wu, wv);
+                            }
+                            else
+                            {
+                                for (int sh = 0; sh < 32; sh += 8)
+                                {
+                                    const int c00 = (int)((t00 >> sh) & 0xFF), c10 = (int)((t10 >> sh) & 0xFF);
+                                    const int c01 = (int)((t01 >> sh) & 0xFF), c11 = (int)((t11 >> sh) & 0xFF);
+                                    const int top = c00 * (256 - wu) + c10 * wu, bot = c01 * (256 - wu) + c11 * wu;
+                                    t |= (uint32_t)(((top * (256 - wv) + bot * wv) >> 16) & 0xFF) << sh;
+                                }
                             }
                         }
                     }
                     else
                     {
                         const int ra = vconst ? rowA : (wrapy(fast_floor(vc)) - oy) * ww;
-                        t = lin[(size_t)(ra + wrapx(fast_floor(uc)) - ox)];
+                        const int tex_x = cached_columns ? columns[(size_t)(x - xs)].tex_x0 : wrapx(fast_floor(uc)) - ox;
+                        t = lin[(size_t)(ra + tex_x)];
                     }
 
                     const int tr = (int)(t & 0xFF), tg = (int)((t >> 8) & 0xFF), tb = (int)((t >> 16) & 0xFF), ta = (int)((t >> 24) & 0xFF);
@@ -5064,7 +6036,9 @@ namespace
                 if (!fb_ok)
                     continue;
 
-                uint32_t* dp = &g_vram[ix_ct32(fbp, fbw, (uint32_t)x, (uint32_t)y)];
+                const uint32_t addr = cached_columns ? (vram_y + columns[(size_t)(x - xs)].vram_x) & 0xFFFFFu
+                    : ix_ct32(fbp, fbw, (uint32_t)x, (uint32_t)y);
+                uint32_t* dp = &g_vram[addr];
                 const uint32_t dst = c.need_dst ? *dp : 0;
 
                 if (c.abe)
@@ -5103,10 +6077,64 @@ namespace
         }
     };
 
+    // Retangulos grandes de cor constante: resolve o blend uma vez
+    // para cada valor possivel de um canal. A mascara CT32 usa a cor
+    // anterior exatamente como no caminho por pixel.
+    static void gs_sprite_flat_rect(const PixCfg& pc, const GsVertex& color,
+                                   int x0, int x1, int y0, int y1)
+    {
+        const unsigned alpha = (unsigned)gs_f2i255(color.a);
+        const unsigned rgb[3] = {(unsigned)gs_f2i255(color.r),
+                                 (unsigned)gs_f2i255(color.g),
+                                 (unsigned)gs_f2i255(color.b)};
+        uint32_t columns[2048];
+        for (int x = x0; x < x1; ++x)
+            columns[x - x0] = ix_ct32(0, 0, (uint32_t)x, 0);
+        uint32_t blend[3][256];
+        if (pc.abe)
+        {
+            for (unsigned ch = 0; ch < 3; ++ch)
+                for (int dst = 0; dst < 256; ++dst)
+                {
+                    const int value = ((((int)rgb[ch] - dst) * (int)alpha) >> 7) + dst;
+                    const uint32_t channel = (uint32_t)(pc.clamp ? gs_clamp255(value) : (value & 255));
+                    blend[ch][dst] = channel << (8 * ch);
+                }
+        }
+        const uint32_t flat = (alpha << 24) | (rgb[2] << 16) | (rgb[1] << 8) | rgb[0];
+        for (int y = y0; y < y1; ++y)
+        {
+            const uint32_t row = ix_ct32(pc.fbp, pc.fbw, 0, (uint32_t)y);
+            for (int x = x0; x < x1; ++x)
+            {
+                uint32_t& pixel = g_vram[(row + columns[x - x0]) & 0xFFFFFu];
+                if (pc.abe)
+                {
+                    const uint32_t dst = pixel;
+                    const uint32_t out = (alpha << 24) | blend[0][dst & 255u] |
+                        blend[1][(dst >> 8) & 255u] | blend[2][(dst >> 16) & 255u];
+                    pixel = (dst & pc.fbmsk) | (out & ~pc.fbmsk);
+                }
+                else
+                    pixel = pc.fbmsk ? ((pixel & pc.fbmsk) | (flat & ~pc.fbmsk)) : flat;
+            }
+        }
+    }
+
     bool gs_sprite_fast(const PixCfg& pc, const GsVertex& a, const GsVertex& b, int px0, int px1, int py0, int py1)
     {
-        if (g_nofastsprite)
+        if (g_nofastsprite || px0 >= px1 || py0 >= py1)
             return false;
+
+        if (g_sprite_wide_fast && pc.fpsm == 0u && !pc.tme && !pc.zactive && !pc.ate &&
+            px1 - px0 <= 2048 &&
+            (!pc.abe || (pc.A == 0 && pc.B == 1 && pc.C == 0 && pc.D == 1)))
+        {
+            gs_sprite_flat_rect(pc, b, px0, px1, py0, py1);
+            if (g_perf_gs)
+                g_prof_sprite_fast_pixels.fetch_add((uint64_t)(px1 - px0) * (py1 - py0), std::memory_order_relaxed);
+            return true;
+        }
 
         static thread_local FastRaster fr;
         const float du = (b.u - a.u) / (b.x - a.x);
@@ -5114,16 +6142,91 @@ namespace
         const float iyr = 1.0f / (b.y - a.y);
         const float v_first = a.v + (b.v - a.v) * (((float)py0 + 0.5f - a.y) * iyr), v_last = a.v + (b.v - a.v) * (((float)(py1 - 1) + 0.5f - a.y) * iyr);
 
-        if (!fr.setup(pc, b.r, b.g, b.b, b.a, std::min(u_first, u_last), std::max(u_first, u_last), std::min(v_first, v_last), std::max(v_first, v_last)))
+        if (!fr.setup(pc, b.r, b.g, b.b, b.a, std::min(u_first, u_last), std::max(u_first, u_last),
+            std::min(v_first, v_last), std::max(v_first, v_last), g_sprite_columns))
             return false;
+
+        if (g_perf_gs)
+            g_prof_sprite_fast_pixels.fetch_add((uint64_t)(px1 - px0) * (py1 - py0), std::memory_order_relaxed);
+        if (g_sprite_columns)
+            fr.prepare_sprite_columns(px0, px1 - 1, u_first, du);
 
         for (int y = py0; y < py1; y++)
         {
             const float v = a.v + (b.v - a.v) * (((float)y + 0.5f - a.y) * iyr);
-            fr.row(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
+            if (g_sprite_columns)
+                fr.row<true>(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
+            else
+                fr.row(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
         }
 
         return true;
+    }
+
+    // Teste P: captura a fonte do menu com resolucao vertical original (54x19).
+    // O texto e retirado apenas do framebuffer de baixa resolucao para nao
+    // aparecer duas vezes. Os texels e o alfa sao preservados em uma copia.
+    // A composicao ocorre mais tarde em gs_present_frame(), apos a ampliacao.
+    // Esta camada e experimental; nao substitui a emulacao GS/CRT do PS2.
+    struct UiGlyphP
+    {
+        uint32_t fbp = 0;
+        unsigned vsync = 0;
+        int x = 0, y = 0, w = 0, h = 0;
+        std::vector<uint32_t> rgba; // 0xAABBGGRR, um texel por pixel final
+    };
+    std::mutex g_ui_native_mu;
+    std::vector<UiGlyphP> g_ui_native_glyphs;
+
+    // O sprite ja foi recortado pelo scissor. Prepara so coordenadas e
+    // enderecos: os texels continuam a ser lidos pixel a pixel da VRAM.
+    template <bool ct32>
+    static void gs_sprite_generic_rows(const PixCfg& pc, const GsVertex& a, const GsVertex& b,
+        int px0, int px1, int py0, int py1, float ixr, float iyr)
+    {
+        struct Column { float u; int tex_x; uint32_t vram_x; };
+        // O scissor GS tem 11 bits. O chamador garante x dentro desse intervalo.
+        static thread_local Column columns[2048];
+        const TexInfo& ti = pc.ti;
+        const bool nearest = pc.tme && !ti.linear && !(ti.ui_vpair && ti.ui_vspan > 0);
+        const int r = gs_f2i255(b.r), g = gs_f2i255(b.g), bl = gs_f2i255(b.b), al = gs_f2i255(b.a);
+        for (int x = px0; x < px1; ++x)
+        {
+            Column& col = columns[x];
+            if (pc.tme)
+            {
+                const float fu = ((float)x + 0.5f - a.x) * ixr;
+                col.u = a.u + (b.u - a.u) * fu;
+                if (nearest)
+                    col.tex_x = gs_tex_wrap(fast_floor(col.u), ti.w, ti.umode, ti.uminv, ti.umaxv);
+            }
+            if (ct32)
+                col.vram_x = ix_ct32(0, 0, (uint32_t)x, 0);
+        }
+
+        for (int y = py0; y < py1; ++y)
+        {
+            const float fv = ((float)y + 0.5f - a.y) * iyr;
+            const float v = a.v + (b.v - a.v) * fv;
+            const int tex_y = nearest ? gs_tex_wrap(fast_floor(v), ti.h, ti.vmode, ti.vminv, ti.vmaxv) : 0;
+            const uint32_t vram_y = ct32 ? ix_ct32(pc.fbp, pc.fbw, 0, (uint32_t)y) : 0;
+
+            for (int x = px0; x < px1; ++x)
+            {
+                if (pc.zactive && !gs_zpass(pc, (uint32_t)x, (uint32_t)y, b.z))
+                    continue;
+
+                const Column& col = columns[x];
+                uint32_t texel = 0;
+                if (nearest)
+                    texel = gs_texel_wrapped(ti, col.tex_x, tex_y);
+                else if (pc.tme)
+                    texel = gs_sample(ti, col.u, v);
+
+                const uint32_t addr = ct32 ? (vram_y + col.vram_x) & 0xFFFFFu : 0;
+                gs_shade_pixel<true, ct32>(pc, x, y, r, g, bl, al, texel, b.z, addr);
+            }
+        }
     }
 
     void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
@@ -5135,12 +6238,282 @@ namespace
 
         gs_trace_draw("sprite", ci, x0, y0, x1, y1);
 
-        const ProfScope prof(g_prof_raster_ns);
+        const RasterProfScope prof(g_prof_sprite_ns);
         int px0 = (int)fast_ceil(x0 - 0.5f), px1 = (int)fast_ceil(x1 - 0.5f);
         int py0 = (int)fast_ceil(y0 - 0.5f), py1 = (int)fast_ceil(y1 - 0.5f);
 
         PixCfg pc;
         gs_pix_cfg(ci, pc);
+
+        // Teste M: usa a escolha basal de TEX1 do proprio decodificador, sem os
+        // overrides posteriores para sprites. Opcao experimental: por padrao
+        // preservamos integralmente o comportamento estavel do teste L.
+        static const bool sprite_tex1 = std::getenv("PS2_GS_SPRITE_TEX1") != nullptr;
+        static const bool sprite_probe = std::getenv("PS2_GS_SPRITE_PROBE") != nullptr;
+        const bool tex1_linear = pc.ti.linear;
+
+        // Sprite com mapeamento 1:1 (1 texel por pixel, tipico de fonte/interface): amostra por vizinho mais proximo.
+        // Com o deslocamento de meia linha do modo campo o bilinear misturava cada texel com o vizinho e as linhas finas
+        // do glifo (1 texel de altura, com alfa parcial) caiam abaixo do teste de alfa e sumiam ("a" virava "u").
+        // PS2_SPRITE_BILINEAR=1 desliga esta regra.
+        static const bool sprite_bilinear = std::getenv("PS2_SPRITE_BILINEAR") != nullptr;
+
+        if (!sprite_tex1)
+        {
+            // Caminho original do teste L: preservado para a comparacao A/B.
+            if (pc.ti.linear && !sprite_bilinear)
+            {
+                const float ru = (b.u - a.u) / (b.x - a.x), rv = (b.v - a.v) / (b.y - a.y);
+
+                if (std::fabs(ru - 1.0f) < 0.02f && std::fabs(rv - 1.0f) < 0.02f)
+                    pc.ti.linear = false;
+            }
+            else if (!pc.ti.linear && !sprite_bilinear)
+            {
+                // Em reducoes, o caminho antigo reativa bilinear ate quando TEX1 escolheu nearest.
+                // Esta heuristica pode modificar as bordas finas dos glifos e por isso agora e testavel.
+                static const bool no_auto = std::getenv("PS2_SPRITE_NOAUTOFILTER") != nullptr;
+                const float ru = (b.u - a.u) / (b.x - a.x), rv = (b.v - a.v) / (b.y - a.y);
+
+                if (!no_auto && (std::fabs(ru) < 0.98f || std::fabs(rv) < 0.98f) && std::fabs(ru) > 0.2f && std::fabs(rv) > 0.2f)
+                    pc.ti.linear = true;
+            }
+        }
+
+        // Teste O (opcional): teste de prefiltragem de cobertura vertical para
+        // os glifos do menu Attack/Fusion/Item/Defend identificados na captura N.
+        // Esses sprites usam atlas 4 bits em TBP=9504, 54x19 texels numa area
+        // de 54x9,5 pixels. Os dois campos deslocados amostram linhas alternadas.
+        // Nao altera o campo apresentado, geometria, GS global, DMA nem VU1.
+        static const bool ui_vpair_enabled = std::getenv("PS2_GS_UI_VPAIR") != nullptr;
+        if (ui_vpair_enabled && pc.tme && !pc.ti.linear &&
+            pc.ti.psm == 0x14u && pc.ti.tbp == 9504u &&
+            (x1 - x0) >= 32.0f && (x1 - x0) <= 55.0f &&
+            (y1 - y0) >= 9.0f && (y1 - y0) <= 10.0f)
+        {
+            const float ru = (b.u - a.u) / (b.x - a.x);
+            const float rv = (b.v - a.v) / (b.y - a.y);
+            const int vbase = fast_floor(a.v);
+            const int vsize = fast_floor(b.v - a.v + 0.5f);
+            if (std::fabs(ru - 1.0f) < 0.03f &&
+                std::fabs(rv - 2.0f) < 0.03f && vsize >= 18 && vsize <= 19)
+            {
+                pc.ti.ui_vpair = true;
+                pc.ti.ui_vfirst = vbase;
+                pc.ti.ui_vspan = vsize;
+                static uint32_t shown = 0;
+                if (shown++ < 12)
+                    std::fprintf(stderr,
+                        "  [GS UI O] filtro_vertical_par tex=%u XY=(%.1f,%.1f)-(%.1f,%.1f) V=(%.1f,%.1f) linhas=%d\n",
+                        pc.ti.tbp, x0, y0, x1, y1, a.v, b.v, vsize);
+            }
+        }
+
+        // Teste P: caminho opcional para desenhar o atlas de fonte de 19
+        // texels na imagem final de 448 linhas. O GS normal continua intacto
+        // quando a variavel nao existe. Nao usa nenhum campo de outro quadro.
+        static const bool ui_native_enabled = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+        // Teste Q: instrumento diagnostico para verificar POR QUE o teste P nao
+        // imprimiu seus registros. Nao altera pixels nem o comportamento do P.
+        // [GS UI Q] versao identifica se o .exe foi regenerado/recompilado.
+        // [GS UI Q] candidato detalha o predicado real do atlas da batalha.
+        static const bool ui_qprobe = std::getenv("PS2_GS_UI_QPROBE") != nullptr;
+        if (ui_qprobe)
+        {
+            static std::atomic<unsigned> q_versao{0u};
+            if (q_versao.fetch_add(1u) == 0u)
+                std::fprintf(stderr,
+                    "  [GS UI Q] versao=Q instalado=1 native=%d vpair=%d field=%s\n",
+                    std::getenv("PS2_GS_UI_NATIVE") != nullptr ? 1 : 0,
+                    std::getenv("PS2_GS_UI_VPAIR") != nullptr ? 1 : 0,
+                    std::getenv("PS2_FIELD_RECON") != nullptr ? std::getenv("PS2_FIELD_RECON") : "(padrao)");
+
+            // Captura exatamente o atlas PSMT4 identificado pela captura F9 N,
+            // mesmo quando outras condicoes do P rejeitam o sprite.
+            if (pc.tme && pc.ti.tbp == 9504u && pc.ti.psm == 0x14u &&
+                x1 - x0 >= 32.0f && x1 - x0 <= 55.0f &&
+                y1 - y0 >= 8.5f && y1 - y0 <= 10.5f)
+            {
+                static std::atomic<unsigned> q_amostras{0u};
+                const unsigned n = q_amostras.fetch_add(1u);
+                if (n < 24u)
+                {
+                    const float du = (b.u - a.u) / (b.x - a.x);
+                    const float dv = (b.v - a.v) / (b.y - a.y);
+                    const int w = (int)std::lround(x1 - x0);
+                    const int h = (int)std::lround((y1 - y0) * 2.0f);
+                    const bool estados = !pc.ti.linear && pc.ti.tfx == 0u && pc.ti.tcc &&
+                        pc.fpsm == 0u && pc.fbmsk == 0u &&
+                        (pc.fbp == 0u || pc.fbp == 2240u) &&
+                        !pc.zactive && pc.abe && g_st.ctx[ci].alpha == 0x44u;
+                    const bool uv_ok = std::fabs(du - 1.0f) < 0.03f &&
+                        std::fabs(dv - 2.0f) < 0.03f &&
+                        w >= 32 && w <= 55 && h >= 18 && h <= 20 &&
+                        a.u >= 0.0f && a.v >= 0.0f;
+                    std::fprintf(stderr,
+                        "  [GS UI Q] candidato=%u native=%d estados=%d uv=%d fbp=%u xy=(%.2f,%.2f)-(%.2f,%.2f)"
+                        " du=%.5f dv=%.5f wh=%dx%d linear=%d tfx=%u tcc=%d fpsm=%u fbmsk=%08X"
+                        " zactive=%d abe=%d alpha=%llX\n",
+                        n, ui_native_enabled ? 1 : 0, estados ? 1 : 0, uv_ok ? 1 : 0,
+                        pc.fbp / 32u, x0, y0, x1, y1, du, dv, w, h,
+                        pc.ti.linear ? 1 : 0, pc.ti.tfx, pc.ti.tcc ? 1 : 0,
+                        pc.fpsm, pc.fbmsk, pc.zactive ? 1 : 0, pc.abe ? 1 : 0,
+                        (unsigned long long)g_st.ctx[ci].alpha);
+                }
+            }
+        }
+        if (ui_native_enabled && pc.tme && !pc.ti.linear &&
+            pc.ti.psm == 0x14u && pc.ti.tbp == 9504u &&
+            pc.ti.tfx == 0u && pc.ti.tcc &&
+            pc.fpsm == 0u && pc.fbmsk == 0u &&
+            (pc.fbp == 0u || pc.fbp == 2240u) &&
+            !pc.zactive && pc.abe &&
+            g_st.ctx[ci].alpha == 0x44u &&
+            (x1 - x0) >= 32.0f && (x1 - x0) <= 55.0f &&
+            (y1 - y0) >= 9.0f && (y1 - y0) <= 10.0f)
+        {
+            const float du = (b.u - a.u) / (b.x - a.x);
+            const float dv = (b.v - a.v) / (b.y - a.y);
+            const int w = (int)std::lround(x1 - x0);
+            const int h = (int)std::lround((y1 - y0) * 2.0f);
+
+            // Nao substitui o sprite caso o modo ou a geometria sejam
+            // diferentes do comando confirmado na captura F9 do teste N.
+            if (std::fabs(du - 1.0f) < 0.03f &&
+                std::fabs(dv - 2.0f) < 0.03f &&
+                w >= 32 && w <= 55 && h >= 18 && h <= 20 &&
+                a.u >= 0.0f && a.v >= 0.0f)
+            {
+                UiGlyphP glyph;
+                glyph.fbp = pc.fbp;
+                glyph.vsync = g_gs_vsyncs;
+                glyph.x = (int)std::lround(x0);
+                glyph.y = (int)std::lround(y0 * 2.0f);
+                glyph.w = w;
+                glyph.h = h;
+                glyph.rgba.resize((size_t)w * (size_t)h);
+
+                // Faz snapshot dos texels enquanto a CLUT e o TEX0 deste
+                // sprite ainda estao ativos. Nao depende de estados futuros.
+                const int vr = gs_f2i255(b.r);
+                const int vg = gs_f2i255(b.g);
+                const int vb = gs_f2i255(b.b);
+                const int va = gs_f2i255(b.a);
+                for (int py = 0; py < h; ++py)
+                    for (int px = 0; px < w; ++px)
+                    {
+                        const float u = a.u + (b.u - a.u) * ((px + 0.5f) / w);
+                        const float v = a.v + (b.v - a.v) * ((py + 0.5f) / h);
+                        const uint32_t tex = gs_texel(pc.ti, fast_floor(u), fast_floor(v));
+                        const uint32_t r = std::min(255u, ((tex & 255u) * (uint32_t)vr) >> 7);
+                        const uint32_t g = std::min(255u, (((tex >> 8) & 255u) * (uint32_t)vg) >> 7);
+                        const uint32_t bl = std::min(255u, (((tex >> 16) & 255u) * (uint32_t)vb) >> 7);
+                        const uint32_t al = std::min(255u, (((tex >> 24) & 255u) * (uint32_t)va) >> 7);
+                        glyph.rgba[(size_t)py * w + px] = r | (g << 8) | (bl << 16) | (al << 24);
+                    }
+
+                {
+                    std::lock_guard<std::mutex> lk(g_ui_native_mu);
+                    auto& cache = g_ui_native_glyphs;
+
+                    // Teste R: no modo opt-in, um deslocamento vertical de um
+                    // pixel final nao cria uma copia extra do mesmo texto.
+                    // Sem a variavel, mantem EXATAMENTE o criterio do teste Q.
+                    static const bool ui_r_dedup =
+                        std::getenv("PS2_GS_UI_DEDUP") != nullptr &&
+                        std::getenv("PS2_GS_UI_DEDUP")[0] != '0';
+                    const size_t before = cache.size();
+                    cache.erase(std::remove_if(cache.begin(), cache.end(),
+                        [&](const UiGlyphP& old)
+                        {
+                            // Textos vizinhos ficam separados ~18 pixels.
+                            // Limitar a mesma posicao X, largura e FBP evita
+                            // substituir outras opcoes do menu.
+                            const bool same_row = ui_r_dedup
+                                ? (old.w == glyph.w &&
+                                   old.y >= glyph.y - 1 &&
+                                   old.y <= glyph.y + 1)
+                                : (old.y == glyph.y);
+                            return old.fbp == glyph.fbp &&
+                                old.x == glyph.x && same_row;
+                        }), cache.end());
+
+                    // Registro restrito: o tamanho antes/depois demonstra
+                    // quando um glifo antigo foi realmente substituido.
+                    if (ui_r_dedup && before > cache.size())
+                    {
+                        static unsigned reports_r = 0;
+                        if (reports_r++ < 16u)
+                            std::fprintf(stderr,
+                                "  [GS UI R] dedup=1 fbp=%u x=%d y=%d removidos=%zu\n",
+                                glyph.fbp / 32u, glyph.x, glyph.y,
+                                before - cache.size());
+                    }
+
+                    if (cache.size() >= 16)
+                        cache.erase(cache.begin());
+                    cache.push_back(std::move(glyph));
+                }
+                static unsigned reports_p = 0;
+                if (reports_p++ < 10u)
+                    std::fprintf(stderr,
+                        "  [GS UI P] fonte_nativa fbp=%u XY=(%.1f,%.1f) %dx%d pixels finais\n",
+                        pc.fbp / 32u, x0, y0, w, h);
+
+                // Nao desenhar a versao de 9,5 linhas: sera composta apos
+                // a reconstrucao espacial, com 19 linhas originais.
+                return;
+            }
+        }
+
+        // Teste M: diagnostico restrito aos sprites pequenos texturizados da UI.
+        // As primeiras 48 ocorrencias e uma amostra a cada 512 sao impressas;
+        // nenhum acesso a textura ou pixel e modificado pelo diagnostico.
+        if (sprite_probe && pc.tme &&
+            (x1 - x0) <= 32.0f && (y1 - y0) <= 32.0f)
+        {
+            static uint64_t small_sprite_count = 0;
+            const uint64_t n = ++small_sprite_count;
+
+            if (n <= 48 || (n % 512u) == 0)
+            {
+                const GsCtx& ctx = g_st.ctx[ci];
+                const float du = (b.u - a.u) / (b.x - a.x);
+                const float dv = (b.v - a.v) / (b.y - a.y);
+                const unsigned mmag = (unsigned)((ctx.tex1 >> 5) & 1u);
+                const unsigned mmin = (unsigned)((ctx.tex1 >> 6) & 7u);
+
+                // Calcula qual filtro a heuristica antiga aplicaria neste mesmo sprite.
+                // Assim um unico teste M mostra se a alteracao afeta a letra examinada.
+                bool legacy_linear = tex1_linear;
+
+                if (!sprite_bilinear)
+                {
+                    if (legacy_linear && std::fabs(du - 1.0f) < 0.02f && std::fabs(dv - 1.0f) < 0.02f)
+                        legacy_linear = false;
+                    else if (!legacy_linear && std::getenv("PS2_SPRITE_NOAUTOFILTER") == nullptr &&
+                             (std::fabs(du) < 0.98f || std::fabs(dv) < 0.98f) &&
+                             std::fabs(du) > 0.2f && std::fabs(dv) > 0.2f)
+                        legacy_linear = true;
+                }
+
+                std::fprintf(stderr,
+                    "  [GS SPRITE M] n=%llu ctx=%d FBP=%u "
+                    "XY=(%.2f,%.2f)-(%.2f,%.2f) UV=(%.2f,%.2f)-(%.2f,%.2f) "
+                    "dUV=(%.3f,%.3f) PSM=%02X TBP=%u TEX0=%016llX TEX1=%016llX "
+                    "MMAG=%u MMIN=%u tex1_linear=%u legado_linear=%u usado_linear=%u mudaria=%u "
+                    "ATE=%u ATST=%u AREF=%d CLAMP=%016llX modo_tex1=%u\n",
+                    (unsigned long long)n, ci, pc.fbp,
+                    x0, y0, x1, y1, a.u, a.v, b.u, b.v,
+                    du, dv, pc.ti.psm, pc.ti.tbp,
+                    (unsigned long long)ctx.tex0, (unsigned long long)ctx.tex1,
+                    mmag, mmin, tex1_linear ? 1u : 0u,
+                    legacy_linear ? 1u : 0u, pc.ti.linear ? 1u : 0u,
+                    (legacy_linear != pc.ti.linear) ? 1u : 0u,
+                    pc.ate ? 1u : 0u, pc.atst, pc.aref,
+                    (unsigned long long)ctx.clamp, sprite_tex1 ? 1u : 0u);
+            }
+        }
 
         // recorta ao scissor uma vez (em vez de testar pixel a pixel)
         px0 = std::max(px0, pc.sx0); px1 = std::min(px1, pc.sx1 + 1);
@@ -5149,7 +6522,18 @@ namespace
         if ((long long)(px1 - px0) * (long long)(py1 - py0) >= 2048 && gs_sprite_fast(pc, a, b, px0, px1, py0, py1))
             return;
 
+        if (g_perf_gs && px1 > px0 && py1 > py0)
+            g_prof_sprite_generic_pixels.fetch_add((uint64_t)(px1 - px0) * (py1 - py0), std::memory_order_relaxed);
         const float ixr = 1.0f / (b.x - a.x), iyr = 1.0f / (b.y - a.y);
+
+        if (g_sprite_generic_rows && px1 > px0 && py1 - py0 >= 2)
+        {
+            if (pc.fpsm == 0)
+                gs_sprite_generic_rows<true>(pc, a, b, px0, px1, py0, py1, ixr, iyr);
+            else
+                gs_sprite_generic_rows<false>(pc, a, b, px0, px1, py0, py1, ixr, iyr);
+            return;
+        }
 
         for (int y = py0; y < py1; y++)
         {
@@ -5164,6 +6548,54 @@ namespace
         }
     }
 
+    // Teste T: cobertura subpixel de arestas 3D, isolada do framebuffer PS2.
+    // A VRAM/z-buffer permanecem SEM ALTERACOES. A mascara opcional e apenas
+    // uma sugestao geometrica para a apresentacao em 640x448; nao e SSAA 2x real.
+    struct GsEdgeT
+    {
+        uint32_t rgba = 0;             // Ultima cor RGBA32 gravada pelo triangulo no GS.
+        uint32_t vsync = 0;            // Evita reutilizar bordas antigas indefinidamente.
+        uint8_t coverage = 0;          // 1..3 de quatro subamostras geometrico-espaciais.
+        int8_t outside_x = 0;         // Direcao do exterior do triangulo (x ou y).
+        int8_t outside_y = 0;
+    };
+    std::mutex g_edge_t_mu;
+    std::vector<GsEdgeT> g_edge_t_frame[2];
+    std::atomic<uint64_t> g_edge_t_triangles{0}, g_edge_t_border_pixels{0};
+    static bool gs_edge_t_enabled()
+    {
+        static const char* value = std::getenv("PS2_GS_TRI_COVERAGE_T");
+        return value != nullptr && value[0] == '1';
+    }
+
+    // Teste U: auditoria do TEX1 e teste controlado de alinhamento UV do caminho 3D.
+    // Todos os controles sao DESLIGADOS por padrao. Nao alterar sprites, GS VRAM,
+    // rasterizacao 2D, FIELDLOCK, blending, Z-buffer, VIF, DMA ou microprogramas VU.
+    // Um desvio positivo move a amostragem dentro da textura, em unidades de texel.
+    // NAO equivale a antialiasing e NAO e uma correcao validada: A/B diagnostico.
+    static bool gs_tex_u_audit_enabled()
+    {
+        static const char* env = std::getenv("PS2_GS_TEX_AUDIT_U");
+        return env != nullptr && env[0] == '1';
+    }
+
+    static float gs_tex_uv_bias_u()
+    {
+        static const float bias = []() -> float
+        {
+            const char* env = std::getenv("PS2_GS_TRI_UV_BIAS_U");
+            if (env == nullptr || env[0] == '\0') return 0.0f;
+            char* end = nullptr;
+            const float v = std::strtof(env, &end);
+            if (end == env || *end != '\0' || !std::isfinite(v)) return 0.0f;
+            // Limitar a meia amostra (em texels) para impedir um erro grosseiro.
+            return std::max(-0.5f, std::min(0.5f, v));
+        }();
+        return bias;
+    }
+
+    std::atomic<uint64_t> g_tex_u_3d{0}, g_tex_u_linear{0}, g_tex_u_nearest{0};
+
     void gs_draw_triangle(int ci, const GsVertex& a, const GsVertex& b, const GsVertex& c)
     {
         float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
@@ -5176,7 +6608,7 @@ namespace
 
         gs_trace_draw("tri", ci, std::min(a.x, std::min(b.x, c.x)), std::min(a.y, std::min(b.y, c.y)), std::max(a.x, std::max(b.x, c.x)), std::max(a.y, std::max(b.y, c.y)));
 
-        const ProfScope prof(g_prof_raster_ns);
+        const RasterProfScope prof(g_prof_tri_ns);
         int minx = (int)fast_floor(std::min(a.x, std::min(b.x, c.x))), maxx = (int)fast_ceil(std::max(a.x, std::max(b.x, c.x)));
         int miny = (int)fast_floor(std::min(a.y, std::min(b.y, c.y))), maxy = (int)fast_ceil(std::max(a.y, std::max(b.y, c.y)));
 
@@ -5185,10 +6617,57 @@ namespace
 
         PixCfg pc;
         gs_pix_cfg(ci, pc);
+
+        // Condicoes reais da batalha: somente triangulos com STQ/perspectiva
+        // destinados aos framebuffers FBP 0/70 (nao os sprites TEX1=0 da UI).
+        // A contagem pode ser ativada isoladamente para um baseline fiel.
+        const bool tex_u_3d = a.persp && b.persp && c.persp && pc.tme &&
+            pc.fpsm == 0u && pc.fbw == 10u &&
+            (pc.fbp == 0u || pc.fbp == 2240u);
+        const float tex_u_bias = tex_u_3d ? gs_tex_uv_bias_u() : 0.0f;
+        if (tex_u_3d && gs_tex_u_audit_enabled())
+        {
+            const uint64_t index = g_tex_u_3d.fetch_add(1, std::memory_order_relaxed);
+            if (pc.ti.linear)
+                g_tex_u_linear.fetch_add(1, std::memory_order_relaxed);
+            else
+                g_tex_u_nearest.fetch_add(1, std::memory_order_relaxed);
+            if (index < 8u)
+            {
+                const uint64_t tex1 = g_st.ctx[ci].tex1;
+                std::fprintf(stderr,
+                    "  [GS TEX U] amostra=%llu fbp=%u TEX1=0x%llX MMAG=%u MMIN=%u bilinear=%u "
+                    "PSM=0x%X TBP=%u bias=%.3f\n",
+                    (unsigned long long)index, pc.fbp / 32u,
+                    (unsigned long long)tex1, (unsigned)((tex1 >> 5) & 1u),
+                    (unsigned)((tex1 >> 6) & 7u), pc.ti.linear ? 1u : 0u,
+                    pc.ti.psm, pc.ti.tbp, (double)tex_u_bias);
+            }
+        }
         minx = std::max(minx, pc.sx0); maxx = std::min(maxx, pc.sx1);
         miny = std::max(miny, pc.sy0); maxy = std::min(maxy, pc.sy1);
 
         const bool persp = a.persp && b.persp && c.persp;
+
+        // Apenas triangulos 3D texturizados nos dois framebuffers documentados
+        // (FBP 0 e 70), sem tocar nos sprites de texto ou nos menus 2D.
+        const bool edge_t = gs_edge_t_enabled() && persp && pc.tme &&
+            pc.fpsm == 0u && pc.fbw == 10u &&
+            (pc.fbp == 0u || pc.fbp == 2240u);
+        std::unique_lock<std::mutex> edge_t_lock(g_edge_t_mu, std::defer_lock);
+        std::vector<GsEdgeT>* edge_t_frame = nullptr;
+        if (edge_t)
+        {
+            // Trava somente enquanto o GS desenha UM triangulo. A thread da
+            // apresentacao copia a mascara sob o mesmo mutex, sem data races.
+            edge_t_lock.lock();
+            const int idx = pc.fbp == 0u ? 0 : 1;
+            auto& frame = g_edge_t_frame[idx];
+            if (frame.size() != 640u * 224u)
+                frame.resize(640u * 224u);
+            edge_t_frame = &frame;
+            g_edge_t_triangles.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Triangulos 2D grandes de cor plana (quads de UI, fundos): usa o caminho rapido por linha.
         bool use_fast = false;
@@ -5207,6 +6686,13 @@ namespace
         const float s0 = (b.y - c.y) * inv, s1 = (c.y - a.y) * inv, s2 = -(s0 + s1);
         const float c0 = (b.x * c.y - b.y * c.x) * inv, d0 = (c.x - b.x) * inv;
         const float c1 = (c.x * a.y - c.y * a.x) * inv, d1 = (a.x - c.x) * inv;
+        const bool early_z = g_gs_tri_early_z && !edge_t;
+        const GsTextureSampler sampler = g_gs_tri_texture_specialize && early_z && pc.tme && pc.fpsm == 0
+            ? gs_tri_sampler(pc.ti) : nullptr;
+        // O caminho especializado do GS ja conhece o formato de cor.
+        // Em Z16S, reutiliza o mesmo endereco no teste e na escrita.
+        const bool fast_effect = g_gs_tri_effects_fast && sampler != nullptr;
+        const bool direct_z16s = fast_effect && pc.zactive && pc.zpsm == 0x3Au;
 
         for (int y = miny; y <= maxy; y++)
         {
@@ -5246,25 +6732,128 @@ namespace
             {
                 const float px = (float)x + 0.5f;
                 const float w0 = k0 + s0 * px, w1 = k1 + s1 * px, w2 = 1.0f - w0 - w1;
-                float u, v;
+                const float zf = (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2;
+                const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
+                // xs..xe e miny..maxy ja estao no scissor. Testa Z antes de UV/STQ e RGBA.
+                // A escrita de Z ainda depende de AFAIL e continua dentro de gs_pixel.
+                uint8_t* depth_pixel = nullptr;
+                if (direct_z16s)
+                {
+                    if (pc.ztst == 0u)
+                        continue;
+                    depth_pixel = vram8() + (size_t)ix_z16s(pc.zbp, pc.fbw, (uint32_t)x, (uint32_t)y) * 2;
+                    if (pc.ztst >= 2u)
+                    {
+                        uint16_t previous;
+                        std::memcpy(&previous, depth_pixel, sizeof(previous));
+                        const uint16_t depth = (uint16_t)zi;
+                        if (depth < previous || (pc.ztst == 3u && depth == previous))
+                            continue;
+                    }
+                }
+                else if (early_z && pc.zactive && !gs_zpass(pc, (uint32_t)x, (uint32_t)y, zi))
+                    continue;
 
-                if (persp)
+                float u = 0.0f, v = 0.0f;
+
+                if (persp && (!early_z || pc.tme))
                 {
                     float q = a.q * w0 + b.q * w1 + c.q * w2;
                     q = q != 0.0f ? 1.0f / q : 1.0f;
                     u = (a.us * w0 + b.us * w1 + c.us * w2) * q;
                     v = (a.vs * w0 + b.vs * w1 + c.vs * w2) * q;
                 }
-                else
+                else if (!early_z || pc.tme)
                 {
                     u = a.u * w0 + b.u * w1 + c.u * w2;
                     v = a.v * w0 + b.v * w1 + c.v * w2;
                 }
 
-                const float zf = (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2;
-                const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
-                gs_pixel(pc, x, y, a.r * w0 + b.r * w1 + c.r * w2, a.g * w0 + b.g * w1 + c.g * w2, a.b * w0 + b.b * w1 + c.b * w2,
-                    a.a * w0 + b.a * w1 + c.a * w2, u, v, zi);
+                // A interpolacao e o Z-test originais continuam inalterados.
+                // Calcular a cobertura 2x2 SOMENTE quando a posicao esta perto
+                // de uma das tres arestas, para economizar CPU.
+                unsigned coverage_t = 4u;
+                int outside_x_t = 0, outside_y_t = 0;
+                if (edge_t && x >= 1 && x < 639 && y >= 1 && y < 223 &&
+                    (w0 < 0.25f * (std::fabs(s0) + std::fabs(d0)) + 1e-5f ||
+                     w1 < 0.25f * (std::fabs(s1) + std::fabs(d1)) + 1e-5f ||
+                     w2 < 0.25f * (std::fabs(s2) + std::fabs(d0 + d1)) + 1e-5f))
+                {
+                    // Quatro posicoes no pixel, sem alterar a amostragem do GS.
+                    // Centro das subcelulas: (+/-0.25, +/-0.25).
+                    static const int sx[4] = {-1,  1, -1,  1};
+                    static const int sy[4] = {-1, -1,  1,  1};
+                    unsigned hits = 0;
+                    int sumx = 0, sumy = 0;
+                    for (int sample = 0; sample < 4; ++sample)
+                    {
+                        const float dx = (float)sx[sample] * 0.25f;
+                        const float dy = (float)sy[sample] * 0.25f;
+                        const float e0 = w0 + s0 * dx + d0 * dy;
+                        const float e1 = w1 + s1 * dx + d1 * dy;
+                        const float e2 = 1.0f - e0 - e1;
+                        if (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f)
+                        {
+                            ++hits;
+                            sumx += sx[sample]; sumy += sy[sample];
+                        }
+                    }
+                    if (hits > 0u && hits < 4u)
+                    {
+                        // O lado externo e oposto ao centroide dos samples
+                        // cobertos. Evita buscar pixels dentro do triangulo.
+                        if (std::abs(sumx) >= std::abs(sumy) && sumx != 0)
+                            outside_x_t = sumx > 0 ? -1 : 1;
+                        else if (sumy != 0)
+                            outside_y_t = sumy > 0 ? -1 : 1;
+                        if (outside_x_t || outside_y_t)
+                            coverage_t = hits;
+                    }
+                }
+                uint32_t old_rgb_t = 0u;
+                if (coverage_t < 4u)
+                    old_rgb_t = gs_read_px(0x00u, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+
+                // Comparacao UV do teste U: afeta apenas a busca de texels
+                // dos triangulos 3D selecionados. Geometria e Z nao mudam.
+                // Bias zero (padrao) preserva EXATAMENTE a versao T.
+                const float r = a.r * w0 + b.r * w1 + c.r * w2;
+                const float g = a.g * w0 + b.g * w1 + c.g * w2;
+                const float blue = a.b * w0 + b.b * w1 + c.b * w2;
+                const float alpha = a.a * w0 + b.a * w1 + c.a * w2;
+                if (sampler != nullptr)
+                {
+                    // CT32 usa o mesmo endereco para o blend e a escrita.
+                    const uint32_t addr = ix_ct32(pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+                    const uint32_t texel = sampler(pc.ti, u + tex_u_bias, v + tex_u_bias);
+                    if (fast_effect)
+                        gs_shade_pixel<true, true>(pc, x, y, gs_f2i255(r), gs_f2i255(g), gs_f2i255(blue),
+                            gs_f2i255(alpha), texel, zi, addr, depth_pixel);
+                    else
+                        gs_shade_pixel<false, true>(pc, x, y, gs_f2i255(r), gs_f2i255(g), gs_f2i255(blue),
+                            gs_f2i255(alpha), texel, zi, addr);
+                }
+                else if (early_z)
+                    gs_pixel<true>(pc, x, y, r, g, blue, alpha, u + tex_u_bias, v + tex_u_bias, zi);
+                else
+                    gs_pixel(pc, x, y, r, g, blue, alpha, u + tex_u_bias, v + tex_u_bias, zi);
+
+                if (coverage_t < 4u)
+                {
+                    const uint32_t after = gs_read_px(0x00u, pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+                    // Um Z-test rejeitado ou pixel transparente nao deve
+                    // contaminar a mascara de outro triangulo.
+                    if ((old_rgb_t & 0x00FFFFFFu) != (after & 0x00FFFFFFu))
+                    {
+                        GsEdgeT& edge = (*edge_t_frame)[(size_t)y * 640u + (size_t)x];
+                        edge.rgba = after;
+                        edge.vsync = g_gs_vsyncs;
+                        edge.coverage = (uint8_t)coverage_t;
+                        edge.outside_x = (int8_t)outside_x_t;
+                        edge.outside_y = (int8_t)outside_y_t;
+                        g_edge_t_border_pixels.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
             }
         }
     }
@@ -5274,7 +6863,76 @@ namespace
     // alinham; mostrar os quadros sem isso faz a imagem tremer. Aqui, cada vertice de sprite vota se a coordenada
     // Y esta numa meia linha (2*Y impar); o voto decai, entao vale o do quadro desenhado por ultimo em cada FBP.
     float g_half_vote[512] = {};
+
+    // Evidencia por FBP. Usa os mesmos vertices e o mesmo reset do voto legado.
+    struct FieldSpriteEvidence
+    {
+        unsigned sprites = 0, half_y = 0, half_ofy = 0, ofy_last = 0;
+    };
+    FieldSpriteEvidence g_field_evidence[512];
     std::atomic<unsigned> g_gs_flips{0};   // trocas do buffer exibido (DISPFB): aproximam os quadros do jogo
+
+    struct FieldUnknownOffset
+    {
+        unsigned ofy = 0, fbw = 0, psm = 0, context = 0;
+        unsigned vertices = 0;
+        bool target = false;
+    };
+
+    struct FieldRasterState
+    {
+        unsigned shifted = 0, base = 0, unknown = 0;
+        unsigned shifted_sprite = 0, shifted_triangle = 0;
+        bool shifted_train = false;
+        FieldUnknownOffset offsets[4];
+        unsigned other_unknown = 0, zero_origin = 0;
+    };
+
+    static void gs_record_unknown_ofy(FieldRasterState& state, const GsCtx& c,
+                                      unsigned ofy, unsigned context, bool target)
+    {
+        // Amostra limitada por framebuffer. Registra o estado junto com o
+        // OFY para diferenciar origem nao reconhecida de layout incompativel.
+        const unsigned fbw = (unsigned)((c.frame >> 16) & 0x3Fu);
+        const unsigned psm = (unsigned)((c.frame >> 24) & 0x3Fu);
+        for (auto& sample : state.offsets)
+        {
+            if (sample.vertices == 0)
+            {
+                sample = {ofy, fbw, psm, context, 1u, target};
+                return;
+            }
+            if (sample.ofy == ofy && sample.fbw == fbw && sample.psm == psm &&
+                sample.context == context && sample.target == target)
+            {
+                ++sample.vertices;
+                return;
+            }
+        }
+        ++state.other_unknown;
+    };
+    FieldRasterState g_field_raster_state[512];
+
+    // Reconhece apenas o framebuffer entrelacado 640 pixels em CT32 do jogo.
+    // A normalizacao afeta cor e Z na rasterizacao, inclusive leituras posteriores.
+    static bool gs_field_raster_target(const GsCtx& c)
+    {
+        const unsigned fbp = (unsigned)(c.frame & 0x1FFu);
+        return g_gs_crt_int && g_gs_crt_ffmd &&
+            (fbp == 0u || fbp == 70u) &&
+            ((c.frame >> 16) & 0x3Fu) == 10u &&
+            ((c.frame >> 24) & 0x3Fu) == 0u;
+    }
+
+    static bool gs_field_raster_train_ofy(unsigned ofy)
+    {
+        // O historico do trem mostra pares como 76B0/76B8 e 7580/7588.
+        // Preserva a parte inteira da origem; somente as duas fases
+        // observadas, separadas por oito unidades em ponto fixo, entram.
+        const unsigned fraction = ofy & 0xFu;
+        return g_field_raster_train && ofy >= 0x7500u && ofy <= 0x7CF8u &&
+            (fraction == 0u || fraction == 8u);
+    }
 
     void gs_vertex(uint64_t data, bool kick, bool xyzf = false)
     {
@@ -5284,6 +6942,36 @@ namespace
         float ofx = (float)(c.xyoffset & 0xFFFF), ofy = (float)((c.xyoffset >> 32) & 0xFFFF);
         v.x = ((float)(data & 0xFFFF) - ofx) / 16.0f;
         v.y = ((float)((data >> 16) & 0xFFFF) - ofy) / 16.0f;
+        // Mantem o voto de campo baseado na coordenada original.
+        const float original_y = v.y;
+        if (g_field_raster)
+        {
+            FieldRasterState& state = g_field_raster_state[c.frame & 0x1FFu];
+            const unsigned raw_ofy = (unsigned)((c.xyoffset >> 32) & 0xFFFFu);
+            const bool target = gs_field_raster_target(c);
+            const bool train_ofy = target && gs_field_raster_train_ofy(raw_ofy);
+            if (target && (raw_ofy == 0x7908u || (train_ofy && (raw_ofy & 0xFu) == 8u)))
+            {
+                v.y += 0.5f;
+                ++state.shifted;
+                state.shifted_train |= train_ofy && raw_ofy != 0x7908u;
+                const unsigned type = (unsigned)(g_st.prim & 7u);
+                state.shifted_sprite += type == 6u;
+                state.shifted_triangle += type >= 3u && type <= 5u;
+            }
+            else if (target && (raw_ofy == 0x7900u || train_ofy))
+                ++state.base;
+            else
+            {
+                ++state.unknown;
+                // Conta a origem zero apenas no mesmo layout dos desenhos
+                // do trem. As coordenadas destes vertices ficam intactas.
+                if (g_field_raster_train && target && raw_ofy == 0u)
+                    ++state.zero_origin;
+                if (g_field_train_diag)
+                    gs_record_unknown_ofy(state, c, raw_ofy, (unsigned)ci, target);
+            }
+        }
         v.z = xyzf ? (uint32_t)((data >> 32) & 0xFFFFFFu) : (uint32_t)(data >> 32);
 
         v.r = (float)(g_st.rgbaq & 0xFF);
@@ -5332,12 +7020,23 @@ namespace
         if (type == 6 && g_st.nq == 1)
         {
             // primeiro vertice do sprite: Y em meia linha (2*Y impar) = quadro "impar"; OFY com fracao tambem conta
-            const int n = (int)std::floor(v.y * 2.0f + 0.5f);
+            const int n = (int)std::floor(original_y * 2.0f + 0.5f);
             float& vote = g_half_vote[c.frame & 0x1FF];
             vote += (n & 1) ? 1.0f : -1.0f;
 
-            if (((c.xyoffset >> 32) & 0xF) >= 8)
+            const unsigned ofy = (unsigned)((c.xyoffset >> 32) & 0xFFFFu);
+            const bool half_ofy = (ofy & 0xFu) >= 8u;
+            if (half_ofy)
                 vote += 4.0f;
+
+            if (g_field_audit)
+            {
+                FieldSpriteEvidence& evidence = g_field_evidence[c.frame & 0x1FF];
+                ++evidence.sprites;
+                evidence.half_y += (unsigned)(n & 1);
+                evidence.half_ofy += half_ofy;
+                evidence.ofy_last = ofy;
+            }
 
             vote = vote > 64.0f ? 64.0f : (vote < -64.0f ? -64.0f : vote);
         }
@@ -5559,7 +7258,11 @@ namespace
             case 0x50: g_st.bitbltbuf = data; break;
             case 0x51: g_st.trxpos = data; break;
             case 0x52: g_st.trxreg = data; break;
-            case 0x53: g_st.trxdir = data; gs_xfer_begin(); break;
+            case 0x53:
+                g_st.trxdir = data;
+                ++g_st.trx_generation; // Invalida um download anterior, inclusive se TRXDIR deixar de ser 1.
+                gs_xfer_begin();
+                break;
             default: break;
         }
     }
@@ -5594,9 +7297,10 @@ namespace
             uint32_t magh = (uint32_t)((display >> 23) & 0xF) + 1;
             w = ((uint32_t)((display >> 32) & 0xFFF) + 1) / magh;
             // DISPLAY.DH e a altura de SAIDA (em linhas de exibicao), nao a do buffer. Cada linha do
-            // buffer se repete (MAGV + 1) vezes; alem disso, em interlacado com FFMD = 1 (modo "campo")
-            // o buffer guarda so um campo, ou seja, metade das linhas. Ler DH+1 linhas invade o buffer
-            // vizinho (o jogo usa buffers de 640x224 em FBP 0, 70, 140...). magv = fator total de repeticao.
+            // buffer se repete (MAGV + 1) vezes. ATENCAO: FFMD=1 e modo FRAME,
+            // nao FIELD (confirmado por PS2SDK e PCSX2). O fator adicional 2 abaixo e
+            // uma heuristica legada que mantemos para preservar a batalha. O jogo usa
+            // buffers de ~640x224 em FBP 0/70: ler 448 linhas invadiria o vizinho.
             magv = ((uint32_t)((display >> 27) & 0x3) + 1) * ((g_gs_crt_int && g_gs_crt_ffmd) ? 2u : 1u);
             h = (uint32_t)((display >> 44) & 0x7FF) + 1;
             valid = w != 0 && w <= 1024 && h != 0 && h <= 1024 && fbw != 0;
@@ -5613,54 +7317,533 @@ namespace
     uint32_t g_win_w = 0, g_win_h = 0;
     std::atomic<unsigned> g_win_seq{0};
 
+    // Compara o buffer enviado ao GDI com o ultimo desenho bem-sucedido.
+    // A janela chama este metodo apos o desenho, inclusive em redesenhos.
+    struct WindowFrameContent
+    {
+        uint32_t width = 0, height = 0;
+        std::vector<uint32_t> previous;
+
+        bool record(const std::vector<uint32_t>& pixels, uint32_t w, uint32_t h)
+        {
+            if (width == w && height == h && previous == pixels)
+                return false;
+            previous = pixels;
+            width = w;
+            height = h;
+            return true;
+        }
+    };
+
+    // F11 pede uma captura da mesma troca, em tres etapas da apresentacao.
+    // O GS copia os pixels; a thread da janela escreve os arquivos.
+    struct FontCapture
+    {
+        unsigned flip = 0, fbp = 0, psm = 0, magv = 0;
+        uint32_t w = 0, source_h = 0, h = 0;
+        bool spatial = false, native_ui = false;
+        std::vector<uint32_t> source, reconstructed, final;
+    };
+    std::atomic<bool> g_font_capture_request{false};
+    FontCapture g_font_capture; // Protegido por g_win_mu.
+#ifdef _WIN32
+    std::atomic<unsigned> g_win_blits{0}, g_win_coalesced{0}, g_win_blit_errors{0};
+    // Empacota os contadores para o perfil obter o mesmo instante dos dois.
+    // Metade inferior: diferentes. Metade superior: iguais ao anterior.
+    std::atomic<uint64_t> g_win_content_counts{0};
+#endif
+    struct PresentProfile
+    {
+        unsigned pacing = 0, invalid = 0, fieldlock = 0, same_flip = 0, aligned = 0, early_flip = 0;
+        unsigned queue_skips = 0;
+        uint64_t queue_wait_ns = 0;
+        unsigned raster_fields = 0, raster_mixed = 0, raster_unknown = 0, raster_train = 0, raster_train_zero = 0;
+        uint64_t raster_sprite_vertices = 0, raster_triangle_vertices = 0;
+    };
+    PresentProfile g_present_profile;
+
+    // Ultimo campo barrado no intervalo. Copiado com a fila do GS
+    // sincronizada para que os numeros correspondam ao voto apresentado.
+    struct FieldTrainDiagnostic
+    {
+        unsigned flip = 0, fbp = 0, w = 0, h = 0, magv = 0, fbw = 0, psm = 0;
+        FieldRasterState raster;
+    };
+    FieldTrainDiagnostic g_field_train_sample;
+
+    struct FieldFlipAudit
+    {
+        unsigned flip = 0, circuit = 0, csr_field = 0, fbp = 0;
+        unsigned dy = 0, dby = 0;
+        int vote = 0, present_vote = 0;
+        unsigned checked = 0, blocked = 0, published = 0;
+        FieldSpriteEvidence sprites;
+    };
+    constexpr unsigned kFieldAuditCapacity = 128;
+    FieldFlipAudit g_field_flips[kFieldAuditCapacity];
+
+    // Le uma linha da VRAM e converte a cor para o formato da janela.
+    // Em CT32/CT24 o swizzle e separavel: reutiliza X em todas as linhas
+    // e calcula Y uma vez por linha. As outras conversoes continuam genericas.
+    class GsScanoutRow
+    {
+        uint32_t columns[1024];
+        uint32_t cached_x = 0, cached_w = 0;
+
+        static uint32_t rgb24(uint32_t v)
+        {
+            return ((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu);
+        }
+
+    public:
+        void read(uint32_t* out, const DispParams& d, uint32_t y, bool fast)
+        {
+            if (fast && (d.psm == 0x00u || d.psm == 0x01u))
+            {
+                if (cached_x != d.dbx || cached_w != d.w)
+                {
+                    for (uint32_t x = 0; x < d.w; ++x)
+                        columns[x] = ix_ct32(0, 0, d.dbx + x, 0);
+                    cached_x = d.dbx;
+                    cached_w = d.w;
+                }
+
+                const uint32_t row = ix_ct32(d.fbp, d.fbw, 0, d.dby + y);
+                for (uint32_t x = 0; x < d.w; ++x)
+                    out[x] = rgb24(g_vram[(row + columns[x]) & 0xFFFFFu]);
+                return;
+            }
+
+            const bool c16 = d.psm == 0x02u || d.psm == 0x0Au;
+            for (uint32_t x = 0; x < d.w; ++x)
+            {
+                const uint32_t v = gs_read_px(d.psm, d.fbp, d.fbw, d.dbx + x, d.dby + y);
+                out[x] = c16
+                    ? (((v & 31u) << 19) | (((v >> 5) & 31u) << 11) | (((v >> 10) & 31u) << 3))
+                    : rgb24(v);
+            }
+        }
+    };
+
     // Converte o quadro exibido para a janela (~30 Hz; espaca mais se a leitura da VRAM estiver cara).
     // Le so uma linha por grupo de repeticao (MAGV / campo) e replica as demais.
+    // Teste K: apenas no modo espacial, esperamos a fila do GS antes de fazer um snapshot.
+    // Declaracao antecipada: implementacao original permanece mais abaixo no runtime.
+    void gs_q_drain();
+    bool gs_q_idle();
+    // Teste S: antisserrilhamento espacial OPCIONAL na imagem de apresentacao.
+    // Nao altera VRAM, Z, texturas ou estados do GS. Usa o mesmo quadro, nunca
+    // combina imagens de instantes diferentes. Inspirado na ideia de FXAA:
+    // detecta contraste local e amostra na direcao tangencial a borda.
+    // Esta filtragem nao recupera poligonos ou texels que nao foram rasterizados.
+    struct GsAaRgbS
+    {
+        float r, g, b;
+    };
+
+    static inline float gs_aa_luma_s(uint32_t c)
+    {
+        return (float)((((c >> 16) & 255u) * 77u + ((c >> 8) & 255u) * 150u
+            + (c & 255u) * 29u) >> 8);
+    }
+
+    static inline GsAaRgbS gs_aa_bilinear_s(const std::vector<uint32_t>& src,
+                                              int w, int h, float fx, float fy)
+    {
+        fx = std::max(0.0f, std::min(fx, (float)(w - 1)));
+        fy = std::max(0.0f, std::min(fy, (float)(h - 1)));
+        const int x0 = (int)fx, y0 = (int)fy;
+        const int x1 = std::min(x0 + 1, w - 1);
+        const int y1 = std::min(y0 + 1, h - 1);
+        const float tx = fx - (float)x0, ty = fy - (float)y0;
+        const float w00 = (1.0f - tx) * (1.0f - ty);
+        const float w10 = tx * (1.0f - ty);
+        const float w01 = (1.0f - tx) * ty;
+        const float w11 = tx * ty;
+        const uint32_t c00 = src[(size_t)y0 * (size_t)w + (size_t)x0];
+        const uint32_t c10 = src[(size_t)y0 * (size_t)w + (size_t)x1];
+        const uint32_t c01 = src[(size_t)y1 * (size_t)w + (size_t)x0];
+        const uint32_t c11 = src[(size_t)y1 * (size_t)w + (size_t)x1];
+        const float r = (float)((c00 >> 16) & 255u) * w00 + (float)((c10 >> 16) & 255u) * w10
+            + (float)((c01 >> 16) & 255u) * w01 + (float)((c11 >> 16) & 255u) * w11;
+        const float g = (float)((c00 >> 8) & 255u) * w00 + (float)((c10 >> 8) & 255u) * w10
+            + (float)((c01 >> 8) & 255u) * w01 + (float)((c11 >> 8) & 255u) * w11;
+        const float b = (float)(c00 & 255u) * w00 + (float)(c10 & 255u) * w10
+            + (float)(c01 & 255u) * w01 + (float)(c11 & 255u) * w11;
+        return {r, g, b};
+    }
+
+    // Se glifos != nullptr, limita a analise a cada retangulo do atlas P/R.
+    // Os dois modos sao independentes: o usuario pode testar cena e fonte
+    // separadamente, sem modificar o GS original nem a logica do jogo.
+    static uint32_t gs_aa_apply_s(std::vector<uint32_t>& img, int w, int h,
+                                   float threshold, float max_span, float strength,
+                                   const std::vector<UiGlyphP>* glifos)
+    {
+        if (w < 3 || h < 3 || img.size() != (size_t)w * (size_t)h)
+            return 0;
+
+        // Snapshot imutavel: nenhuma amostragem usa pixels ja suavizados.
+        const std::vector<uint32_t> orig = img;
+        uint32_t changed = 0;
+        auto process = [&](int xl, int xr, int yt, int yb)
+        {
+            xl = std::max(1, xl); xr = std::min(w - 2, xr);
+            yt = std::max(1, yt); yb = std::min(h - 2, yb);
+            if (xl > xr || yt > yb) return;
+            for (int y = yt; y <= yb; ++y)
+            for (int x = xl; x <= xr; ++x)
+            {
+                const size_t i = (size_t)y * (size_t)w + (size_t)x;
+                const float lM  = gs_aa_luma_s(orig[i]);
+                const float lN  = gs_aa_luma_s(orig[i - (size_t)w]);
+                const float lS  = gs_aa_luma_s(orig[i + (size_t)w]);
+                const float lW  = gs_aa_luma_s(orig[i - 1u]);
+                const float lE  = gs_aa_luma_s(orig[i + 1u]);
+                const float lNW = gs_aa_luma_s(orig[i - (size_t)w - 1u]);
+                const float lNE = gs_aa_luma_s(orig[i - (size_t)w + 1u]);
+                const float lSW = gs_aa_luma_s(orig[i + (size_t)w - 1u]);
+                const float lSE = gs_aa_luma_s(orig[i + (size_t)w + 1u]);
+                const float lmin = std::min(lM, std::min(std::min(lN, lS), std::min(lW, lE)));
+                const float lmax = std::max(lM, std::max(std::max(lN, lS), std::max(lW, lE)));
+                if (lmax - lmin < std::max(threshold, lmax * 0.14f))
+                    continue; // nao altera areas lisas e contrastes fracos
+
+                // Direcao da borda a partir das diferencas diagonais.
+                float dx = -((lNW + lNE) - (lSW + lSE));
+                float dy = ((lNW + lSW) - (lNE + lSE));
+                const float reduce = std::max((lNW + lNE + lSW + lSE) * (1.0f / 32.0f), 2.0f);
+                const float inv = 1.0f / (std::min(std::fabs(dx), std::fabs(dy)) + reduce);
+                dx = std::max(-max_span, std::min(max_span, dx * inv));
+                dy = std::max(-max_span, std::min(max_span, dy * inv));
+                if (std::fabs(dx) + std::fabs(dy) < 0.125f)
+                    continue;
+
+                // Primeiro, duas amostras internas sobre a tangente da borda.
+                const GsAaRgbS a0 = gs_aa_bilinear_s(orig, w, h,
+                    (float)x - dx * (1.0f / 6.0f), (float)y - dy * (1.0f / 6.0f));
+                const GsAaRgbS a1 = gs_aa_bilinear_s(orig, w, h,
+                    (float)x + dx * (1.0f / 6.0f), (float)y + dy * (1.0f / 6.0f));
+                GsAaRgbS a = {(a0.r + a1.r) * 0.5f,
+                              (a0.g + a1.g) * 0.5f, (a0.b + a1.b) * 0.5f};
+                // Duas amostras externas reduzem os degraus em diagonais.
+                const GsAaRgbS b0 = gs_aa_bilinear_s(orig, w, h,
+                    (float)x - dx * 0.5f, (float)y - dy * 0.5f);
+                const GsAaRgbS b1 = gs_aa_bilinear_s(orig, w, h,
+                    (float)x + dx * 0.5f, (float)y + dy * 0.5f);
+                GsAaRgbS b = {a.r * 0.5f + (b0.r + b1.r) * 0.25f,
+                              a.g * 0.5f + (b0.g + b1.g) * 0.25f,
+                              a.b * 0.5f + (b0.b + b1.b) * 0.25f};
+                const float lb = (77.0f * b.r + 150.0f * b.g + 29.0f * b.b) / 256.0f;
+                // Limita halos: rejeita amostra externa fora do intervalo local.
+                if (lb < lmin || lb > lmax) b = a;
+                // Controle de intensidade: preserva a cor central dos
+                // glifos finos para nao apagar a fonte (regressao do O).
+                const uint32_t original = orig[i];
+                b.r = (float)((original >> 16) & 255u) * (1.0f - strength) + b.r * strength;
+                b.g = (float)((original >> 8) & 255u) * (1.0f - strength) + b.g * strength;
+                b.b = (float)(original & 255u) * (1.0f - strength) + b.b * strength;
+                const uint32_t r = (uint32_t)std::min(255.0f, std::max(0.0f, b.r + 0.5f));
+                const uint32_t g = (uint32_t)std::min(255.0f, std::max(0.0f, b.g + 0.5f));
+                const uint32_t bl = (uint32_t)std::min(255.0f, std::max(0.0f, b.b + 0.5f));
+                const uint32_t color = (r << 16) | (g << 8) | bl;
+                if (img[i] != color) {img[i] = color; ++changed;}
+            }
+        };
+        if (glifos != nullptr)
+        {
+            // Nao afeta outros menus e nao interpreta um retangulo como texto
+            // se ele nao foi identificado no atlas especifico da batalha.
+            for (const UiGlyphP& glyph : *glifos)
+                process(glyph.x, glyph.x + glyph.w - 1,
+                        glyph.y, glyph.y + glyph.h - 1);
+        }
+        else
+            process(1, w - 2, 1, h - 2);
+        return changed;
+    }
+
+    // Uma linha na imagem de saida corresponde a meia linha no framebuffer 640x224.
+    // Replica a linha da borda para manter o tamanho e evitar uma faixa preta.
+    static void gs_align_spatial_field(uint32_t* pixels, size_t width, size_t height, int shift)
+    {
+        const size_t row_bytes = width * sizeof(uint32_t);
+        const size_t move_bytes = (height - 1) * row_bytes;
+        if (shift > 0)
+        {
+            std::memmove(pixels + width, pixels, move_bytes);
+        }
+        else
+        {
+            std::memmove(pixels, pixels + width, move_bytes);
+            std::memcpy(pixels + (height - 1) * width, pixels + (height - 2) * width, row_bytes);
+        }
+    }
+
+    struct PresentPacing
+    {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point next{}, next_flip{};
+        unsigned last_flip = 0;
+        bool published = false;
+
+        // Da ao EE uma janela curta para continuar rodando enquanto
+        // o worker termina. Passado o prazo, volta a sincronizar.
+        Clock::time_point queue_deadline{};
+
+        bool defer_for_queue(Clock::time_point now, bool queue_idle)
+        {
+            if (queue_idle)
+            {
+                queue_deadline = {};
+                return false;
+            }
+            if (queue_deadline == Clock::time_point{})
+                queue_deadline = now + std::chrono::milliseconds(33);
+            if (now < queue_deadline)
+                return true;
+            queue_deadline = {};
+            return false;
+        }
+
+        bool can_advance(Clock::time_point now, unsigned flip) const
+        {
+            return published && flip != last_flip && now >= next_flip;
+        }
+
+        void did_publish(Clock::time_point start, Clock::time_point finish, unsigned flip, bool legacy)
+        {
+            const auto work = finish - start;
+            // Conserva a reserva de CPU quando reconstruir o quadro e caro.
+            next = legacy
+                ? finish + std::max<Clock::duration>(std::chrono::milliseconds(33), work * 3)
+                : start + std::max<Clock::duration>(std::chrono::milliseconds(33), work * 4);
+            next_flip = start + std::max<Clock::duration>(std::chrono::milliseconds(16), work * 4);
+            last_flip = flip;
+            published = true;
+        }
+    };
+
     void gs_present_frame()
     {
-        using clk = std::chrono::steady_clock;
-        static clk::time_point next{};
+        using clk = PresentPacing::Clock;
+        static PresentPacing pacing;
+        static const bool flip_pacing = std::getenv("PS2_GS_PRESENT_ON_FLIP") != nullptr;
         const clk::time_point t0 = clk::now();
-
-        if (t0 < next)
+        unsigned flip = g_gs_flips.load(std::memory_order_relaxed);
+        const bool early = t0 < pacing.next;
+        if (early && (!flip_pacing || !pacing.can_advance(t0, flip)))
+        {
+            if (g_perf_gs) ++g_present_profile.pacing;
             return;
+        }
+
+        const bool capture_pending = g_font_capture_request.load(std::memory_order_relaxed);
+        static const bool defer_present = [] {
+            const char* value = std::getenv("PS2_GS_PRESENT_DEFER");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        const bool queue_drained = flip_pacing || g_field_audit || g_field_raster ||
+            capture_pending || defer_present;
+        // O EE e o unico produtor. Se a fila ja terminou, nenhum
+        // comando novo pode chegar ate esta chamada de apresentacao sair.
+        if (defer_present && pacing.defer_for_queue(t0, gs_q_idle()))
+        {
+            if (g_perf_gs) ++g_present_profile.queue_skips;
+            return;
+        }
+        if (queue_drained)
+        {
+            // Com GS assincrono, le DISPFB e o voto apenas apos os comandos
+            // enfileirados. No GS sincrono, gs_q_drain retorna imediatamente.
+            const uint64_t wait_start = g_perf_gs ? prof_now() : 0;
+            gs_q_drain();
+            if (g_perf_gs) g_present_profile.queue_wait_ns += prof_now() - wait_start;
+            flip = g_gs_flips.load(std::memory_order_relaxed);
+        }
 
         DispParams d;
 
         if (!gs_display_params(d))
+        {
+            if (g_perf_gs) ++g_present_profile.invalid;
             return;
+        }
 
         // Campo: o jogo desloca meia linha (OFY / Y dos sprites) nos quadros "impares". Por padrao so os quadros "pares" sao
-        // mostrados (eliminou o tremor nos testes); PS2_FIELDLOCK=0 mostra todos, com a compensacao de PS2_FIELDSHIFT linhas
-        // de saida (padrao 1; pode ser negativo) nos impares.
+        // mostrados (eliminou o tremor nos testes). PS2_FIELDLOCK=0 permite os dois campos.
+        // PS2_FIELDSHIFT controla o deslocamento no caminho sem reconstrucao espacial.
         static const bool fieldlock = !(std::getenv("PS2_FIELDLOCK") != nullptr && std::getenv("PS2_FIELDLOCK")[0] == '0');
+        // Teste K: reconstrucao APENAS ESPACIAL, com linhas da MESMA imagem.
+        // A reconstrucao usa apenas pixels da imagem atual. O ajuste opcional
+        // abaixo usa g_half_vote para alinhar a imagem ja reconstruida.
+        // Os testes I/J usavam capturas temporais: com 4-6 FPS a defasagem vira tremor.
+        static const char* const field_recon_k = std::getenv("PS2_FIELD_RECON");
+        const bool spatial_active = field_recon_k != nullptr
+            && std::strcmp(field_recon_k, "spatial") == 0
+            && d.magv == 2 && d.h >= 2 && d.w >= 3;
 
-        if (fieldlock && d.magv > 1 && g_half_vote[(d.fbp / 32) & 0x1FF] > 0.0f)
+        // O FIELDLOCK legado e aplicado inclusive ao modo espacial.
+        // Teste L: respeita FIELDLOCK tambem no modo espacial.
+        // No K, !spatial_active ignorava o bloqueio e exibia quadros de
+        // posicionamento vertical diferente, causando a tremulacao observada.
+        // Manter o descarte legado ate modelarmos a paridade real do GS.
+        const unsigned fbp_index = (d.fbp / 32u) & 0x1FFu;
+        const float vote = g_half_vote[fbp_index];
+        const FieldRasterState& raster_state = g_field_raster_state[fbp_index];
+        // A captura do vagao encontrou dois vertices com OFY=0 no
+        // mesmo layout CT32. Mantem esses vertices onde foram desenhados.
+        // Qualquer outro estado desconhecido continua vetando a excecao.
+        const bool train_zero_pair = raster_state.shifted_train &&
+            raster_state.unknown == 2u && raster_state.zero_origin == 2u;
+        const bool raster_field = g_field_raster && spatial_active &&
+            g_gs_crt_int && g_gs_crt_ffmd && d.magv == 2u &&
+            d.w == 640u && d.h == 448u && d.fbw == 10u && d.psm == 0u &&
+            d.dbx == 0u && d.dby == 0u && (d.fbp == 0u || d.fbp == 2240u) &&
+            raster_state.shifted != 0 && (raster_state.unknown == 0 || train_zero_pair) &&
+            (raster_state.base == 0 || raster_state.shifted_train);
+        FieldFlipAudit* audit = nullptr;
+        if (g_field_audit && flip != 0)
+        {
+            FieldFlipAudit& entry = g_field_flips[flip % kFieldAuditCapacity];
+            if (entry.flip == flip && entry.fbp == d.fbp / 32u)
+            {
+                audit = &entry;
+                ++audit->checked;
+                audit->present_vote = (int)vote;
+            }
+        }
+        if (fieldlock && d.magv > 1 && vote > 0.0f && !raster_field)
+        {
+            if (g_field_raster)
+            {
+                g_present_profile.raster_mixed += raster_state.base != 0;
+                g_present_profile.raster_unknown += raster_state.unknown != 0;
+                if (g_field_train_diag && raster_state.unknown != 0)
+                    g_field_train_sample = {flip, fbp_index, d.w, d.h, d.magv, d.fbw, d.psm, raster_state};
+            }
+            if (audit != nullptr) ++audit->blocked;
+            if (g_perf_gs) ++g_present_profile.fieldlock;
             return;
+        }
 
+        // Mede o trabalho de apresentacao a partir daqui. A espera para
+        // drenar comandos do GS nao deve prolongar o prazo entre quadros.
+        const auto work_start = clk::now();
         const uint64_t prof_t0 = prof_now();
-        std::vector<uint32_t> pix((size_t)d.w * d.h);
-        const bool c16 = d.psm == 0x02 || d.psm == 0x0A;
+        // O swap devolve o buffer anterior para a proxima apresentacao.
+        static std::vector<uint32_t> pix;
+        pix.resize((size_t)d.w * d.h);
+        static GsScanoutRow scanout;
+        static const bool scanout_fast = [] {
+            const char* value = std::getenv("PS2_GS_SCANOUT_FAST");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
 
         // campo impar: desloca PS2_FIELDSHIFT * (MAGV / 2) linhas de saida; PS2_NOFIELDFIX=1 desliga
         static const bool nofix = std::getenv("PS2_NOFIELDFIX") != nullptr;
         static const int fieldshift = std::getenv("PS2_FIELDSHIFT") != nullptr ? std::atoi(std::getenv("PS2_FIELDSHIFT")) : 1;
-        const bool half = !nofix && d.magv > 1 && g_half_vote[(d.fbp / 32) & 0x1FF] > 0.0f;
+        const bool half = !nofix && !raster_field && d.magv > 1 && vote > 0.0f;
         const int shift = half ? fieldshift * (int)(d.magv / 2) : 0;
         const uint32_t nlines = (d.h + d.magv - 1) / d.magv;
         static const bool nosmoothv = std::getenv("PS2_NOSMOOTHV") != nullptr;
+        FontCapture capture;
+        // Aguarda uma imagem elegivel para que os tres arquivos sejam do
+        // mesmo framebuffer, com os mesmos registradores e conteudo de VRAM.
+        if (capture_pending && g_font_capture_request.exchange(false))
+        {
+            capture.flip = flip;
+            capture.fbp = d.fbp / 32u;
+            capture.psm = d.psm;
+            capture.magv = d.magv;
+            capture.w = d.w;
+            capture.source_h = nlines;
+            capture.h = d.h;
+            capture.spatial = spatial_active;
+            capture.native_ui = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+            capture.source.resize((size_t)d.w * nlines);
+            for (uint32_t y = 0; y < nlines; ++y)
+                scanout.read(capture.source.data() + (size_t)y * d.w, d, y, scanout_fast);
+        }
 
-        if (!nosmoothv && shift == 0 && d.magv == 2 && nlines >= 2)
+        if (spatial_active)
+        {
+            // Snapshot do MESMO framebuffer (FBP/DBX/DBY) na resolucao de origem.
+            // O jogo usa aproximadamente 640x224 por framebuffer, alternando FBP 0/70.
+            // Ler 448 linhas diretamente invadiria o proximo framebuffer: nao fazer isso.
+            // Esta espera e custo diagnostico; NAO e uma otimizacao de desempenho.
+            if (!queue_drained)
+                gs_q_drain();
+            static std::vector<uint32_t> source;
+            source.resize((size_t)nlines * d.w);
+            for (uint32_t y = 0; y < nlines; ++y)
+                scanout.read(&source[(size_t)y * d.w], d, y, scanout_fast);
+
+            // Reconstrucao edge-directed apenas de linhas IMPARES ausentes.
+            // Evita combinar duas capturas de tempos diferentes (weave I/J), que
+            // produziram a oscilacao. Preserva as linhas pares do GS pixel a pixel.
+            auto avg_rgb = [](uint32_t a, uint32_t b) -> uint32_t
+            {
+                return ((a & 0xFEFEFEFEu) >> 1) + ((b & 0xFEFEFEFEu) >> 1)
+                    + (a & b & 0x01010101u);
+            };
+            auto color_delta = [](uint32_t a, uint32_t b) -> int
+            {
+                return std::abs((int)(a & 255u) - (int)(b & 255u))
+                    + std::abs((int)((a >> 8) & 255u) - (int)((b >> 8) & 255u))
+                    + std::abs((int)((a >> 16) & 255u) - (int)((b >> 16) & 255u));
+            };
+            uint64_t diagonals = 0;
+            for (uint32_t y = 0; y < d.h; ++y)
+            {
+                const uint32_t row = std::min(y / 2u, nlines - 1u);
+                const uint32_t* a = &source[(size_t)row * d.w];
+                uint32_t* out = &pix[(size_t)y * d.w];
+                if ((y & 1u) == 0u || row + 1u >= nlines)
+                {
+                    std::memcpy(out, a, (size_t)d.w * sizeof(uint32_t));
+                    continue;
+                }
+                const uint32_t* b = &source[(size_t)(row + 1u) * d.w];
+                for (uint32_t x = 0; x < d.w; ++x)
+                {
+                    const int vertical = color_delta(a[x], b[x]);
+                    uint32_t top = a[x], bottom = b[x];
+                    // Escolhe vizinhos diagonais APENAS se ambos concordarem muito
+                    // melhor que a interpolacao vertical. Na duvida, preserva a media.
+                    // Com delta vertical <= 30, nenhuma diagonal pode
+                    // satisfazer o limiar abaixo. A media permanece identica.
+                    if (x > 0u && x + 1u < d.w && (!scanout_fast || vertical > 30))
+                    {
+                        const int left = color_delta(a[x - 1u], b[x + 1u]);
+                        const int right = color_delta(a[x + 1u], b[x - 1u]);
+                        if (left + 30 < vertical && left + 12 < right)
+                        {
+                            top = a[x - 1u]; bottom = b[x + 1u]; ++diagonals;
+                        }
+                        else if (right + 30 < vertical && right + 12 < left)
+                        {
+                            top = a[x + 1u]; bottom = b[x - 1u]; ++diagonals;
+                        }
+                    }
+                    out[x] = avg_rgb(top, bottom);
+                }
+            }
+            static unsigned reports_k = 0;
+            if (reports_k++ < 12u || (reports_k & 255u) == 0u)
+                std::fprintf(stderr,
+                    "  [GS FIELD K] modo=spatial FBP=%u FFMD=%u fonte=%ux%u saida=%ux%u diagonais=%llu (sem weave)\n",
+                    d.fbp / 32u, g_gs_crt_ffmd, d.w, nlines, d.w, d.h,
+                    (unsigned long long)diagonals);
+        }
+        else if (!nosmoothv && shift == 0 && d.magv == 2 && nlines >= 2)
         {
             // linhas pares = linha da fonte; impares = media das duas vizinhas (em vez de duplicar: bordas menos "quadradas")
-            std::vector<uint32_t> L((size_t)nlines * d.w);
+            static std::vector<uint32_t> L;
+            L.resize((size_t)nlines * d.w);
 
-            for (uint32_t by = 0; by < nlines; by++)
-                for (uint32_t x = 0; x < d.w; x++)
-                {
-                    uint32_t v = gs_read_px(d.psm, d.fbp, d.fbw, d.dbx + x, d.dby + by);
-                    L[(size_t)by * d.w + x] = c16 ? ((((v & 31u) << 3) << 16) | ((((v >> 5) & 31u) << 3) << 8) | (((v >> 10) & 31u) << 3))
-                                                  : (((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu));
-                }
+            for (uint32_t by = 0; by < nlines; ++by)
+                scanout.read(&L[(size_t)by * d.w], d, by, scanout_fast);
 
             for (uint32_t r = 0; r < d.h; r++)
             {
@@ -5681,45 +7864,308 @@ namespace
             }
         }
         else
-        for (uint32_t by = 0; by < nlines; by++)
         {
-            int r0 = (int)(by * d.magv) + shift, r1 = r0 + (int)d.magv;
+            if (shift != 0)
+                std::fill(pix.begin(), pix.end(), 0u);
 
-            if (by == 0) r0 = 0;                 // a primeira linha cobre o topo
-            if (by + 1 == nlines) r1 = (int)d.h; // a ultima cobre o fim
-
-            const int lo = std::max(0, r0), hi = std::min((int)d.h, r1);
-
-            if (lo >= hi)
-                continue;
-
-            uint32_t* row = &pix[(size_t)lo * d.w];
-
-            for (uint32_t x = 0; x < d.w; x++)
+            for (uint32_t by = 0; by < nlines; by++)
             {
-                uint32_t v = gs_read_px(d.psm, d.fbp, d.fbw, d.dbx + x, d.dby + by);
+                int r0 = (int)(by * d.magv) + shift, r1 = r0 + (int)d.magv;
 
-                if (c16)
-                    row[x] = (((v & 31u) << 3) << 16) | ((((v >> 5) & 31u) << 3) << 8) | (((v >> 10) & 31u) << 3);
-                else
-                    row[x] = ((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu);
+                if (by == 0) r0 = 0;                 // a primeira linha cobre o topo
+                if (by + 1 == nlines) r1 = (int)d.h; // a ultima cobre o fim
+
+                const int lo = std::max(0, r0), hi = std::min((int)d.h, r1);
+
+                if (lo >= hi)
+                    continue;
+
+                uint32_t* row = &pix[(size_t)lo * d.w];
+
+                scanout.read(row, d, by, scanout_fast);
+
+                for (int r = lo + 1; r < hi; r++)
+                    std::memcpy(&pix[(size_t)r * d.w], row, (size_t)d.w * sizeof(uint32_t));
             }
-
-            for (int r = lo + 1; r < hi; r++)
-                std::memcpy(&pix[(size_t)r * d.w], row, (size_t)d.w * sizeof(uint32_t));
         }
 
+        if (capture.w != 0)
+            capture.reconstructed = pix;
+
+        // Teste U: um resumo dos estados TEX1/filtragem da geometria 3D.
+        // Nao consulta a VRAM nem altera a imagem. O primeiro resumo sera
+        // emitido assim que for apresentado um framebuffer de batalha.
+        if (gs_tex_u_audit_enabled())
+        {
+            static unsigned reports_u = 0;
+            const uint64_t total = g_tex_u_3d.load(std::memory_order_relaxed);
+            if (total > 0u && (reports_u++ < 10u || (reports_u & 255u) == 0u))
+                std::fprintf(stderr,
+                    "  [GS TEX U] resumo tri3d=%llu bilinear=%llu nearest=%llu bias=%.3f "
+                    "FBP=%u (cumulativo)\n",
+                    (unsigned long long)total,
+                    (unsigned long long)g_tex_u_linear.load(std::memory_order_relaxed),
+                    (unsigned long long)g_tex_u_nearest.load(std::memory_order_relaxed),
+                    (double)gs_tex_uv_bias_u(), d.fbp / 32u);
+        }
+
+        // Teste T: AA guiado pelas arestas REAIS dos triangulos rasterizados,
+        // nao por contraste da tela inteira (diferente do teste S).
+        // Conserva VRAM, Z, DMA e a camada de fonte P/R intactos.
+        if (gs_edge_t_enabled() && spatial_active && d.w == 640u && d.h == 448u &&
+            d.fbw == 10u && d.psm == 0u && d.dbx == 0u && d.dby == 0u &&
+            (d.fbp == 0u || d.fbp == 2240u))
+        {
+            const uint64_t t_edge = prof_now();
+            std::vector<GsEdgeT> edges;
+            {
+                std::lock_guard<std::mutex> lock(g_edge_t_mu);
+                edges = g_edge_t_frame[d.fbp == 0u ? 0 : 1];
+            }
+            uint32_t count = 0u;
+            if (edges.size() == 640u * 224u)
+            {
+                // Fonte de comparacao imutavel: os pixels ja modificados
+                // nao influenciam o proximo pixel (evita borrar em cadeia).
+                const std::vector<uint32_t> original = pix;
+                for (unsigned y = 1; y < 223; ++y)
+                    for (unsigned x = 1; x < 639; ++x)
+                    {
+                        const GsEdgeT& e = edges[(size_t)y * 640u + x];
+                        if (e.coverage == 0u || e.coverage >= 4u ||
+                            (unsigned)(g_gs_vsyncs - e.vsync) > 60u)
+                            continue;
+                        // Desenhos posteriores (sprites/menu/outros modelos)
+                        // invalidam automaticamente esta anotacao via cor.
+                        const uint32_t current = gs_read_px(0x00u, d.fbp, d.fbw, x, y);
+                        if (current != e.rgba)
+                            continue;
+                        const int nx = (int)x + (int)e.outside_x;
+                        const int ny = (int)y + (int)e.outside_y;
+                        if (nx < 0 || nx >= 640 || ny < 0 || ny >= 224)
+                            continue;
+                        // Apenas transicoes perceptiveis, evitando suavizar
+                        // detalhes internos das texturas.
+                        for (int sub = 0; sub < 2; ++sub)
+                        {
+                            const size_t dstidx = ((size_t)y * 2u + (size_t)sub) * 640u + x;
+                            const size_t srcidx = ((size_t)ny * 2u + (size_t)sub) * 640u + (unsigned)nx;
+                            const uint32_t fg = original[dstidx], bg = original[srcidx];
+                            const int diff = std::abs((int)((fg >> 16) & 255u) - (int)((bg >> 16) & 255u))
+                                           + std::abs((int)((fg >> 8) & 255u) - (int)((bg >> 8) & 255u))
+                                           + std::abs((int)(fg & 255u) - (int)(bg & 255u));
+                            if (diff < 36)
+                                continue;
+                            // Mistura moderada: fator externo = (4 - cobertura)/8.
+                            // Mais conservador que apagar 100% do sample ausente.
+                            const unsigned outside = 4u - e.coverage;
+                            const unsigned inside = 8u - outside;
+                            const unsigned r = ((((fg >> 16) & 255u) * inside) + (((bg >> 16) & 255u) * outside) + 4u) / 8u;
+                            const unsigned g = ((((fg >> 8) & 255u) * inside) + (((bg >> 8) & 255u) * outside) + 4u) / 8u;
+                            const unsigned b = (((fg & 255u) * inside) + ((bg & 255u) * outside) + 4u) / 8u;
+                            pix[dstidx] = (r << 16) | (g << 8) | b;
+                            ++count;
+                        }
+                    }
+            }
+            static unsigned reports_t = 0;
+            if (reports_t++ < 10u || (reports_t & 255u) == 0u)
+                std::fprintf(stderr,
+                    "  [GS EDGE T] cobertura_2x2=1 fbp=%u triangulos=%llu bordas_amostradas=%llu pixels_suavizados=%u tempo=%llu ms (VRAM intacta)\n",
+                    d.fbp / 32u,
+                    (unsigned long long)g_edge_t_triangles.load(std::memory_order_relaxed),
+                    (unsigned long long)g_edge_t_border_pixels.load(std::memory_order_relaxed),
+                    count, (unsigned long long)((prof_now() - t_edge) / 1000000u));
+        }
+
+        // Teste S (cena): antisserrilhamento na APRESENTACAO, depois da
+        // reconstrucao espacial e ANTES de sobrepor a fonte P/R.
+        // Nao modifica a VRAM nem os triangulos originais do PS2.
+        static const char* edgeaa_scene = std::getenv("PS2_GS_PRESENT_AA");
+        if (edgeaa_scene != nullptr && edgeaa_scene[0] != '0')
+        {
+            const uint64_t start = prof_now();
+            const uint32_t changed = gs_aa_apply_s(pix, (int)d.w, (int)d.h,
+                30.0f, 3.0f, 0.85f, nullptr);
+            static unsigned reports = 0;
+            if (reports++ < 8u)
+                std::fprintf(stderr,
+                    "  [GS AA S] cena=1 alterados=%u %ux%u tempo=%llu ms (somente apresentacao)\n",
+                    changed, d.w, d.h,
+                    (unsigned long long)((prof_now() - start) / 1000000u));
+        }
+
+        // Teste A/B: alinha somente o framebuffer conhecido do jogo quando o
+        // voto identifica um campo deslocado. O sinal indica a direcao na tela.
+        static const int align_shift = []
+        {
+            const char* value = std::getenv("PS2_FIELD_SPATIAL_ALIGN");
+            if (value == nullptr) return 0;
+            if (std::strcmp(value, "1") == 0 || std::strcmp(value, "+1") == 0) return 1;
+            return std::strcmp(value, "-1") == 0 ? -1 : 0;
+        }();
+        if (align_shift != 0 && spatial_active && half && g_gs_crt_int && g_gs_crt_ffmd &&
+            d.w == 640u && d.h == 448u && d.fbw == 10u && d.psm == 0u &&
+            d.dbx == 0u && d.dby == 0u && (d.fbp == 0u || d.fbp == 2240u))
+        {
+            gs_align_spatial_field(pix.data(), d.w, d.h, align_shift);
+            if (g_perf_gs) ++g_present_profile.aligned;
+        }
+
+        // Teste P: compoe o TEXTO da propria imagem/FBP sobre o resultado
+        // de 640x448. Nao faz weave e nao altera o FIELDLOCK do teste L.
+        // O blend GS ALPHA=0x44 e (fonte-destino)*alfa/128+destino.
+        static const bool ui_native_present = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+        if (ui_native_present && d.magv == 2u && d.w == 640u && d.h == 448u &&
+            d.dbx == 0u && d.dby == 0u)
+        {
+            std::vector<UiGlyphP> glyphs;
+            {
+                std::lock_guard<std::mutex> lk(g_ui_native_mu);
+                for (const UiGlyphP& glyph : g_ui_native_glyphs)
+                    if (glyph.fbp == d.fbp &&
+                        (unsigned)(g_gs_vsyncs - glyph.vsync) <= 60u)
+                        glyphs.push_back(glyph);
+            }
+            for (const UiGlyphP& glyph : glyphs)
+                for (int gy = 0; gy < glyph.h; ++gy)
+                {
+                    const int dy = glyph.y + gy;
+                    if (dy < 0 || dy >= (int)d.h) continue;
+                    for (int gx = 0; gx < glyph.w; ++gx)
+                    {
+                        const int dx = glyph.x + gx;
+                        if (dx < 0 || dx >= (int)d.w) continue;
+                        const uint32_t tex = glyph.rgba[(size_t)gy * glyph.w + gx];
+                        const int alpha = (int)((tex >> 24) & 255u);
+                        if (alpha == 0) continue;
+                        uint32_t& dst = pix[(size_t)dy * d.w + dx];
+                        const int sr = (int)(tex & 255u), sg = (int)((tex >> 8) & 255u);
+                        const int sb = (int)((tex >> 16) & 255u);
+                        const int dr = (int)((dst >> 16) & 255u);
+                        const int dg = (int)((dst >> 8) & 255u);
+                        const int db = (int)(dst & 255u);
+                        const int nr = gs_clamp255(dr + (((sr - dr) * alpha) >> 7));
+                        const int ng = gs_clamp255(dg + (((sg - dg) * alpha) >> 7));
+                        const int nb = gs_clamp255(db + (((sb - db) * alpha) >> 7));
+                        dst = (uint32_t)((nr << 16) | (ng << 8) | nb);
+                    }
+                }
+            // Teste S (letras): alternativa independente, opcional e restrita
+            // aos retangulos dos quatro sprites do atlas P/R ja compostos.
+            // Aplicar APOS a composicao evita misturar novamente as linhas
+            // do glifo como acontecia com o filtro vertical do teste O.
+            static const char* edgeaa_ui = std::getenv("PS2_GS_UI_EDGEAA");
+            if (edgeaa_ui != nullptr && edgeaa_ui[0] != '0' && !glyphs.empty())
+            {
+                const uint64_t start = prof_now();
+                const uint32_t changed = gs_aa_apply_s(pix, (int)d.w, (int)d.h,
+                    20.0f, 1.5f, 0.25f, &glyphs);
+                static unsigned reports_ui = 0;
+                if (reports_ui++ < 8u)
+                    std::fprintf(stderr,
+                        "  [GS AA S] letras=1 glifos=%zu alterados=%u tempo=%llu ms\n",
+                        glyphs.size(), changed,
+                        (unsigned long long)((prof_now() - start) / 1000000u));
+            }
+            static unsigned reported_p = 0;
+            if (!glyphs.empty() && reported_p++ < 10u)
+                std::fprintf(stderr,
+                    "  [GS UI P] apresentacao_nativa fbp=%u glifos=%zu (sem weave)\n",
+                    d.fbp / 32u, glyphs.size());
+        }
+
+        if (capture.w != 0)
+            capture.final = pix;
         {
             std::lock_guard<std::mutex> lk(g_win_mu);
+            if (capture.w != 0)
+                g_font_capture = std::move(capture);
             g_win_pix.swap(pix);
             g_win_w = d.w;
             g_win_h = d.h;
+            // Publica a sequencia junto com os pixels e as dimensoes.
+            g_win_seq.fetch_add(1);
         }
 
-        g_win_seq.fetch_add(1);
+        if (audit != nullptr) ++audit->published;
+        if (!queue_drained)
+            flip = g_gs_flips.load(std::memory_order_relaxed);
+        if (g_perf_gs)
+        {
+            // Conta publicacoes efetivas, depois do FIELDLOCK.
+            if (pacing.published && flip == pacing.last_flip)
+                ++g_present_profile.same_flip;
+            if (raster_field && (!pacing.published || flip != pacing.last_flip))
+            {
+                ++g_present_profile.raster_fields;
+                if (raster_state.shifted_train) ++g_present_profile.raster_train;
+                if (train_zero_pair && fieldlock && vote > 0.0f) ++g_present_profile.raster_train_zero;
+                g_present_profile.raster_sprite_vertices += raster_state.shifted_sprite;
+                g_present_profile.raster_triangle_vertices += raster_state.shifted_triangle;
+            }
+            if (early)
+                ++g_present_profile.early_flip;
+        }
         g_prof_present_ns += prof_now() - prof_t0;
-        const clk::time_point t1 = clk::now();
-        next = t1 + std::max<clk::duration>(std::chrono::milliseconds(33), (t1 - t0) * 3);
+        static const bool legacy_pacing = std::getenv("PS2_GS_LEGACY_PACING") != nullptr;
+        pacing.did_publish(work_start, clk::now(), flip, legacy_pacing);
+    }
+
+    static void gs_save_bmp(const char* name, const std::vector<uint32_t>& pixels,
+                            uint32_t width, uint32_t height)
+    {
+        const uint32_t stride = (width * 3 + 3) & ~3u;
+        const uint32_t image_bytes = stride * height;
+        const uint32_t size = 54 + image_bytes, offset = 54, dib = 40, planes_bpp = (24u << 16) | 1u;
+        const int32_t top_down_height = -(int32_t)height;
+        unsigned char header[54] = {'B', 'M'};
+        std::memcpy(header + 2, &size, 4);
+        std::memcpy(header + 10, &offset, 4);
+        std::memcpy(header + 14, &dib, 4);
+        std::memcpy(header + 18, &width, 4);
+        std::memcpy(header + 22, &top_down_height, 4);
+        std::memcpy(header + 26, &planes_bpp, 4);
+        std::memcpy(header + 34, &image_bytes, 4);
+        std::vector<unsigned char> line(stride, 0);
+        FILE* f = std::fopen(name, "wb");
+        if (f == nullptr)
+        {
+            std::fprintf(stderr, "  [captura] falha ao abrir %s\n", name);
+            return;
+        }
+
+        bool ok = std::fwrite(header, 1, sizeof(header), f) == sizeof(header);
+        for (uint32_t y = 0; ok && y < height; ++y)
+        {
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint32_t p = pixels[(size_t)y * width + x];
+                line[x * 3] = (unsigned char)p;
+                line[x * 3 + 1] = (unsigned char)(p >> 8);
+                line[x * 3 + 2] = (unsigned char)(p >> 16);
+            }
+            ok = std::fwrite(line.data(), 1, stride, f) == stride;
+        }
+        if (std::fclose(f) != 0) ok = false;
+        std::fprintf(stderr, "  [captura] %s %s\n", name, ok ? "gravado" : "falha na gravacao");
+    }
+
+    static void gs_save_font_capture(const FontCapture& capture)
+    {
+        static unsigned shots = 0;
+        const unsigned id = ++shots;
+        char name[80];
+        std::fprintf(stderr,
+            "  [captura fonte] id=%u troca=%u FBP=%u PSM=%02X MAGV=%u spatial=%u ui_native=%u\n",
+            id, capture.flip, capture.fbp, capture.psm, capture.magv,
+            (unsigned)capture.spatial, (unsigned)capture.native_ui);
+        std::snprintf(name, sizeof name, "gs_fonte_%u_vram.bmp", id);
+        gs_save_bmp(name, capture.source, capture.w, capture.source_h);
+        std::snprintf(name, sizeof name, "gs_fonte_%u_recon.bmp", id);
+        gs_save_bmp(name, capture.reconstructed, capture.w, capture.h);
+        std::snprintf(name, sizeof name, "gs_fonte_%u_final.bmp", id);
+        gs_save_bmp(name, capture.final, capture.w, capture.h);
     }
 
     // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
@@ -5771,11 +8217,457 @@ namespace
             w, (h + magv - 1) / magv, magv, psm, fbp / 32, fbw, (unsigned long long)display, (unsigned long long)g_st.unsupported);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // GS assincrono (PS2_GS_THREAD=1): a thread do EE so decodifica o GIF e enfileira os comandos; uma thread propria
+    // executa, EM ORDEM, os registradores do GS (inclui os desenhos), as transferencias de imagem e as trocas de tela.
+    // Assim o rasterizador roda em paralelo com o codigo do jogo e do VU1 em vez de em serie com ele.
+    // Estado do GS (g_st, VRAM, cache de CLUT) so e tocado pela thread do GS; a fila e SPSC (um produtor, um consumidor).
+    // ---------------------------------------------------------------------------------------------
+    struct GsCmd { uint64_t a, b; uint32_t kind, reg; };   // kind: 0 = registrador, 1 = qword de imagem, 2 = registrador privilegiado
+
+    constexpr uint32_t kGsQSize = 1u << 18;
+    GsCmd g_gsq[kGsQSize];
+    std::atomic<uint64_t> g_gsq_head{0}, g_gsq_tail{0};
+    std::atomic<bool> g_gsq_stop{false};
+    std::atomic<uint64_t> g_gsq_busy_ns{0};
+    // Diagnostico: tempo e numero de esperas por fila cheia.
+    std::atomic<uint64_t> g_gsq_full_wait_ns{0};
+    std::atomic<uint64_t> g_gsq_full_wait_count{0};
+    const bool g_gs_async = std::getenv("PS2_GS_THREAD") != nullptr;
+
+    static const bool g_gsq_start_fast = [] {
+        const char* value = std::getenv("PS2_GS_START_FAST");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    // Assim como write_head, esta marca pertence ao produtor da fila.
+    static bool g_gsq_started = false;
+
+    static const bool g_gsq_batch = [] {
+        const char* value = std::getenv("PS2_GS_QUEUE_BATCH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    // Reutiliza os cursores do produtor mesmo sem publicar em lotes.
+    static const bool g_gsq_local_cursor = [] {
+        const char* value = std::getenv("PS2_GS_LOCAL_CURSOR");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool g_gsq_use_local_cursor = g_gsq_batch || g_gsq_local_cursor;
+    // So o produtor modifica estes cursores. O consumidor ve apenas
+    // os comandos anteriores ao head publicado com release.
+    static uint64_t g_gsq_write_head = 0, g_gsq_safe_tail = 0;
+    static uint64_t g_gsq_publications = 0;
+    constexpr unsigned kGsPublishBatch = 16;
+
+    static const bool g_gsq_wake_on_work = [] {
+        const char* value = std::getenv("PS2_GS_WAKE_ON_WORK");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static std::mutex g_gsq_work_mu;
+    static std::condition_variable g_gsq_work_cv;
+    static std::atomic<bool> g_gsq_worker_waiting{false};
+    static std::atomic<uint64_t> g_gsq_work_wakes{0};
+
+    // O consumidor marca a espera antes de reler head. O produtor
+    // publica head antes de ler a marca. A ordem sequencial impede
+    // que ambos deixem de observar a atualizacao do outro.
+    static void gs_q_publish(uint64_t head)
+    {
+        if (g_perf_gs) ++g_gsq_publications;
+        if (!g_gsq_wake_on_work)
+        {
+            g_gsq_head.store(head, std::memory_order_release);
+            return;
+        }
+
+        g_gsq_head.store(head, std::memory_order_seq_cst);
+        if (g_gsq_worker_waiting.load(std::memory_order_seq_cst))
+        {
+            std::lock_guard<std::mutex> lk(g_gsq_work_mu);
+            g_gsq_work_cv.notify_one();
+        }
+    }
+
+    static const bool g_gsq_limit_flips = [] {
+        const char* value = std::getenv("PS2_GS_LIMIT_FLIPS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+
+    // O EE pode comecar a desenhar o campo seguinte, mas espera pela
+    // conclusao do DISPFB anterior antes de publicar outra troca na fila.
+    // Estado de escrita do produtor separado dos registradores do worker.
+    static uint64_t g_gsq_pmode = 0, g_gsq_dispfb[2] = {};
+    static uint64_t g_gsq_last_flip_end = 0;
+    static uint64_t g_gsq_flip_wait_ns = 0, g_gsq_flip_waits = 0;
+    static std::mutex g_gsq_flip_mu;
+    static std::condition_variable g_gsq_flip_cv;
+    static uint64_t g_gsq_priv_done = 0; // Protegido por g_gsq_flip_mu.
+
+    static uint32_t gs_active_dispfb(uint64_t pmode)
+    {
+        return (pmode & 1u) ? 0x12000070u : 0x12000090u;
+    }
+
+    static bool gs_changed_fbp(uint64_t value, uint64_t previous)
+    {
+        return ((value ^ previous) & 0x1FFu) != 0;
+    }
+
+    static bool gs_queue_wait_previous_flip(uint32_t reg, uint64_t value)
+    {
+        if (reg == 0x12000000u)
+            g_gsq_pmode = value;
+        if (reg != 0x12000070u && reg != 0x12000090u)
+            return false;
+
+        uint64_t& previous = g_gsq_dispfb[reg == 0x12000090u];
+        const bool flip = reg == gs_active_dispfb(g_gsq_pmode) && gs_changed_fbp(value, previous);
+        previous = value;
+        if (flip && g_gsq_last_flip_end != 0)
+        {
+            std::unique_lock<std::mutex> lk(g_gsq_flip_mu);
+            if (g_gsq_priv_done < g_gsq_last_flip_end)
+            {
+                const uint64_t start = prof_now();
+                g_gsq_flip_cv.wait(lk, [] { return g_gsq_priv_done >= g_gsq_last_flip_end; });
+                g_gsq_flip_wait_ns += prof_now() - start;
+                ++g_gsq_flip_waits;
+            }
+        }
+        return flip;
+    }
+
+    struct CadenceGsProfile
+    {
+        unsigned gaps[5] = {}; // 0, 1, 2, 3 ou pelo menos 4 VBLANKs entre trocas.
+        uint64_t max_gap_ns = 0;
+    };
+    std::mutex g_cadence_gs_mu;
+    CadenceGsProfile g_cadence_gs;
+
+    static void gs_profile_flip()
+    {
+        // Chamado pelo GS sincrono ou pelo worker. O contador de VBLANKs
+        // representa entregas no EE ate a aplicacao do DISPFB pelo GS.
+        const uint64_t now = prof_now();
+        const uint64_t vblank = g_vsync_del.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(g_cadence_gs_mu);
+        static uint64_t last_ns = 0, last_vblank = 0;
+        if (last_ns != 0)
+        {
+            const unsigned bucket = (unsigned)std::min<uint64_t>(vblank - last_vblank, 4u);
+            ++g_cadence_gs.gaps[bucket];
+            g_cadence_gs.max_gap_ns = std::max(g_cadence_gs.max_gap_ns, now - last_ns);
+        }
+        last_ns = now;
+        last_vblank = vblank;
+    }
+
+    // registrador privilegiado do GS (PMODE, DISPFB1/2, DISPLAY1/2...): diz qual area e exibida
+    void gs_priv_apply(uint32_t phys, uint64_t value, unsigned csr_field)
+    {
+        uint64_t& reg = g_gs_priv[(phys - 0x12000000u) >> 3];
+        if ((phys == 0x12000070u || phys == 0x12000090u) && gs_changed_fbp(value, reg))
+        {
+            // O jogo escreve nos dois DISPFB; so o circuito escolhido conta como troca.
+            const uint32_t active = gs_active_dispfb(g_gs_priv[0]);
+            if (phys == active)
+            {
+                const unsigned flip = g_gs_flips.fetch_add(1) + 1;
+                if (g_perf_cadence) gs_profile_flip();
+                if (g_field_audit)
+                {
+                    const unsigned fbp = (unsigned)(value & 0x1FFu);
+                    const uint64_t display = g_gs_priv[((phys & 0xFFu) + 0x10u) / 8u];
+                    FieldFlipAudit& entry = g_field_flips[flip % kFieldAuditCapacity];
+                    entry = {};
+                    entry.flip = flip;
+                    entry.circuit = phys == 0x12000070u ? 1u : 2u;
+                    entry.csr_field = csr_field;
+                    entry.fbp = fbp;
+                    entry.dy = (unsigned)((display >> 12) & 0x7FFu);
+                    entry.dby = (unsigned)((value >> 43) & 0x7FFu);
+                    entry.vote = (int)g_half_vote[fbp];
+                    entry.sprites = g_field_evidence[fbp];
+                }
+            }
+
+            // O buffer que sai da tela volta a acumular votos para o proximo quadro.
+            const unsigned previous = (unsigned)(reg & 0x1FFu);
+            g_half_vote[previous] = 0.0f;
+            if (g_field_audit) g_field_evidence[previous] = {};
+            if (g_field_raster) g_field_raster_state[previous] = {};
+        }
+
+        reg = value;
+    }
+
+    void gs_exec(const GsCmd& c)
+    {
+        if (c.kind == 0) gs_core_write(c.reg, c.a);
+        else if (c.kind == 1) gs_core_image(c.a, c.b);
+        else gs_priv_apply(c.reg, c.a, (unsigned)c.b);
+    }
+
+    void gs_worker_main()
+    {
+        uint64_t t = 0;
+        unsigned idle = 0;
+
+        while (!g_gsq_stop.load(std::memory_order_relaxed))
+        {
+            const uint64_t h = g_gsq_head.load(std::memory_order_acquire);
+
+            if (t == h)
+            {
+
+                if (g_gsq_wake_on_work)
+                {
+                    std::unique_lock<std::mutex> lk(g_gsq_work_mu);
+                    g_gsq_worker_waiting.store(true, std::memory_order_seq_cst);
+                    g_gsq_work_cv.wait(lk, [t] {
+                        return g_gsq_stop.load(std::memory_order_relaxed) ||
+                            g_gsq_head.load(std::memory_order_seq_cst) != t;
+                    });
+                    g_gsq_worker_waiting.store(false, std::memory_order_seq_cst);
+                    if (g_perf_gs) g_gsq_work_wakes.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                if (++idle < 4000u) std::this_thread::yield();
+                else std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+                continue;
+            }
+
+            idle = 0;
+            const uint64_t t0 = prof_now();
+
+            while (t < h)
+            {
+                const GsCmd& cmd = g_gsq[t & (kGsQSize - 1)];
+                const bool signal_priv = g_gsq_limit_flips && cmd.kind == 2;
+                gs_exec(cmd);
+                ++t;
+
+                if (signal_priv)
+                {
+                    {
+                        std::lock_guard<std::mutex> lk(g_gsq_flip_mu);
+                        g_gsq_priv_done = t;
+                    }
+                    g_gsq_flip_cv.notify_one();
+                }
+                if (signal_priv || (t & 255u) == 0)
+                {
+                    g_gsq_tail.store(t, std::memory_order_release);
+                    if (g_gsq_stop.load(std::memory_order_relaxed))
+                        return;
+                }
+            }
+
+            g_gsq_tail.store(t, std::memory_order_release);
+            g_gsq_busy_ns.fetch_add(prof_now() - t0, std::memory_order_relaxed);
+        }
+    }
+
+    void gs_q_start()
+    {
+        static std::once_flag once;
+        std::call_once(once, []
+        {
+            // Junta o worker antes da destruicao dos mutexes e da fila.
+            static std::thread worker(gs_worker_main);
+            std::atexit([]
+            {
+                // deixa a fila esvaziar um pouco antes de encerrar (evita derrubar a thread no meio de um desenho)
+                for (int i = 0; i < 200 && g_gsq_tail.load() != g_gsq_head.load(); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+                {
+                    std::lock_guard<std::mutex> lk(g_gsq_work_mu);
+                    g_gsq_stop.store(true, std::memory_order_relaxed);
+                }
+                g_gsq_work_cv.notify_one();
+                worker.join();
+            });
+            std::fprintf(stderr, "  [gs] GS assincrono ligado (thread propria; fila de %u comandos)\n", kGsQSize);
+        });
+    }
+
+    static void gs_q_flush_batch()
+    {
+        if (g_gsq_batch && g_gs_async &&
+            g_gsq_write_head != g_gsq_head.load(std::memory_order_relaxed))
+            gs_q_publish(g_gsq_write_head);
+    }
+
+    inline void gs_q_push(uint32_t kind, uint32_t reg, uint64_t a, uint64_t b)
+    {
+        if (!g_gsq_start_fast || !g_gsq_started)
+        {
+            gs_q_start();
+            g_gsq_started = true;
+        }
+        // Escritas privilegiadas e esperas pela troca anterior precisam
+        // enxergar todos os comandos produzidos ate aqui.
+        if (kind == 2) gs_q_flush_batch();
+        const bool flip = g_gsq_limit_flips && kind == 2 && gs_queue_wait_previous_flip(reg, a);
+        const uint64_t h = g_gsq_use_local_cursor ? g_gsq_write_head : g_gsq_head.load(std::memory_order_relaxed);
+        const uint64_t tail = g_gsq_use_local_cursor ? g_gsq_safe_tail : g_gsq_tail.load(std::memory_order_acquire);
+
+        if (h - tail >= kGsQSize)
+        {
+            uint64_t current_tail = g_gsq_tail.load(std::memory_order_acquire);
+            if (h - current_tail >= kGsQSize)
+            {
+                gs_q_flush_batch();
+                const uint64_t wait_start = prof_now();
+                g_gsq_full_wait_count.fetch_add(1, std::memory_order_relaxed);
+                do
+                {
+                    std::this_thread::yield();
+                    current_tail = g_gsq_tail.load(std::memory_order_acquire);
+                }
+                while (h - current_tail >= kGsQSize);
+                g_gsq_full_wait_ns.fetch_add(prof_now() - wait_start, std::memory_order_relaxed);
+            }
+            // Um tail antigo so reduz o espaco estimado. Releia com
+            // acquire antes de reutilizar qualquer slot ainda ocupado.
+            if (g_gsq_use_local_cursor) g_gsq_safe_tail = current_tail;
+        }
+
+        g_gsq[h & (kGsQSize - 1)] = GsCmd{ a, b, kind, reg };
+        if (flip) g_gsq_last_flip_end = h + 1;
+        if (g_gsq_use_local_cursor)
+            g_gsq_write_head = h + 1;
+        if (g_gsq_batch && kind != 2 && (g_gsq_write_head % kGsPublishBatch) != 0)
+            return;
+        gs_q_publish(h + 1);
+    }
+
+    // Espera o GS terminar tudo que ja foi enfileirado (para quem precisa ler a VRAM / o estado do GS).
+    bool gs_q_idle()
+    {
+        return !g_gs_async || g_gsq_tail.load(std::memory_order_acquire) ==
+            g_gsq_head.load(std::memory_order_acquire);
+    }
+
+    void gs_q_drain()
+    {
+        gs_q_flush_batch();
+        while (!gs_q_idle())
+            std::this_thread::yield();
+    }
+
+    uint32_t dma_addr(uint32_t a); // implementada na secao DMA, mais abaixo.
+
+    // Teste H: buffer de um download do GS. Preparado somente se o hardware tiver
+    // enviado TRXDIR=1 (VRAM local -> host) e se o formato de pixel for conhecido.
+    struct GsDownload
+    {
+        uint64_t generation = ~0ull;
+        size_t cursor = 0;
+        std::vector<uint8_t> bytes;
+        uint32_t psm = 0;
+        uint32_t width = 0, height = 0;
+    };
+
+    GsDownload g_gs_download;
+
+    // Empacota os pixels na ordem de transferencia de imagem do GS, little-endian.
+    // O retorno da VRAM NAO transforma os pixels em RGB: preserva o formato PSM.
+    bool gs_prepare_download()
+    {
+        const uint64_t generation = g_st.trx_generation;
+        if (g_gs_download.generation == generation)
+            return !g_gs_download.bytes.empty();
+
+        g_gs_download.generation = generation;
+        g_gs_download.cursor = 0;
+        g_gs_download.bytes.clear();
+
+        if ((g_st.trxdir & 3u) != 1u)
+            return false; // Sem TRXDIR=1, nao existe download GS confirmado.
+
+        const uint64_t blt = g_st.bitbltbuf;
+        const uint32_t bp = (uint32_t)(blt & 0x3FFFu);
+        const uint32_t bw = (uint32_t)((blt >> 16) & 0x3Fu);
+        const uint32_t psm = (uint32_t)((blt >> 24) & 0x3Fu);
+        const uint32_t sx = (uint32_t)(g_st.trxpos & 0x7FFu);
+        const uint32_t sy = (uint32_t)((g_st.trxpos >> 16) & 0x7FFu);
+        const uint32_t w = (uint32_t)(g_st.trxreg & 0xFFFu);
+        const uint32_t h = (uint32_t)((g_st.trxreg >> 32) & 0xFFFu);
+        const uint32_t dir = (uint32_t)((g_st.trxpos >> 59) & 3u);
+
+        // Implementamos apenas formatos e transferencia em ordem direta.
+        // Parametros desconhecidos nao podem alterar a RAM do jogo.
+        unsigned bits = 0;
+        switch (psm)
+        {
+            case 0x00: case 0x30: bits = 32; break;
+            case 0x01: case 0x31: bits = 24; break;
+            case 0x02: case 0x0A: case 0x32: case 0x3A: bits = 16; break;
+            case 0x13: case 0x1B: bits = 8; break;
+            case 0x14: case 0x24: case 0x2C: bits = 4; break;
+            default: return false;
+        }
+
+        const uint64_t pixels = (uint64_t)w * h;
+        const uint64_t byte_count = (pixels * bits + 7u) / 8u;
+        if (bw == 0 || w == 0 || h == 0 || dir != 0 || byte_count == 0 || byte_count > 4u * 1024u * 1024u)
+            return false;
+
+        // QWC e DMA sao alinhados em 16 bytes; apenas o ultimo QW e preenchido.
+        g_gs_download.bytes.assign((size_t)((byte_count + 15u) & ~15ull), 0);
+        g_gs_download.psm = psm;
+        g_gs_download.width = w;
+        g_gs_download.height = h;
+
+        const uint64_t mask = bits == 32 ? 0xFFFFFFFFull : ((1ull << bits) - 1u);
+        for (uint64_t i = 0; i < pixels; ++i)
+        {
+            const uint32_t x = sx + (uint32_t)(i % w);
+            const uint32_t y = sy + (uint32_t)(i / w);
+            const uint64_t pix = (uint64_t)gs_read_px(psm, bp, bw, x, y) & mask;
+            const uint64_t bit = i * bits;
+            // bits pode ser 4/8/16/24/32; todos sao multiplos de 4.
+            for (unsigned b = 0; b < bits; b += 4)
+            {
+                const uint64_t p = bit + b;
+                const size_t at = (size_t)(p >> 3);
+                const unsigned shift = (unsigned)(p & 7u);
+                g_gs_download.bytes[at] |= (uint8_t)(((pix >> b) & 0xFu) << shift);
+            }
+        }
+        return true;
+    }
+
+    // Copia um bloco da transferencia VRAM -> EE RAM. Retorna falso quando nao
+    // ha download valido ou quando a FIFO nao possui dados suficientes.
+    bool gs_download_to_ram(Ctx& c, uint32_t madr, uint32_t qwc)
+    {
+        // Espera o GS terminar os comandos enfileirados ANTES de ler a VRAM.
+        gs_q_drain();
+        if (!gs_prepare_download())
+            return false;
+
+        const uint64_t n = (uint64_t)qwc * 16u;
+        if (n > g_gs_download.bytes.size() - g_gs_download.cursor)
+            return false;
+
+        uint8_t* dst = host_ptr(c, dma_addr(madr), (size_t)n);
+        std::memcpy(dst, g_gs_download.bytes.data() + g_gs_download.cursor, (size_t)n);
+        g_gs_download.cursor += (size_t)n;
+        return true;
+    }
+
     void gs_write(unsigned reg, uint64_t data)
     {
         reg &= 0xFF;
         g_gs.reg[reg]++;
-        gs_core_write(reg, data);
+
+        if (g_gs_async) gs_q_push(0, reg, data, 0);
+        else gs_core_write(reg, data);
 
         if (reg == 0x00)
             g_gs.prim[data & 7]++;
@@ -5829,8 +8721,18 @@ namespace
             {
                 image_left--;
                 g_gs.image_qw++;
-                const ProfScope prof(g_prof_img_ns);
-                gs_core_image(lo, hi);
+                const bool sampled = g_prof_image_qword &&
+                    ((g_gs.image_qw - 1u) & (g_prof_image_stride - 1u)) == 0;
+                const uint64_t start = sampled ? prof_now() : 0;
+
+                if (g_gs_async) gs_q_push(1, 0, lo, hi);
+                else gs_core_image(lo, hi);
+
+                if (sampled)
+                {
+                    g_prof_img_ns += prof_now() - start;
+                    ++g_prof_image_samples;
+                }
                 return;
             }
 
@@ -5940,6 +8842,35 @@ namespace
 
     GifDecoder g_gif;
 
+    // Diagnostico somente de leitura: registra a origem REAL de cada palavra
+    // que o DMA entrega ao VIF1 (tag superior ou payload).
+    // Nao modifica TTE, a ordem do DMA, o VIF ou o GS.
+    struct DmaProbeOrigin
+    {
+        uint32_t tag_addr = 0, word_addr = 0, chcr = 0;
+        unsigned tag_id = 0, lane = 0;
+        bool from_tag = false;
+    };
+    static const bool g_vif1_direct_qword = [] {
+        const char* value = std::getenv("PS2_VIF1_DIRECT_QWORD");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static const bool g_vif1_direct_run = [] {
+        const char* value = std::getenv("PS2_VIF1_DIRECT_RUN");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    static uint64_t g_vif1_direct_runs = 0;
+    static uint64_t g_vif1_direct_fast_qwords = 0;
+
+    const bool g_dma_probe = std::getenv("PS2_DMA_PROBE") != nullptr;
+    const bool g_vif1_tag_nop_fast = [] {
+        const char* value = std::getenv("PS2_VIF1_TAG_NOP_FAST");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    uint64_t g_vif1_tag_nop_pairs = 0;
+
+    DmaProbeOrigin g_dma_probe_origin = {};
+
     // VIF0 / VIF1: interpretam os VIFcodes. Levam micro codigo (MPG) e dados (UNPACK) ao VU0/VU1, disparam
     // programas (MSCAL/MSCALF/MSCNT) e, no VIF1, repassam DIRECT/DIRECTHL ao GIF (PATH2).
     struct VifDecoder
@@ -5959,6 +8890,79 @@ namespace
         uint32_t dbuf[4] = {};
         unsigned dn = 0;
         std::vector<uint32_t> up_words;
+        uint32_t hist[32] = {};     // ultimos VIFcodes decodificados (diagnostico de dessincronia)
+        unsigned hist_n = 0;
+        struct ProbeCommand { uint32_t code = 0; DmaProbeOrigin src = {}; };
+        ProbeCommand probe_hist[16] = {};
+        uint64_t probe_hist_n = 0;
+        int bad_log = 8;
+
+        void probe_dump(const char* reason, uint32_t code)
+        {
+            if (unit != 1 || !g_dma_probe)
+                return;
+
+            const DmaProbeOrigin& o = g_dma_probe_origin;
+            std::fprintf(stderr,
+                "  [DMA PROBE %s] VIF=0x%08X origem=%s addr=0x%08X tag=0x%08X id=%u lane=%u CHCR=0x%X TTE=%u pendentes(DIRECT=%llu MPG=%llu UNPACK=%llu)\n",
+                reason, code, o.from_tag ? "TAG" : "PAYLOAD", o.word_addr,
+                o.tag_addr, o.tag_id, o.lane, o.chcr, (o.chcr & 0x40u) != 0,
+                (unsigned long long)direct_qw, (unsigned long long)mpg_left,
+                (unsigned long long)up_left);
+
+            // Os ultimos 12 comandos, com o endereco da palavra que os originou.
+            const unsigned count = (unsigned)std::min<uint64_t>(12, probe_hist_n);
+            for (unsigned back = count; back > 0; --back)
+            {
+                const ProbeCommand& e = probe_hist[(probe_hist_n - back) & 15u];
+                std::fprintf(stderr,
+                    "    [DMA PROBE HIST] VIF=%08X origem=%s addr=%08X tag=%08X id=%u CHCR=%X\n",
+                    e.code, e.src.from_tag ? "TAG" : "PAYLOAD", e.src.word_addr,
+                    e.src.tag_addr, e.src.tag_id, e.src.chcr);
+            }
+        }
+        bool desync = false;        // VIFcode impossivel visto: o resto da cadeia DMA e lixo e e descartado
+
+        // PS2_VIF_DISCARD=1 (experimental): descarta o resto da cadeia DMA apos um VIFcode invalido e recomeca no proximo DMA.
+        // Por padrao NAO: o hardware trata um VIFcode desconhecido como NOP e segue (as palavras seguintes costumam ser codigos
+        // validos, como ITOP), e descartar a cadeia apagava cenas inteiras da batalha.
+        static bool resync_enabled()
+        {
+            static const bool on = std::getenv("PS2_VIF_DISCARD") != nullptr;
+            return on;
+        }
+
+        // Chamado no inicio de cada DMA em cadeia: um pacote termina sempre em fronteira de comando. Se sobrou dado
+        // pendente, a contagem de palavras de algum comando esta errada: avisa e recomeca em um VIFcode (so com PS2_VIF_DISCARD=1).
+        void boundary(const char* quem)
+        {
+            const bool left = direct_qw != 0 || mpg_left != 0 || up_left != 0 || reg_left != 0 || skip_words != 0 || dn != 0;
+
+            if (!left && !desync)
+                return;
+
+            if (bad_log > 0)
+            {
+                bad_log--;
+                std::fprintf(stderr, "  [VIF%d] %s: pacote anterior terminou no meio de um comando (direct=%llu mpg=%llu unpack=%llu reg=%u skip=%llu dn=%u; unpack fmt=%u num=%u addr=0x%X) - ultimos VIFcodes:",
+                    unit, quem, (unsigned long long)direct_qw, (unsigned long long)mpg_left, (unsigned long long)up_left, reg_left,
+                    (unsigned long long)skip_words, dn, up_fmt, up_num, up_addr);
+
+                for (unsigned i = 0; i < 12 && i < hist_n; i++)
+                    std::fprintf(stderr, " %08X", hist[(hist_n - 1 - i) & 31u]);
+
+                std::fprintf(stderr, "\n");
+            }
+
+            if (resync_enabled())
+            {
+                desync = false;
+                direct_qw = mpg_left = up_left = skip_words = 0;
+                reg_left = 0;
+                dn = 0;
+                up_words.clear();
+            }
+        }
 
         static unsigned vector_bits(unsigned fmt)
         {
@@ -5977,11 +8981,24 @@ namespace
             if (nc[fmt] == 0)
                 return;
 
+            const bool profile = g_perf_vif1 && unit == 1;
+            const uint64_t start = profile ? prof_now() : 0;
+            const bool fast = g_vif1_unpack_fast && unit == 1;
             uint64_t bitpos = 0;
             const uint64_t total = (uint64_t)up_words.size() * 32u;
 
             auto get = [&](unsigned n) -> uint32_t
             {
+                if (fast)
+                {
+                    // Cada UNPACK usa uma largura fixa de 8, 16 ou 32 bits.
+                    // Todos dividem 32 e bitpos comeca em zero: nenhum campo cruza palavras.
+                    const uint32_t word = up_words[(size_t)(bitpos >> 5)];
+                    const unsigned shift = (unsigned)(bitpos & 31u);
+                    bitpos += n;
+                    return (word >> shift) & (0xFFFFFFFFu >> (32 - n));
+                }
+
                 uint32_t v = 0;
 
                 for (unsigned i = 0; i < n; i++)
@@ -6029,6 +9046,7 @@ namespace
                 const uint32_t slot = (cl >= wl && wl != 0) ? (i / wl) * cl + (i % wl) : i;
                 uint32_t* dst = reinterpret_cast<uint32_t*>(data) + (((up_addr + slot) & dmask) * 4u);
                 const unsigned mrow = i < 3 ? i : 3;
+                const uint32_t old_x = dst[0];  // apenas para diagnosticar sobrescritas do cabecalho
 
                 for (int l = 0; l < 4; l++)
                 {
@@ -6049,9 +9067,42 @@ namespace
 
                     dst[l] = v;
                 }
+
+                // PS2_VU_HEADER_TRACE=1: rastreia a origem do contador VI03 da VU1.
+                // Estes sao os dois quadwords observados nos logs (TOP=0x0FE/0x27F + 186).
+                // Somente instrumentacao: nao altera memoria nem o fluxo VIF.
+                if (unit == 1 && g_vu_header_trace)
+                {
+                    const uint32_t a = (up_addr + slot) & dmask;
+                    if (a == 0x1B8u || a == 0x339u)
+                    {
+                        static uint64_t header_writes = 0;
+                        ++header_writes;
+                        if (header_writes <= 64 || (header_writes & 4095u) == 0)
+                            std::fprintf(stderr,
+                                "  [VU1 WRITE VIF] n=%llu D[%03X] x=%08X (antes=%08X) fmt=%u i=%u/%u base=%03X slot=%u cl=%u wl=%u mode=%u mask=%d palavra_inicial=%08X\n",
+                                (unsigned long long)header_writes, a, dst[0], old_x,
+                                fmt, i, up_num, up_addr, slot, cl, wl, mode, (int)up_mask,
+                                up_words.empty() ? 0u : up_words.front());
+                    }
+                }
+
+                // PS2_VU1WATCH=n: mostra todo UNPACK que grava o quadword n da memoria de dados do VU1
+                static const int watch = std::getenv("PS2_VU1WATCH") ? (int)std::strtol(std::getenv("PS2_VU1WATCH"), nullptr, 0) : -1;
+
+                if (unit == 1 && watch >= 0 && (((up_addr + slot) & dmask) == (uint32_t)watch))
+                    std::fprintf(stderr, "  [VU1WATCH] UNPACK fmt=%u usn=%d addr=0x%X i=%u/%u CL=%u WL=%u MODE=%u mask=%d(0x%08X) TOPS=0x%X -> [0x%X] = %08X %08X %08X %08X\n",
+                        fmt, (int)up_usn, up_addr, i, up_num, cl, wl, mode, (int)up_mask, mask, tops, watch, dst[0], dst[1], dst[2], dst[3]);
             }
 
+            if (profile)
+            {
+                ++g_prof_unpack_calls;
+                g_prof_unpack_words += up_words.size();
+            }
             up_words.clear();
+            if (profile)
+                g_prof_unpack_ns += prof_now() - start;
         }
 
         void start_program(uint32_t byte_addr, bool cont)
@@ -6078,6 +9129,12 @@ namespace
 
             if (!cont)
             {
+                if (unit == 1 && g_dma_probe && byte_addr >= 0x4000u)
+                {
+                    static unsigned suspicious_mscal = 0;
+                    if (suspicious_mscal++ < 8)
+                        probe_dump("MSCAL_FORA_DA_VU1", (byte_addr / 8u) | 0x14000000u);
+                }
                 static uint32_t seen1[32];
                 static unsigned seen1_n = 0;
                 bool is_new = true;
@@ -6094,6 +9151,20 @@ namespace
 
             vu1_run(cont ? g_vu1_pc_get() * 8u : byte_addr);
             g_gs.mscal++;
+        }
+
+        // A mesma tag pode carregar duas palavras de payload. So
+        // dispense a decodificacao quando ambas seriam comandos NOP.
+        bool try_tag_nops(uint64_t tag)
+        {
+            constexpr uint64_t command_bits = 0x7F0000007F000000ull;
+            if ((tag & command_bits) || (direct_qw | mpg_left | up_left | reg_left | skip_words) ||
+                g_dma_probe || (g_giflog && g_vif_log != 0))
+                return false;
+
+            hist[hist_n++ & 31u] = (uint32_t)tag;
+            hist[hist_n++ & 31u] = (uint32_t)(tag >> 32);
+            return true;
         }
 
         void word(uint32_t w)
@@ -6117,7 +9188,7 @@ namespace
             {
                 std::memcpy((unit ? g_vu1_micro : g_vu0_micro) + (mpg_addr & (unit ? 0x3FFFu : 0xFFFu)), &w, 4);
 
-                if (unit) g_vu1_dirty = true; else g_vu0_dirty = true;
+                if (unit) vu1_micro_written(); else g_vu0_dirty = true;
                 mpg_addr += 4;
                 mpg_left--;
                 return;
@@ -6154,6 +9225,46 @@ namespace
             const unsigned num = (w >> 16) & 0xFF;
             const unsigned imm = w & 0xFFFF;
 
+            hist[hist_n++ & 31u] = w;
+
+            if (unit == 1 && g_dma_probe)
+            {
+                ProbeCommand& entry = probe_hist[probe_hist_n++ & 15u];
+                entry.code = w;
+                entry.src = g_dma_probe_origin;
+            }
+
+            if (cmd < 0x60)
+            {
+                static const unsigned char ok[0x60] = { 1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0, 1,1,0,1,1,1,0,1, 0,0,0,0,0,0,0,0,
+                    1,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 1,1,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+                    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0 };
+                const unsigned char good = ok[cmd] || cmd == 0x4A || cmd == 0x50 || cmd == 0x51;
+
+                if (!good)
+                {
+                    if (unit == 1 && g_dma_probe)
+                    {
+                        static unsigned invalid_count = 0;
+                        if (invalid_count++ < 8)
+                            probe_dump("INVALIDO", w);
+                    }
+                    if (resync_enabled())
+                        desync = true;
+
+                    if (bad_log > 0)
+                    {
+                        bad_log--;
+                        std::fprintf(stderr, "  [VIF%d] VIFcode invalido 0x%08X (cmd=0x%02X): ignorado (tratado como NOP, como no hardware). ultimos:", unit, w, cmd);
+
+                        for (unsigned i = 1; i < 12 && i <= hist_n - 1; i++)
+                            std::fprintf(stderr, " %08X", hist[(hist_n - 1 - i) & 31u]);
+
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+
             if (unit == 1 && g_giflog && g_vif_log != 0)
             {
                 g_vif_log--;
@@ -6162,6 +9273,33 @@ namespace
 
             if (cmd >= 0x60)
             {
+                // EXPERIMENTO VIF1 (reversivel): quando WL=0 e CL>0,
+                // UNPACK nao possui ciclos de escrita. O código antigo
+                // consumia a carga como dados e modificava a memoria VU1.
+                // Mantemos o comportamento anterior ate habilitar
+                // PS2_VIF_WL0_FIX=1 para comparar a mesma cena.
+                if (unit == 1 && cl != 0 && wl == 0)
+                {
+                    static uint64_t wl0_count = 0;
+                    ++wl0_count;
+                    const bool wl0_fix = std::getenv("PS2_VIF_WL0_FIX") != nullptr;
+
+                    // Limita o volume de logs em cenas que usam muitos UNPACK.
+                    if (wl0_count <= 16 || (wl0_count & 4095u) == 0)
+                        std::fprintf(stderr,
+                            "  [VIF1 WL0] n=%llu cmd=%02X num=%u imm=%04X CL=%u WL=%u acao=%s\n",
+                            (unsigned long long)wl0_count, cmd, num, imm, cl, wl,
+                            wl0_fix ? "NOP SEM PAYLOAD" : "LEGADO (CONSUME PAYLOAD)");
+
+                    if (wl0_fix)
+                    {
+                        // Não cria uma transferencia UNPACK nem consome as
+                        // proximas palavras como payload; o proximo word()
+                        // podera interpretar corretamente o VIFcode seguinte.
+                        return;
+                    }
+                }
+
                 if (unit == 1)
                     g_gs.unpack_cmds++;
 
@@ -6201,6 +9339,12 @@ namespace
                 case 0x50: case 0x51:
                     if (unit == 1)
                     {
+                        if (g_dma_probe && imm > 4096u)
+                        {
+                            static unsigned huge_direct = 0;
+                            if (huge_direct++ < 8)
+                                probe_dump("DIRECT_GRANDE", w);
+                        }
                         direct_qw = imm == 0 ? 65536u : imm;
                         dn = 0;
                     }
@@ -6246,20 +9390,107 @@ namespace
             if (ch == 2)
                 g_gif.qword((uint64_t)w[0] | ((uint64_t)w[1] << 32), (uint64_t)w[2] | ((uint64_t)w[3] << 32));
             else if (ch == 0)
+            {
                 for (int k = 0; k < 4; k++)
                     g_vif0.word(w[k]);
+
+                if (g_vif0.desync)
+                    return;
+            }
+            else if (g_vif1_direct_qword && !g_dma_probe && !g_vif1.desync &&
+                     g_vif1.direct_qw != 0 && g_vif1.dn == 0)
+            {
+                // Limite o trecho ao DIRECT atual e aos bytes deste DMA.
+                // Cada quadword continua passando pelo GIF na ordem original.
+                const uint32_t count = g_vif1_direct_run
+                    ? (uint32_t)std::min<uint64_t>(g_vif1.direct_qw, qwc - i) : 1u;
+                g_gif.qword((uint64_t)w[0] | ((uint64_t)w[1] << 32),
+                            (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+                for (uint32_t k = 1; k < count; ++k)
+                {
+                    uint64_t lo, hi;
+                    const uint8_t* quadword = p + (size_t)(i + k) * 16;
+                    std::memcpy(&lo, quadword, 8);
+                    std::memcpy(&hi, quadword + 8, 8);
+                    g_gif.qword(lo, hi);
+                }
+                g_vif1.direct_qw -= count;
+                g_gs.direct_qw += count;
+                if (g_perf)
+                {
+                    g_vif1_direct_fast_qwords += count;
+                    ++g_vif1_direct_runs;
+                }
+                i += count - 1;
+            }
             else
+            {
                 for (int k = 0; k < 4; k++)
+                {
+                    if (g_dma_probe)
+                    {
+                        g_dma_probe_origin.from_tag = false;
+                        g_dma_probe_origin.word_addr = addr + i * 16u + (uint32_t)k * 4u;
+                        g_dma_probe_origin.lane = (unsigned)k;
+                    }
                     g_vif1.word(w[k]);
+                }
+
+                if (g_vif1.desync)
+                    return;
+            }
         }
     }
+
+    // VIFcode plausivel? (comandos que existem no VIF; UNPACK = 0x60..0x7F)
+    inline bool vif_code_ok(uint32_t w)
+    {
+        const unsigned cmd = (w >> 24) & 0x7Fu;
+
+        if (cmd >= 0x60u)
+            return true;
+
+        switch (cmd)
+        {
+            case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+            case 0x10: case 0x11: case 0x13: case 0x14: case 0x15: case 0x17:
+            case 0x20: case 0x30: case 0x31: case 0x4A: case 0x50: case 0x51:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Par de VIFcodes da metade alta de uma DMAtag: tags legitimas trazem [comando sem dados, comando qualquer]
+    // (por exemplo [NOP, DIRECT], [STCYCL, UNPACK], [FLUSH, MSCAL]). Lixo aleatorio quase nunca passa nesse teste.
+    inline bool vif_hi_pair_ok(uint32_t w0, uint32_t w1)
+    {
+        switch ((w0 >> 24) & 0x7Fu)
+        {
+            case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+            case 0x10: case 0x11: case 0x13:
+                return vif_code_ok(w1);
+            default:
+                return false;
+        }
+    }
+
+    // diagnostico: [0] TTE+par ok, [1] TTE+lixo, [2] sem TTE e zero, [3] sem TTE+par ok, [4] sem TTE+lixo
+    uint64_t g_hi_stat[5] = {};
 
     void dma_walk(Ctx& c, int ch, uint32_t chcr)
     {
         DmaChan& d = g_dmach[ch];
+        struct DbgDmaMark { DbgDmaMark() { g_dbg_dma[5] = 1; } ~DbgDmaMark() { g_dbg_dma[5] = 0; } } dbg_dma_mark;
+        g_dbg_dma[0] = (uint32_t)ch;
         g_vif0.cx = &c;
         g_gs.kicks[ch]++;
         unsigned mod = (chcr >> 2) & 3;
+        if (g_dma_probe && ch == 1)
+        {
+            g_dma_probe_origin = {};
+            g_dma_probe_origin.chcr = chcr;
+        }
         bool detail = g_giflog && g_dma_detail < 12;
 
         if (detail)
@@ -6270,7 +9501,111 @@ namespace
 
         if (mod == 0)
         {
+            // Teste G (reversivel): no DMA1, CHCR.DIR=0 significa transferencia
+            // VIF1 -> RAM, nao RAM -> VIF1. O caminho legado alimentava o VIF1
+            // com os bytes ja presentes em MADR, produzindo VIFcodes falsos,
+            // DIRECTs enormes e MSCALs para enderecos fora da VU1.
+            //
+            // Esta chave DIAGNOSTICA apenas impede a transferencia ao contrario.
+            // O retorno real de dados GS/VIF1 para a RAM ainda NAO esta implementado;
+            // por isso nao altera a RAM nem deve ser considerado um fix definitivo.
+            if (ch == 1 && (chcr & 1u) == 0u)
+            {
+                const bool block_reverse_feed =
+                    std::getenv("PS2_VIF1_REVERSE_TEST") != nullptr;
+                static uint64_t reverse_count = 0;
+                ++reverse_count;
+
+                // Inclui o primeiro caso e algumas amostras posteriores,
+                // sem inundar o log durante a batalha.
+                if (g_dma_probe &&
+                    (reverse_count <= 16u ||
+                     (reverse_count & (reverse_count - 1u)) == 0u))
+                    std::fprintf(stderr,
+                        "  [DMA1 REVERSE] n=%llu CHCR=%03X DIR=0 MADR=%08X "
+                        "QWC=%u RA=%08X acao=%s\n",
+                        (unsigned long long)reverse_count, chcr, d.madr, d.qwc,
+                        (uint32_t)c.r[31].lo,
+                        block_reverse_feed ? "IGNORAR FEED (SEM READBACK)" :
+                                             "LEGADO (RAM INTERPRETADA COMO VIF)");
+
+                if (block_reverse_feed)
+                {
+                    // Teste H opt-in: agora podemos tentar o caminho VRAM -> RAM.
+                    // Se o GS nao estiver em TRXDIR=1, conserva o teste G sem escrita.
+                    if (std::getenv("PS2_VIF1_READBACK_TEST") != nullptr)
+                    {
+                        const bool ok = gs_download_to_ram(c, d.madr, d.qwc);
+                        static uint64_t trials = 0, successes = 0;
+                        ++trials;
+                        if (ok) ++successes;
+                        if (g_dma_probe && (trials <= 16 || (trials & (trials - 1u)) == 0u))
+                            std::fprintf(stderr,
+                                "  [DMA1 READBACK H] n=%llu status=%s TRXDIR=%u GER=%llu "
+                                "PSM=%02X RRW=%u RRH=%u QWC=%u RAM=%08X "
+                                "cursor=%zu/%zu sucessos=%llu\n",
+                                (unsigned long long)trials,
+                                ok ? "COPIADO" : "SEM_GS_DOWNLOAD",
+                                (unsigned)(g_st.trxdir & 3u),
+                                (unsigned long long)g_st.trx_generation,
+                                g_gs_download.psm, g_gs_download.width,
+                                g_gs_download.height, d.qwc, d.madr,
+                                g_gs_download.cursor, g_gs_download.bytes.size(),
+                                (unsigned long long)successes);
+                    }
+                    return; // Nunca alimenta VIF1 com dados de DMA reverso.
+                }
+            }
+
+            // Teste F: observa apenas os DMA1 normais que incluem os enderecos
+            // em que o teste E2 interpretou dados do payload como VIFcodes.
+            // Nao altera a transferencia nem o estado do VIF1.
+            bool probe_normal_hit = false;
+            if (g_dma_probe && ch == 1 && d.qwc != 0)
+            {
+                const uint64_t dma_begin = dma_addr(d.madr);
+                const uint64_t dma_end = dma_begin + (uint64_t)d.qwc * 16u;
+                const uint32_t suspect[] = { 0x01166C20u, 0x0116725Cu, 0x011681FCu, 0x011685F4u };
+                for (uint32_t a : suspect)
+                    if (dma_begin <= a && (uint64_t)a < dma_end)
+                        probe_normal_hit = true;
+
+                if (probe_normal_hit)
+                {
+                    std::fprintf(stderr,
+                        "  [DMA PROBE NORMAL INICIO] MADR=%08X QWC=%u FIM=%08llX CHCR=%X RA=%08X SP=%08X VIF: DIRECT=%llu dn=%u MPG=%llu UNPACK=%llu REG=%u SKIP=%llu cl=%u wl=%u TOP=%03X\n",
+                        d.madr, d.qwc, (unsigned long long)dma_end, chcr,
+                        (uint32_t)c.r[31].lo, (uint32_t)c.r[29].lo,
+                        (unsigned long long)g_vif1.direct_qw, g_vif1.dn,
+                        (unsigned long long)g_vif1.mpg_left,
+                        (unsigned long long)g_vif1.up_left,
+                        g_vif1.reg_left, (unsigned long long)g_vif1.skip_words,
+                        g_vif1.cl, g_vif1.wl, g_vif1.tops);
+
+                    // Os comandos anteriores podem mostrar por que o VIF1 nao
+                    // esta consumindo esse buffer como payload de DIRECT/UNPACK.
+                    const unsigned n = (unsigned)std::min<uint64_t>(8, g_vif1.probe_hist_n);
+                    for (unsigned back = n; back > 0; --back)
+                    {
+                        const auto& h = g_vif1.probe_hist[(g_vif1.probe_hist_n - back) & 15u];
+                        std::fprintf(stderr,
+                            "    [DMA PROBE NORMAL HIST] VIF=%08X origem=%s addr=%08X tag=%08X CHCR=%X\n",
+                            h.code, h.src.from_tag ? "TAG" : "PAYLOAD",
+                            h.src.word_addr, h.src.tag_addr, h.src.chcr);
+                    }
+                }
+            }
+
+            // Mesma chamada do teste E: nenhuma mudanca funcional.
             dma_feed(c, ch, d.madr, d.qwc);
+
+            if (probe_normal_hit)
+                std::fprintf(stderr,
+                    "  [DMA PROBE NORMAL FIM] MADR=%08X QWC=%u VIF: DIRECT=%llu dn=%u MPG=%llu UNPACK=%llu REG=%u SKIP=%llu\n",
+                    d.madr, d.qwc, (unsigned long long)g_vif1.direct_qw,
+                    g_vif1.dn, (unsigned long long)g_vif1.mpg_left,
+                    (unsigned long long)g_vif1.up_left, g_vif1.reg_left,
+                    (unsigned long long)g_vif1.skip_words);
             return;
         }
 
@@ -6280,9 +9615,16 @@ namespace
         uint32_t tadr = d.tadr;
         uint32_t asr[2] = {};
         int depth = 0;
+        const bool tte = (chcr & 0x40u) != 0;
+
+        if (ch == 1) g_vif1.boundary("DMA1");
+        else if (ch == 0) g_vif0.boundary("DMA0");
 
         for (int guard = 0; guard < 200000; guard++)
         {
+            if ((ch == 1 && g_vif1.desync) || (ch == 0 && g_vif0.desync))
+                return;   // fluxo perdido: o resto da cadeia e lixo (o proximo DMA recomeca limpo)
+
             const uint8_t* t = host_ptr(c, dma_addr(tadr), 16);
             uint64_t lo, hi;
             std::memcpy(&lo, t, 8);
@@ -6291,6 +9633,7 @@ namespace
             uint32_t qwc = (uint32_t)(lo & 0xFFFF);
             unsigned id = (unsigned)((lo >> 28) & 7);
             uint32_t addr = (uint32_t)(lo >> 32);
+            g_dbg_dma[1] = (uint32_t)guard; g_dbg_dma[2] = tadr; g_dbg_dma[3] = id; g_dbg_dma[4] = qwc;
 
             if (detail && guard < 8)
                 std::fprintf(stderr, "    tag @0x%08X: id=%u qwc=%u addr=0x%08X  (VIFcodes da tag: 0x%08X 0x%08X)\n",
@@ -6299,15 +9642,69 @@ namespace
             // No VIF1 a metade alta da DMAtag (bits 64..127) leva dois VIFcodes, tipicamente
             // [NOP, DIRECT(qwc)] (convencao da libgraph): eles chegam ao VIF antes dos dados da tag.
             // E isso que faz os pacotes GIF "puros" dos dados serem aceitos pelo PATH2.
-            if (ch == 1)
+            // PADRAO: envia com TTE, ou sem TTE se o par for plausivel. PS2_VIF_TTE=1 so envia com CHCR.TTE (bit 6), como no hardware (experimental).
+            // Sem TTE a metade alta da tag e lixo (o hardware nao a envia): so repassa se os DOIS VIFcodes forem plausiveis
+            // (tags legitimas com [NOP, DIRECT]...), descartando o lixo que dessincronizava o fluxo na batalha.
+            // PS2_VIF_TTE=1: so envia com CHCR.TTE (experimental). PS2_VIF_TAGALWAYS=1: sempre envia (comportamento antigo).
+            static const bool tte_only = std::getenv("PS2_VIF_TTE") != nullptr;
+            static const bool tag_always = std::getenv("PS2_VIF_TAGALWAYS") != nullptr;   // PS2_VIF_TAGALWAYS=1: sempre envia (comportamento antigo)
+            static unsigned hi_dropped = 0;
+            const bool pair_ok = vif_hi_pair_ok((uint32_t)hi, (uint32_t)(hi >> 32));
+            const bool hi_ok = tte || pair_ok;
+
+            if (g_dma_probe && ch == 1)
             {
-                g_vif1.word((uint32_t)hi);
-                g_vif1.word((uint32_t)(hi >> 32));
+                g_dma_probe_origin.tag_addr = tadr;
+                g_dma_probe_origin.tag_id = id;
+                g_dma_probe_origin.chcr = chcr;
+                static uint64_t tag_count = 0;
+                ++tag_count;
+                if (tag_count <= 16 || (tag_count & (tag_count - 1)) == 0)
+                    std::fprintf(stderr,
+                        "  [DMA PROBE TAG] n=%llu TADR=%08X id=%u QWC=%u addr=%08X CHCR=%X TTE=%u hi=%08X,%08X par=%u enviado=%u\n",
+                        (unsigned long long)tag_count, tadr, id, qwc, addr, chcr,
+                        tte ? 1u : 0u, (uint32_t)hi, (uint32_t)(hi >> 32),
+                        pair_ok ? 1u : 0u,
+                        (tag_always || (tte_only ? tte : hi_ok)) ? 1u : 0u);
             }
-            else if (ch == 0)
+
+            if (ch == 1)
+                g_hi_stat[tte ? (pair_ok ? 0 : 1) : (hi == 0 ? 2 : (pair_ok ? 3 : 4))]++;
+
+            if (!hi_ok && !tag_always && !tte_only && (++hi_dropped <= 4 || (hi_dropped & 4095u) == 0))
+                std::fprintf(stderr, "  [DMA%d] tag sem TTE com VIFcodes invalidos (%08X %08X) descartados (%u vezes)\n", ch,
+                    (uint32_t)hi, (uint32_t)(hi >> 32), hi_dropped);
+
+            if (tag_always ? true : (tte_only ? tte : hi_ok))
             {
-                g_vif0.word((uint32_t)hi);
-                g_vif0.word((uint32_t)(hi >> 32));
+                if (ch == 1)
+                {
+                    if (g_vif1_tag_nop_fast && g_vif1.try_tag_nops(hi))
+                    {
+                        if (g_perf) ++g_vif1_tag_nop_pairs;
+                    }
+                    else
+                    {
+                        if (g_dma_probe)
+                        {
+                            g_dma_probe_origin.from_tag = true;
+                            g_dma_probe_origin.word_addr = tadr + 8u;
+                            g_dma_probe_origin.lane = 2;
+                        }
+                        g_vif1.word((uint32_t)hi);
+                        if (g_dma_probe)
+                        {
+                            g_dma_probe_origin.word_addr = tadr + 12u;
+                            g_dma_probe_origin.lane = 3;
+                        }
+                        g_vif1.word((uint32_t)(hi >> 32));
+                    }
+                }
+                else if (ch == 0)
+                {
+                    g_vif0.word((uint32_t)hi);
+                    g_vif0.word((uint32_t)(hi >> 32));
+                }
             }
 
             switch (id)
@@ -6343,13 +9740,11 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
     // registradores privilegiados do GS (PMODE, DISPFB1/2, DISPLAY1/2...): dizem qual area e exibida
     if (g_gsrun && phys >= 0x12000000u && phys < 0x12000100u && (phys & 7u) == 0)
     {
-        if ((phys == 0x12000070u || phys == 0x12000090u) && (value & 0x1FFu) != (g_gs_priv[(phys - 0x12000000u) >> 3] & 0x1FFu))
-        {
-            g_gs_flips.fetch_add(1);
-            g_half_vote[g_gs_priv[(phys - 0x12000000u) >> 3] & 0x1FFu] = 0.0f;   // o buffer que sai da tela e o proximo alvo: vota de novo
-        }
+        // Carrega o FIELD visto pelo EE junto com a escrita para o GS assincrono.
+        const unsigned csr_field = g_field_audit ? g_gs_field : 0u;
+        if (g_gs_async) gs_q_push(2, phys, value, csr_field);
+        else gs_priv_apply(phys, value, csr_field);
 
-        g_gs_priv[(phys - 0x12000000u) >> 3] = value;
         return;
     }
 
@@ -6367,8 +9762,24 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
         case 0x20: d.qwc = (uint32_t)value; break;
         case 0x30: d.tadr = (uint32_t)value; break;
         case 0x00:
+            if (g_dma_probe && ch == 1)
+            {
+                static uint64_t chcr_count = 0;
+                ++chcr_count;
+                if (chcr_count <= 20 || (chcr_count & (chcr_count - 1)) == 0)
+                    std::fprintf(stderr,
+                        "  [DMA PROBE CHCR] n=%llu valor=%08X TTE=%u STR=%u MADR=%08X QWC=%u TADR=%08X RA=%08X SP=%08X\n",
+                        (unsigned long long)chcr_count, (uint32_t)value,
+                        (((uint32_t)value & 0x40u) != 0) ? 1u : 0u,
+                        (((uint32_t)value & 0x100u) != 0) ? 1u : 0u,
+                        d.madr, d.qwc, d.tadr, (uint32_t)c.r[31].lo, (uint32_t)c.r[29].lo);
+            }
             if (value & 0x100)
             {
+                constexpr Timer0EeStage stages[] = {
+                    Timer0EeStage::Vif0, Timer0EeStage::Vif1, Timer0EeStage::Gif
+                };
+                const Timer0StageScope timer0_stage(stages[ch]);
                 std::lock_guard<std::mutex> lk(g_gs_mu);
 
                 if (ch == 0)
@@ -6386,7 +9797,14 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
                 uint64_t unsupported_before = g_st.unsupported;
                 const uint64_t pt0 = prof_now();
                 dma_walk(c, ch, (uint32_t)value);
-                g_prof_dma_ns += prof_now() - pt0;
+                gs_q_flush_batch();
+                const uint64_t elapsed = prof_now() - pt0;
+                g_prof_dma_ns += elapsed;
+                if (g_perf_cadence)
+                {
+                    if (ch == 1) g_cadence_ee.dma_vif1_ns += elapsed;
+                    if (ch == 2) g_cadence_ee.dma_gif_ns += elapsed;
+                }
                 gs_trace_kick(ch, draws_before, unsupported_before);
             }
 
@@ -6395,24 +9813,399 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
     }
 }
 
+// Imprime o ranking pelo tempo de interpretacao, com o tempo do GIF em coluna propria.
+static void vif1_prof_report(double seconds)
+{
+    if (seconds > 0.0)
+    {
+        std::fprintf(stderr, "  [prof VIF1] intervalo=%.3f s UNPACK=%s commits=%llu payload_words=%llu commit_ms=%.3f\n",
+            seconds, g_vif1_unpack_fast ? "fast" : "legado",
+            (unsigned long long)g_prof_unpack_calls, (unsigned long long)g_prof_unpack_words,
+            g_prof_unpack_ns / 1e6);
+
+        unsigned active[2048], count = 0;
+        Vu1Profile total;
+        for (unsigned i = 0; i < 2048; ++i)
+        {
+            const Vu1Profile& p = g_prof_vu1[i];
+            if (p.calls == 0)
+                continue;
+            active[count++] = i;
+            total.calls += p.calls;
+            total.pairs += p.pairs;
+            total.ns += p.ns;
+            total.kick_ns += p.kick_ns;
+        }
+        const unsigned shown = std::min(count, 8u);
+        std::partial_sort(active, active + shown, active + count, [](unsigned a, unsigned b)
+        {
+            const uint64_t ta = g_prof_vu1[a].ns - g_prof_vu1[a].kick_ns;
+            const uint64_t tb = g_prof_vu1[b].ns - g_prof_vu1[b].kick_ns;
+            return ta != tb ? ta > tb : a < b;
+        });
+
+        std::fprintf(stderr, "  [prof VU1] caminho=%s entradas=%u chamadas=%llu pares=%llu interpretador_ms=%.3f xgkick_ms=%.3f\n",
+            g_vu1_fast ? "fast" : "legado", count, (unsigned long long)total.calls, (unsigned long long)total.pairs,
+            (total.ns - total.kick_ns) / 1e6, total.kick_ns / 1e6);
+        for (unsigned rank = 0; rank < shown; ++rank)
+        {
+            const unsigned i = active[rank];
+            const Vu1Profile& p = g_prof_vu1[i];
+            std::fprintf(stderr, "  [prof VU1] entrada=0x%04X chamadas=%llu pares=%llu interpretador_ms=%.3f xgkick_ms=%.3f\n",
+                i * 8u, (unsigned long long)p.calls, (unsigned long long)p.pairs,
+                (p.ns - p.kick_ns) / 1e6, p.kick_ns / 1e6);
+        }
+    }
+
+    // O primeiro relatorio apenas estabelece a linha de base dos intervalos.
+    for (Vu1Profile& p : g_prof_vu1)
+        p = {};
+    if (seconds > 0.0 && g_vu_aot_enabled)
+        std::fprintf(stderr, "  [prof VU1 AOT] pares_nativos=%llu compativel=%llu micro_diferente=%llu sem_include=%llu pares_nativos_parcial=%llu cache_revisao=%u reusos=%llu\n",
+            (unsigned long long)g_prof_aot_pairs, (unsigned long long)g_prof_aot_match,
+            (unsigned long long)g_prof_aot_mismatch, (unsigned long long)g_prof_aot_missing,
+            (unsigned long long)g_prof_aot_partial_pairs,
+            (unsigned)g_vu_aot_revision_cache, (unsigned long long)g_prof_aot_revision_hits);
+    g_prof_aot_pairs = g_prof_aot_match = g_prof_aot_mismatch = g_prof_aot_missing = g_prof_aot_partial_pairs = 0;
+    g_prof_aot_revision_hits = 0;
+    g_prof_unpack_calls = g_prof_unpack_words = g_prof_unpack_ns = 0;
+}
+
 // Resumo a cada 120 vsyncs (2 s): o que o jogo mandou desenhar nesse intervalo.
 // Relatorio de desempenho a cada 120 vsyncs (PS2_PERF=1 ou PS2_GIFLOG=1): onde o tempo de emulacao foi gasto.
+static void gs_field_report()
+{
+    // O relatorio e chamado com g_gs_mu. Aguarda o consumidor antes
+    // de ler os snapshots preenchidos pela thread do GS.
+    gs_q_drain();
+    static unsigned last_flip = 0;
+    const unsigned latest = g_gs_flips.load(std::memory_order_relaxed);
+    if (latest == last_flip)
+        return;
+
+    // A troca mais recente ainda pode ser avaliada no proximo VBLANK.
+    const unsigned current = latest - 1u;
+    const unsigned delta = current - last_flip;
+    const unsigned count = std::min(delta, kFieldAuditCapacity - 1u);
+    if (count < delta)
+        std::fprintf(stderr, "  [campo GS] trocas_fora_do_historico=%u\n", delta - count);
+    for (unsigned i = count; i != 0; --i)
+    {
+        const unsigned flip = current - i + 1;
+        const FieldFlipAudit& f = g_field_flips[flip % kFieldAuditCapacity];
+        std::fprintf(stderr,
+            "  [campo GS] troca=%u circuito=%u FBP=%u FIELD_CSR=%u DY=%u DBY=%u "
+            "voto_troca=%d sprites=%u Y_meia=%u OFY_meia=%u OFY_ultimo=0x%04X "
+            "avaliacoes=%u bloqueios=%u publicados=%u ultimo_voto_janela=%d\n",
+            f.flip, f.circuit, f.fbp, f.csr_field, f.dy, f.dby,
+            f.vote, f.sprites.sprites, f.sprites.half_y, f.sprites.half_ofy,
+            f.sprites.ofy_last, f.checked, f.blocked, f.published, f.present_vote);
+    }
+    last_flip = current;
+}
+
+static void gs_cadence_report(bool has_interval)
+{
+    CadenceGsProfile gs;
+    {
+        std::lock_guard<std::mutex> lk(g_cadence_gs_mu);
+        gs = g_cadence_gs;
+        g_cadence_gs = {};
+    }
+    const CadenceEeProfile ee = g_cadence_ee;
+    g_cadence_ee = {};
+    if (!has_interval) return;
+
+    std::fprintf(stderr,
+        "  [prof cadencia GS] vb_0=%u vb_1=%u vb_2=%u vb_3=%u vb_4mais=%u maior_gap_ms=%.3f\n",
+        gs.gaps[0], gs.gaps[1], gs.gaps[2], gs.gaps[3], gs.gaps[4], gs.max_gap_ns / 1e6);
+    std::fprintf(stderr,
+        "  [prof cadencia EE] lotes=%u lotes_multiplos=%u max_pendentes=%u descartados=%llu "
+        "vblank_ocioso=%u sleeps=%u sleep_ms=%.3f vif1_ms=%.3f gif_ms=%.3f\n",
+        ee.batches, ee.multiple, ee.max_pending, (unsigned long long)ee.dropped,
+        ee.idle_vblanks, ee.idle_sleeps, ee.idle_sleep_ns / 1e6, ee.dma_vif1_ns / 1e6, ee.dma_gif_ns / 1e6);
+}
+
+extern const bool g_vu0_status_trace = [] {
+    const char* value = std::getenv("PS2_VU0_STATUS_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+
+namespace
+{
+    constexpr unsigned kVu0EventCount = (unsigned)Vu0StatusEvent::Count;
+    constexpr const char* kVu0EventNames[] = {
+        "VDIV", "VSQRT", "VRSQRT", "VWAITQ", "CFC2_VI16", "CTC2_VI16",
+        "micro_DIV", "micro_SQRT", "micro_RSQRT", "micro_leitura_STATUS"
+    };
+    static_assert(sizeof kVu0EventNames / sizeof *kVu0EventNames == kVu0EventCount);
+    struct Vu0EventCounts
+    {
+        uint64_t count = 0;
+        uint32_t first_pc = 0, first_value = 0, last_pc = 0, last_value = 0;
+    };
+    Vu0EventCounts g_vu0_events[kVu0EventCount]{};
+
+    void vu0_status_report()
+    {
+        if (!g_vu0_status_trace)
+            return;
+        for (unsigned i = 0; i < kVu0EventCount; ++i)
+        {
+            const auto& counts = g_vu0_events[i];
+            std::fprintf(stderr,
+                "  [prof VU0 STATUS] op=%s n=%llu primeiro_pc=%08X primeiro_status=%03X ultimo_pc=%08X ultimo_status=%03X\n",
+                kVu0EventNames[i], (unsigned long long)counts.count, counts.first_pc,
+                counts.first_value, counts.last_pc, counts.last_value);
+            g_vu0_events[i] = {};
+        }
+    }
+}
+
+void vu0_status_record(Vu0StatusEvent event, uint32_t pc, uint32_t value)
+{
+    // Apenas a thread convidada ativa do EE executa estas instrucoes.
+    auto& counts = g_vu0_events[(unsigned)event];
+    value &= 0xFFFu;
+    if (counts.count++ == 0)
+    {
+        counts.first_pc = pc;
+        counts.first_value = value;
+    }
+    counts.last_pc = pc;
+    counts.last_value = value;
+}
+
 static void gs_prof_report()
 {
-        static uint64_t last_dma = 0, last_vu = 0, last_pr = 0, last_ras = 0, last_img = 0, last_wall = 0;
-        static unsigned last_flips = 0;
+        static uint64_t last_dma = 0, last_vu = 0, last_pr = 0, last_tri = 0, last_sprite = 0, last_img = 0, last_wall = 0;
+        static unsigned last_flips = 0, last_presented = 0;
         const uint64_t now = prof_now();
         const unsigned flips = g_gs_flips.load();
+        const unsigned presented = g_win_seq.load(std::memory_order_relaxed);
+        const uint64_t tri = g_prof_tri_ns.load(std::memory_order_relaxed);
+        const uint64_t sprite = g_prof_sprite_ns.load(std::memory_order_relaxed);
+
+        if (g_field_clock_trace)
+            field_clock_report(last_wall ? (double)(now - last_wall) / 1e9 : 0.0);
+        if (g_move_callback_trace)
+            move_callback_report(last_wall ? (double)(now - last_wall) / 1e9 : 0.0);
 
         if (last_wall != 0)
-            std::fprintf(stderr, "  [prof] %.1f s: DMA/GS=%llu ms (microprogramas=%llu raster=%llu upload=%llu) janela=%llu ms | trocas de buffer=%u\n",
+        {
+            const double seconds = (double)(now - last_wall) / 1e9;
+            std::fprintf(stderr, "  [prof] taxas: GS=%.1f trocas/s | janela=%.1f quadros publicados/s\n",
+                (flips - last_flips) / seconds, (presented - last_presented) / seconds);
+            vu0_status_report();
+            rotation_caller_report();
+            char upload[48] = "sem_medicao";
+            if (g_prof_image_qword)
+                std::snprintf(upload, sizeof upload, "%llu%s", (unsigned long long)((g_prof_img_ns - last_img) / 1000000u),
+                    g_prof_image_stride == 1 ? "" : "_amostrado");
+            std::fprintf(stderr, "  [prof] %.1f s: DMA/GS=%llu ms (microprogramas=%llu raster=%llu upload=%s) janela=%llu ms | trocas de buffer=%u\n",
                 (double)(now - last_wall) / 1e9, (unsigned long long)((g_prof_dma_ns - last_dma) / 1000000u),
-                (unsigned long long)((g_prof_vu_ns - last_vu) / 1000000u), (unsigned long long)((g_prof_raster_ns - last_ras) / 1000000u),
-                (unsigned long long)((g_prof_img_ns - last_img) / 1000000u), (unsigned long long)((g_prof_present_ns - last_pr) / 1000000u),
+                (unsigned long long)((g_prof_vu_ns - last_vu) / 1000000u), (unsigned long long)((tri - last_tri + sprite - last_sprite) / 1000000u),
+                upload, (unsigned long long)((g_prof_present_ns - last_pr) / 1000000u),
                 flips - last_flips);
+            static uint64_t last_samples = 0;
+            std::fprintf(stderr, "  [prof upload] ativo=%u passo=%u amostras=%llu\n",
+                (unsigned)g_prof_image_qword, g_prof_image_stride,
+                (unsigned long long)(g_prof_image_samples - last_samples));
+            last_samples = g_prof_image_samples;
+        }
 
-        last_dma = g_prof_dma_ns; last_vu = g_prof_vu_ns; last_pr = g_prof_present_ns; last_ras = g_prof_raster_ns; last_img = g_prof_img_ns;
-        last_wall = now; last_flips = flips;
+        if (g_perf_gs)
+        {
+            if (last_wall != 0)
+            {
+                std::fprintf(stderr, "  [prof GS] tri_early_z=%u tri_ms=%.3f sprite_ms=%.3f tri_texture_specialize=%u tri_effects_fast=%u\n",
+                    (unsigned)g_gs_tri_early_z, (tri - last_tri) / 1e6,
+                    (sprite - last_sprite) / 1e6, (unsigned)g_gs_tri_texture_specialize, (unsigned)g_gs_tri_effects_fast);
+                std::fprintf(stderr,
+                    "  [prof janela] publicados=%u pacing=%u display_invalido=%u fieldlock=%u publicados_sem_nova_troca=%u campos_alinhados=%u adiantados_por_troca=%u fila_adiados=%u fila_espera_ms=%.3f\n",
+                    presented - last_presented, g_present_profile.pacing, g_present_profile.invalid,
+                    g_present_profile.fieldlock, g_present_profile.same_flip, g_present_profile.aligned,
+                    g_present_profile.early_flip, g_present_profile.queue_skips,
+                    g_present_profile.queue_wait_ns / 1e6);
+                std::fprintf(stderr,
+                    "  [prof campo raster] ativo=%u campos=%u vertices_sprite=%llu vertices_tri=%llu bloqueios_fase_mista=%u bloqueios_OFY_desconhecido=%u trem_ativo=%u campos_trem=%u recuperados_ofy_zero=%u\n",
+                    (unsigned)g_field_raster, g_present_profile.raster_fields,
+                    (unsigned long long)g_present_profile.raster_sprite_vertices,
+                    (unsigned long long)g_present_profile.raster_triangle_vertices,
+                    g_present_profile.raster_mixed, g_present_profile.raster_unknown,
+                    (unsigned)(g_field_raster && g_field_raster_train), g_present_profile.raster_train,
+                    g_present_profile.raster_train_zero);
+            }
+            static uint64_t last_fast_pixels = 0, last_generic_pixels = 0;
+            const uint64_t fast_pixels = g_prof_sprite_fast_pixels.load(std::memory_order_relaxed);
+            const uint64_t generic_pixels = g_prof_sprite_generic_pixels.load(std::memory_order_relaxed);
+            if (last_wall != 0)
+                std::fprintf(stderr, "  [prof sprites] colunas=%u pixels_fast=%llu pixels_generico=%llu generico_linhas=%u wide_fast=%u\n",
+                    (unsigned)g_sprite_columns, (unsigned long long)(fast_pixels - last_fast_pixels),
+                    (unsigned long long)(generic_pixels - last_generic_pixels), (unsigned)g_sprite_generic_rows, (unsigned)g_sprite_wide_fast);
+            last_fast_pixels = fast_pixels;
+            last_generic_pixels = generic_pixels;
+            g_present_profile = {};
+            if (g_field_train_diag && g_field_train_sample.raster.unknown != 0)
+            {
+                const auto& sample = g_field_train_sample;
+                const auto& state = sample.raster;
+                if (last_wall != 0)
+                {
+                    std::fprintf(stderr,
+                        "  [prof OFY trem] troca=%u FBP=%u tamanho=%ux%u MAGV=%u FBW=%u PSM=%02X "
+                        "base=%u ajustados=%u fase_trem=%u desconhecidos=%u outros=%u\n",
+                        sample.flip, sample.fbp, sample.w, sample.h, sample.magv, sample.fbw, sample.psm,
+                        state.base, state.shifted, (unsigned)state.shifted_train, state.unknown, state.other_unknown);
+                    for (const auto& offset : state.offsets)
+                        if (offset.vertices != 0)
+                            std::fprintf(stderr,
+                                "  [prof OFY vertice] OFY=0x%04X FBW=%u PSM=%02X contexto=%u layout_valido=%u vertices=%u\n",
+                                offset.ofy, offset.fbw, offset.psm, offset.context + 1,
+                                (unsigned)offset.target, offset.vertices);
+                }
+                g_field_train_sample = {};
+            }
+        }
+
+        std::fprintf(stderr, "  [prof] tags VIF1: TTE ok=%llu lixo=%llu | sem TTE: zero=%llu ok=%llu lixo=%llu\n", (unsigned long long)g_hi_stat[0],
+            (unsigned long long)g_hi_stat[1], (unsigned long long)g_hi_stat[2], (unsigned long long)g_hi_stat[3], (unsigned long long)g_hi_stat[4]);
+
+        {
+            static uint64_t last_nop_pairs = 0;
+            std::fprintf(stderr, "  [prof VIF1 NOP] ativo=%u pares=%llu\n",
+                (unsigned)g_vif1_tag_nop_fast, (unsigned long long)(g_vif1_tag_nop_pairs - last_nop_pairs));
+            last_nop_pairs = g_vif1_tag_nop_pairs;
+        }
+
+        {
+            static uint64_t last_gen = 0, last_del = 0;
+            const uint64_t gen = g_vsync_gen.load(), del = g_vsync_del.load();
+            std::fprintf(stderr, "  [prof] vsync: gerados=%llu entregues=%llu (neste intervalo)%s\n", (unsigned long long)(gen - last_gen),
+                (unsigned long long)(del - last_del), g_vsync_catchup ? " [catchup]" : "");
+            last_gen = gen; last_del = del;
+        }
+
+        {
+            static uint64_t last_periods = 0, last_delivered = 0, last_wakes = 0, last_posts = 0, last_merged = 0, last_dma_delivered = 0;
+            const uint64_t periods = g_timer0_periods.load(std::memory_order_relaxed);
+            const uint64_t delivered = g_timer0_delivered.load(std::memory_order_relaxed);
+            const uint64_t wakes = g_irq_wakes.load(std::memory_order_relaxed);
+            const uint64_t posts = g_timer0_posts.load(std::memory_order_relaxed);
+            const uint64_t merged = g_timer0_merged.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "  [prof timer0] fase_fixa=%u espera_alta_res=%u despertares=%llu periodos=%llu sinais=%llu agrupados_ee=%llu entregues=%llu entregues_dma=%llu dma_poll=%u comparacao=0x%llX\n",
+                (unsigned)g_timer0_phase, (unsigned)g_irq_wait_highres_active.load(std::memory_order_relaxed),
+                (unsigned long long)(wakes - last_wakes), (unsigned long long)(periods - last_periods),
+                (unsigned long long)(posts - last_posts), (unsigned long long)(merged - last_merged),
+                (unsigned long long)(delivered - last_delivered),
+                (unsigned long long)(g_timer0_dma_delivered - last_dma_delivered), (unsigned)g_timer0_dma_poll,
+                (unsigned long long)g_timer0_comp.load());
+            last_periods = periods;
+            last_delivered = delivered;
+            last_wakes = wakes;
+            last_posts = posts;
+            last_merged = merged;
+            last_dma_delivered = g_timer0_dma_delivered;
+            static uint64_t last_recovered = 0;
+            if (g_timer0_elapsed)
+                std::fprintf(stderr, "  [prof timer0 relogio] ticks_recuperados=%llu\n",
+                    (unsigned long long)(g_timer0_sys_ticks_recovered - last_recovered));
+            last_recovered = g_timer0_sys_ticks_recovered;
+        }
+
+        if (g_timer0_trace_stages)
+        {
+            constexpr unsigned count = (unsigned)Timer0EeStage::Count;
+            unsigned long long delta[count]{};
+            for (unsigned i = 0; i < count; ++i)
+                delta[i] = g_timer0_merges_by_stage[i].exchange(0, std::memory_order_relaxed);
+
+            std::fprintf(stderr, "  [prof timer0 etapas] outros=%llu vif0=%llu vif1=%llu gif=%llu vblank=%llu timer0=%llu\n",
+                delta[0], delta[1], delta[2], delta[3], delta[4], delta[5]);
+        }
+
+        if (g_perf_cadence)
+            gs_cadence_report(last_wall != 0);
+
+        if (last_wall != 0)
+        {
+            static uint64_t last_direct_fast = 0, last_direct_total = 0, last_direct_runs = 0;
+            std::fprintf(stderr, "  [prof VIF1 DIRECT] ativo=%u rapidos=%llu total=%llu agrupar=%u trechos=%llu\n",
+                (unsigned)g_vif1_direct_qword,
+                (unsigned long long)(g_vif1_direct_fast_qwords - last_direct_fast),
+                (unsigned long long)(g_gs.direct_qw - last_direct_total), (unsigned)g_vif1_direct_run,
+                (unsigned long long)(g_vif1_direct_runs - last_direct_runs));
+            last_direct_runs = g_vif1_direct_runs;
+            last_direct_fast = g_vif1_direct_fast_qwords;
+            last_direct_total = g_gs.direct_qw;
+        }
+
+        if (g_perf_vif1)
+            vif1_prof_report(last_wall == 0 ? 0.0 : (double)(now - last_wall) / 1e9);
+
+        if (g_gs_async && last_wall != 0)
+        {
+            static uint64_t last_wait_ns = 0, last_wait_count = 0;
+            const uint64_t waited = g_gsq_full_wait_ns.load(std::memory_order_relaxed);
+            const uint64_t blocked = g_gsq_full_wait_count.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "  [prof] GS FILA CHEIA: espera=%llu ms | bloqueios=%llu (neste intervalo)\n",
+                (unsigned long long)((waited - last_wait_ns) / 1000000u),
+                (unsigned long long)(blocked - last_wait_count));
+            last_wait_ns = waited;
+            last_wait_count = blocked;
+            static uint64_t last_busy = 0, last_flip_wait_ns = 0, last_flip_waits = 0;
+            const uint64_t busy = g_gsq_busy_ns.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "  [prof] thread do GS: ocupada=%llu ms | fila=%llu comandos\n", (unsigned long long)((busy - last_busy) / 1000000u),
+                (unsigned long long)(g_gsq_head.load() - g_gsq_tail.load()));
+            last_busy = busy;
+            static uint64_t last_work_wakes = 0;
+            const uint64_t work_wakes = g_gsq_work_wakes.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "  [prof GS despertar] ativo=%u retomadas=%llu\n",
+                (unsigned)g_gsq_wake_on_work, (unsigned long long)(work_wakes - last_work_wakes));
+            last_work_wakes = work_wakes;
+            static uint64_t last_publications = 0, last_commands = 0;
+            const uint64_t commands = g_gsq_head.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "  [prof GS lote] ativo=%u comandos=%llu publicacoes=%llu inicio_rapido=%u cursor_local=%u\n",
+                (unsigned)g_gsq_batch, (unsigned long long)(commands - last_commands),
+                (unsigned long long)(g_gsq_publications - last_publications), (unsigned)g_gsq_start_fast, (unsigned)g_gsq_local_cursor);
+            last_commands = commands;
+            last_publications = g_gsq_publications;
+            std::fprintf(stderr, "  [prof fila por troca] ativo=%u esperas=%llu espera_ms=%.3f\n",
+                (unsigned)g_gsq_limit_flips, (unsigned long long)(g_gsq_flip_waits - last_flip_waits),
+                (g_gsq_flip_wait_ns - last_flip_wait_ns) / 1e6);
+            last_flip_waits = g_gsq_flip_waits;
+            last_flip_wait_ns = g_gsq_flip_wait_ns;
+        }
+
+#ifdef _WIN32
+        if (g_perf_gs)
+        {
+            static unsigned last_blits = 0, last_coalesced = 0, last_errors = 0;
+            const unsigned blits = g_win_blits.load(std::memory_order_relaxed);
+            const unsigned coalesced = g_win_coalesced.load(std::memory_order_relaxed);
+            const unsigned errors = g_win_blit_errors.load(std::memory_order_relaxed);
+            if (last_wall != 0)
+            {
+                const double seconds = (now - last_wall) / 1e9;
+                std::fprintf(stderr, "  [prof GDI] novos/s=%.1f novos=%u pulados=%u falhas=%u\n",
+                    (blits - last_blits) / seconds, blits - last_blits,
+                    coalesced - last_coalesced, errors - last_errors);
+            }
+            static uint64_t last_content_counts = 0;
+            const uint64_t content_counts = g_win_content_counts.load(std::memory_order_relaxed);
+            const unsigned distinct = (unsigned)content_counts - (unsigned)last_content_counts;
+            const unsigned repeated = (unsigned)(content_counts >> 32) - (unsigned)(last_content_counts >> 32);
+            if (last_wall != 0)
+                std::fprintf(stderr, "  [prof GDI pixels] distintos/s=%.1f distintos=%u repetidos=%u\n",
+                    distinct / ((now - last_wall) / 1e9), distinct, repeated);
+            last_content_counts = content_counts;
+            last_blits = blits;
+            last_coalesced = coalesced;
+            last_errors = errors;
+        }
+#endif
+        last_dma = g_prof_dma_ns; last_vu = g_prof_vu_ns; last_pr = g_prof_present_ns; last_tri = tri; last_sprite = sprite; last_img = g_prof_img_ns;
+        last_wall = now; last_flips = flips; last_presented = presented;
 }
 
 void ps2_gs_vsync()
@@ -6454,6 +10247,7 @@ void ps2_gs_vsync()
     {
         std::lock_guard<std::mutex> lk(g_gs_mu);
         gs_prof_report();
+        if (g_field_audit) gs_field_report();
     }
 
     if (!g_giflog || g_gs_vsyncs % 120u != 0)
@@ -6550,6 +10344,23 @@ static unsigned g_vu0_runs = 0, g_vu1_runs = 0;
 
 static inline uint32_t* um_q(const VuUnit& u, uint32_t index) { return reinterpret_cast<uint32_t*>(u.data) + ((index & u.dmask) * 4u); }
 
+// Rastreia somente escritas na primeira palavra dos dois cabecalhos usados por VI03.
+// Chamado nos caminhos SQ/ISW da VU, nunca modifica o valor gravado.
+static void um_trace_header_write(const VuUnit& u, uint32_t qaddr, const char* op, uint32_t pc, uint32_t valor)
+{
+    if (!u.vu1 || !g_vu_header_trace)
+        return;
+    const uint32_t a = qaddr & u.dmask;
+    if (a != 0x1B8u && a != 0x339u)
+        return;
+    static uint64_t n = 0;
+    ++n;
+    if (n <= 64 || (n & 4095u) == 0)
+        std::fprintf(stderr, "  [VU1 WRITE MICRO] n=%llu pc=%04X %s D[%03X].x=%08X\n",
+            (unsigned long long)n, pc * 8u, op, a, valor);
+}
+
+
 static bool g_um_flags = true;   // calcula MAC/status? (so se algum programa carregado os le)
 
 // Algum programa le MAC/status? (FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR). Se nenhum le, o calculo e dispensavel.
@@ -6627,8 +10438,11 @@ static inline uint32_t um_p(float r)
     return b;
 }
 
-static void um_arith_fast(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc)
+template <int fixed_op = -1, int fixed_src = -1>
+static void um_arith_fast(Ctx& c, int runtime_op, int runtime_src, int dest, int fd, int fs, int ft, int to_acc)
 {
+    const int op = fixed_op >= 0 ? fixed_op : runtime_op;
+    const int src = fixed_src >= 0 ? fixed_src : runtime_src;
     float bq = 0.0f;
 
     if (src == VU_SRC_Q) bq = um_f(c.vi[22]);
@@ -6666,35 +10480,47 @@ static void um_arith_fast(Ctx& c, int op, int src, int dest, int fd, int fs, int
     }
 }
 
-// Igual a vu_arith, mas atualiza MAC/status (os programas ramificam por eles).
-static void um_arith(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc)
+// Mesmo calculo em double e mesmo empacotamento nos dois caminhos.
+template <bool masked, int fixed_op = -1, int fixed_src = -1>
+static void um_arith_exact(Ctx& c, int runtime_op, int runtime_src, int dest, int fd, int fs, int ft, int to_acc)
 {
-    if (!g_um_flags)
+    const int op = fixed_op >= 0 ? fixed_op : runtime_op;
+    const int src = fixed_src >= 0 ? fixed_src : runtime_src;
+    auto operand = [&](int lane) -> uint32_t
     {
-        um_arith_fast(c, op, src, dest, fd, fs, ft, to_acc);
-        return;
+        switch (src)
+        {
+            case VU_SRC_VEC: return c.vf[ft][lane];
+            case VU_SRC_X:   return c.vf[ft][0];
+            case VU_SRC_Y:   return c.vf[ft][1];
+            case VU_SRC_Z:   return c.vf[ft][2];
+            case VU_SRC_W:   return c.vf[ft][3];
+            case VU_SRC_Q:   return c.vi[22];
+            default:         return c.vi[21];
+        }
+    };
+
+    // As faixas mascaradas nao escrevem VF/ACC nem participam de MAC/status.
+    // Para broadcast, a mesma palavra e a mesma conversao servem a todas as faixas.
+    uint32_t shared = 0;
+    double broadcast = 0.0;
+    if (masked && src != VU_SRC_VEC)
+    {
+        shared = operand(0);
+        broadcast = ee_in(shared);
     }
 
     double res[4];
     uint32_t out[4];
-
     for (int l = 0; l < 4; l++)
     {
+        if (masked && !(dest & (8 >> l)))
+            continue;
+
         const uint32_t ab = c.vf[fs][l];
-        uint32_t bb;
-
-        switch (src)
-        {
-            case VU_SRC_VEC: bb = c.vf[ft][l]; break;
-            case VU_SRC_X:   bb = c.vf[ft][0]; break;
-            case VU_SRC_Y:   bb = c.vf[ft][1]; break;
-            case VU_SRC_Z:   bb = c.vf[ft][2]; break;
-            case VU_SRC_W:   bb = c.vf[ft][3]; break;
-            case VU_SRC_Q:   bb = c.vi[22]; break;
-            default:         bb = c.vi[21]; break;
-        }
-
-        const double a = ee_in(ab), b = ee_in(bb);
+        const uint32_t bb = masked && src != VU_SRC_VEC ? shared : operand(l);
+        const double a = ee_in(ab);
+        const double b = masked && src != VU_SRC_VEC ? broadcast : ee_in(bb);
         double r;
 
         switch (op)
@@ -6720,6 +10546,16 @@ static void um_arith(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, 
     }
 
     um_flags(c, res, dest);
+}
+
+static void um_arith(Ctx& c, int op, int src, int dest, int fd, int fs, int ft, int to_acc, bool optimize)
+{
+    if (!g_um_flags)
+        um_arith_fast(c, op, src, dest, fd, fs, ft, to_acc);
+    else if (optimize)
+        um_arith_exact<true>(c, op, src, dest, fd, fs, ft, to_acc);
+    else
+        um_arith_exact<false>(c, op, src, dest, fd, fs, ft, to_acc);
 }
 
 static void um_opmula(Ctx& c, int fs, int ft)
@@ -6788,9 +10624,397 @@ static void um_vu1_special(VuUnit& u, Ctx& c, UmLowerWrite& lw, unsigned idx, in
     c.vi[23] = ee_pack(r);
 }
 
-static void vu_run(VuUnit& u, uint32_t byte_addr)
+struct VuAotProgram
+{
+    const uint32_t* image;
+    unsigned (*run)(VuUnit&, uint32_t, unsigned, bool);
+};
+
+// Os includes AOT ja trazem operacao e fonte como constantes. Use-as
+// nos mesmos calculos para que o compilador elimine os switches.
+#if defined(PS2_VU1_AOT_SPECIALIZE)
+template <int op, int src>
+static void um_arith_aot(Ctx& c, int dest, int fd, int fs, int ft, int to_acc, bool optimize)
+{
+    if (!g_um_flags)
+        um_arith_fast<op, src>(c, op, src, dest, fd, fs, ft, to_acc);
+    else if (optimize)
+        um_arith_exact<true, op, src>(c, op, src, dest, fd, fs, ft, to_acc);
+    else
+        um_arith_exact<false, op, src>(c, op, src, dest, fd, fs, ft, to_acc);
+}
+#define um_arith(c, op, src, dest, fd, fs, ft, to_acc, optimize) \
+    um_arith_aot<op, src>(c, dest, fd, fs, ft, to_acc, optimize)
+#endif
+
+// O include e gerado pelo proprio runtime com microcodigo carregado pelo jogo.
+#if __has_include("ps2_vu1_aot_0350.inc")
+#include "ps2_vu1_aot_0350.inc"
+#endif
+#if __has_include("ps2_vu1_aot_0078.inc")
+#include "ps2_vu1_aot_0078.inc"
+#endif
+
+#if __has_include("ps2_vu1_aot_0658.inc")
+#include "ps2_vu1_aot_0658.inc"
+#endif
+
+#if defined(PS2_VU1_AOT_SPECIALIZE)
+#undef um_arith
+#endif
+
+static int vu_aot_target(uint32_t entry)
+{
+    switch (entry)
+    {
+        case 0x0350u: return 0;
+        case 0x0078u: return 1;
+        case 0x0658u: return 2;
+        default: return -1;
+    }
+}
+
+struct VuAotSelection
+{
+    const VuAotProgram* program = nullptr;
+    // Nulo indica que toda a imagem coincide com a captura.
+    const uint8_t* prefix = nullptr;
+};
+
+static VuAotSelection vu_aot_match(const VuUnit& u, int target)
+{
+    if (!u.vu1 || !g_vu_aot_enabled || g_vu_aot_capture || target < 0)
+        return {};
+
+    static const VuAotProgram* const programs[] = {
+#if __has_include("ps2_vu1_aot_0350.inc")
+        &vu_aot_0350,
+#else
+        nullptr,
+#endif
+#if __has_include("ps2_vu1_aot_0078.inc")
+        &vu_aot_0078,
+#else
+        nullptr,
+#endif
+#if __has_include("ps2_vu1_aot_0658.inc")
+        &vu_aot_0658,
+#else
+        nullptr,
+#endif
+    };
+    const VuAotProgram* program = programs[target];
+    if (program == nullptr)
+    {
+        ++g_prof_aot_missing;
+        return {};
+    }
+
+    struct Validation
+    {
+        uint32_t image[4096];
+        uint8_t prefix[2048];
+        bool ready = false;
+        bool exact = false;
+    };
+    // Guarda as duas ultimas imagens por entrada para reaproveitar a
+    // validacao quando o jogo alterna entre dois overlays.
+    static Validation validations[3][2];
+    static unsigned last_slot[3] = {};
+    static uint64_t last_revision[3] = {};
+    unsigned slot = last_slot[target];
+    if (g_vu_aot_revision_cache && u.micro == g_vu1_micro &&
+        validations[target][slot].ready && last_revision[target] == g_vu1_micro_revision)
+    {
+        ++g_prof_aot_revision_hits;
+        ++g_prof_aot_match;
+        return {program, nullptr};
+    }
+
+    auto matches = [&](const Validation& candidate)
+    {
+        return candidate.ready && std::memcmp(u.micro, candidate.image, sizeof candidate.image) == 0;
+    };
+    if (!matches(validations[target][slot]))
+    {
+        slot ^= 1u;
+    }
+    Validation& cache = validations[target][slot];
+    // Uma imagem nova ainda precisa passar pela comparacao exata.
+    if (slot != last_slot[target] && !matches(cache))
+    {
+        std::memcpy(cache.image, u.micro, sizeof cache.image);
+        cache.exact = std::memcmp(cache.image, program->image, sizeof cache.image) == 0;
+        if (!cache.exact)
+        {
+            unsigned consecutive = 0;
+            for (int pc = 2047; pc >= 0; --pc)
+            {
+                const unsigned word = (unsigned)pc * 2;
+                const bool same = cache.image[word] == program->image[word] &&
+                    cache.image[word + 1] == program->image[word + 1];
+                consecutive = same ? std::min(consecutive + 1, 8u) : 0;
+                cache.prefix[pc] = (uint8_t)consecutive;
+            }
+        }
+        cache.ready = true;
+    }
+
+    // So reutilize validacoes exatas da micromemoria real. Imagens
+    // parciais continuam no caminho anterior, inclusive apos overlays.
+    last_revision[target] = u.micro == g_vu1_micro && cache.exact ? g_vu1_micro_revision : 0;
+    last_slot[target] = slot;
+    if (cache.exact)
+    {
+        ++g_prof_aot_match;
+        return {program, nullptr};
+    }
+    ++g_prof_aot_mismatch;
+    return {program, cache.prefix};
+}
+
+// Emite apenas pares que nao alteram fluxo, Q pendente ou o GIF.
+static bool vu_aot_emit_pair(std::string& code, uint32_t pc, uint32_t lo, uint32_t hi)
+{
+    if ((hi & 0x78000000u) || (hi == 0 && lo == 0))
+        return false;
+
+    std::string lower, upper;
+    bool deferred = false;
+    const unsigned it = (lo >> 16) & 31u, is = (lo >> 11) & 31u, id = (lo >> 6) & 31u;
+    const unsigned ld = (lo >> 21) & 15u;
+    char line[256];
+
+    if (hi & 0x80000000u)
+    {
+        std::snprintf(line, sizeof line, "c.vi[21] = 0x%08Xu;\n", lo);
+        lower = line;
+    }
+    else if ((lo >> 25) == 0 || (lo >> 25) == 1)
+    {
+        const int imm = (int)(lo & 0x7FFu) - ((lo & 0x400u) ? 2048 : 0);
+        if ((lo >> 25) == 0)
+        {
+            std::snprintf(line, sizeof line, "um_set_vf(lw, %u, %u, um_q(u, c.vi[%u] + (uint32_t)(%d)));\n",
+                it, ld, is, imm);
+            deferred = true;
+        }
+        else
+        {
+            std::snprintf(line, sizeof line, "auto qaddr = c.vi[%u] + (uint32_t)(%d); auto* q = um_q(u, qaddr);\n",
+                it, imm);
+            lower = line;
+            for (unsigned l = 0; l < 4; ++l)
+                if (ld & (8u >> l))
+                {
+                    std::snprintf(line, sizeof line, "q[%u] = c.vf[%u][%u];\n", l, is, l);
+                    lower += line;
+                }
+            if (ld & 8u)
+            {
+                std::snprintf(line, sizeof line, "um_trace_header_write(u, qaddr, \"SQ\", %u, q[0]);\n", pc);
+                lower += line;
+            }
+            line[0] = 0;
+        }
+        lower += line;
+    }
+    else if ((lo >> 25) == 8 || (lo >> 25) == 9)
+    {
+        const unsigned imm = ((lo >> 10) & 0x7800u) | (lo & 0x7FFu);
+        if (it != 0)
+        {
+            std::snprintf(line, sizeof line, "c.vi[%u] = (c.vi[%u] %c %uu) & 0xFFFFu;\n",
+                it, is, (lo >> 25) == 8 ? '+' : '-', imm);
+            lower = line;
+        }
+    }
+    else if ((lo >> 25) == 0x40)
+    {
+        const unsigned funct = lo & 63u;
+        const unsigned idx = (id << 2) | (funct & 3u);
+        if (funct == 0x30 || funct == 0x31 || funct == 0x34 || funct == 0x35)
+        {
+            const char* name = funct == 0x30 ? "vu_iadd" : funct == 0x31 ? "vu_isub"
+                : funct == 0x34 ? "vu_iand" : "vu_ior";
+            std::snprintf(line, sizeof line, "%s(c, %u, %u, %u);\n", name, id, is, it);
+            lower = line;
+        }
+        else if (funct >= 0x3C && idx == 48)
+        {
+            std::snprintf(line, sizeof line, "um_set_vf(lw, %u, %u, c.vf[%u]);\n", it, ld, is);
+            lower = line;
+            deferred = true;
+        }
+        else if (funct >= 0x3C && (idx == 52 || idx == 54))
+        {
+            if (idx == 54 && is != 0)
+            {
+                std::snprintf(line, sizeof line, "c.vi[%u] = (c.vi[%u] - 1u) & 0xFFFFu;\n", is, is);
+                lower += line;
+            }
+            std::snprintf(line, sizeof line, "um_set_vf(lw, %u, %u, um_q(u, c.vi[%u]));\n", it, ld, is);
+            lower += line;
+            if (idx == 52 && is != 0)
+            {
+                std::snprintf(line, sizeof line, "c.vi[%u] = (c.vi[%u] + 1u) & 0xFFFFu;\n", is, is);
+                lower += line;
+            }
+            deferred = true;
+        }
+        else
+            return false;
+    }
+    else
+        return false;
+
+    const unsigned f = hi & 63u, d = (hi >> 21) & 15u, ft = (hi >> 16) & 31u;
+    const unsigned fs = (hi >> 11) & 31u, fd = (hi >> 6) & 31u;
+    const unsigned idx = (fd << 2) | (f & 3u);
+    static const int bc_ops[] = {VU_ADD,VU_SUB,VU_MADD,VU_MSUB,VU_MAX,VU_MIN,VU_MUL};
+    static const int ops[] = {VU_MUL,VU_MAX,VU_MUL,VU_MIN,VU_ADD,VU_MADD,VU_ADD,VU_MADD,
+        VU_SUB,VU_MSUB,VU_SUB,VU_MSUB,VU_ADD,VU_MADD,VU_MUL,VU_MAX,VU_SUB,VU_MSUB,0,VU_MIN};
+    static const int shift[] = {0,4,12,15};
+    int op = -1, src = VU_SRC_VEC;
+    bool acc = false;
+    if (f < 0x1C)
+    {
+        op = bc_ops[f >> 2];
+        src = VU_SRC_X + (int)(f & 3u);
+    }
+    else if (f == 0x2E)
+    {
+        std::snprintf(line, sizeof line, "um_opmsub(c, %u, %u, %u);\n", fd, fs, ft);
+        upper = line;
+    }
+    else if (f < 0x30)
+    {
+        op = ops[f - 0x1C];
+        if (f < 0x28)
+            src = (f == 0x1C || (f >= 0x20 && ((f - 0x20) & 2u) == 0)) ? VU_SRC_Q : VU_SRC_I;
+    }
+    else if (f >= 0x3C && idx < 16)
+    {
+        op = bc_ops[idx >> 2]; src = VU_SRC_X + (int)(idx & 3u); acc = true;
+    }
+    else if (f >= 0x3C && idx < 24)
+    {
+        std::snprintf(line, sizeof line, "%s(c, %u, %u, %u, %d);\n",
+            idx < 20 ? "vu_itof" : "vu_ftoi", d, ft, fs, shift[idx & 3u]);
+        upper = line;
+    }
+    else if (f >= 0x3C && idx < 28)
+    {
+        op = VU_MUL; src = VU_SRC_X + (int)(idx - 24); acc = true;
+    }
+    else if (f >= 0x3C && (idx == 28 || idx == 30 || (idx >= 32 && idx <= 45 && idx != 43)))
+    {
+        static const int acc_ops[] = {VU_ADD,VU_MADD,VU_ADD,VU_MADD,VU_SUB,VU_MSUB,VU_SUB,VU_MSUB,
+            VU_ADD,VU_MADD,VU_MUL,0,VU_SUB,VU_MSUB};
+        op = idx < 32 ? VU_MUL : acc_ops[idx - 32];
+        src = idx >= 40 ? VU_SRC_VEC : (idx == 30 || (idx >= 32 && (idx & 2u))) ? VU_SRC_I : VU_SRC_Q;
+        acc = true;
+    }
+    else if (f >= 0x3C && (idx == 29 || idx == 31 || idx == 46))
+    {
+        if (idx == 29)
+            std::snprintf(line, sizeof line, "vu_abs(c, %u, %u, %u);\n", d, ft, fs);
+        else
+            std::snprintf(line, sizeof line, "%s(c, %u, %u);\n", idx == 31 ? "vu_clipw" : "um_opmula", fs, ft);
+        upper = line;
+    }
+    else if (f >= 0x3C && idx == 47)
+    {
+        // NOP upper.
+    }
+    else
+        return false;
+
+    if (op >= 0)
+    {
+        std::snprintf(line, sizeof line, "um_arith(c, %d, %d, %u, %u, %u, %u, %u, optimize);\n",
+            op, src, d, acc ? 0u : fd, fs, ft, (unsigned)acc);
+        upper = line;
+    }
+
+    // Lower le/escreve antes do upper; uma escrita VF adiada so entra depois.
+    code += "{\n";
+    if (deferred) code += "UmLowerWrite lw;\n";
+    code += lower + upper;
+    if (deferred)
+        code += "if (lw.vf != 0) for (int lane = 0; lane < 4; ++lane)"
+                " if (lw.mask & (8 >> lane)) c.vf[lw.vf][lane] = lw.v[lane];\n";
+    code += "c.vf[0][0] = c.vf[0][1] = c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u; c.vi[0] = 0;\n}\n";
+    return true;
+}
+
+static bool vu_aot_generate(const uint32_t* image, uint32_t entry, const uint32_t* visits)
+{
+    char name[48], tmp[56], suffix[8];
+    std::snprintf(suffix, sizeof suffix, "%04x", entry);
+    std::snprintf(name, sizeof name, "ps2_vu1_aot_%s.inc", suffix);
+    std::snprintf(tmp, sizeof tmp, "%s.tmp", name);
+    FILE* out = std::fopen(tmp, "wb");
+    if (out == nullptr)
+    {
+        std::fprintf(stderr, "  [VU1 AOT] falha ao abrir %s\n", tmp);
+        return false;
+    }
+
+    std::fprintf(out, "// Gerado pelo Ring of Judgment para a VU1.\nstatic const uint32_t vu_aot_image_%s[] = {\n", suffix);
+    for (unsigned i = 0; i < 4096; ++i)
+        std::fprintf(out, "0x%08Xu,%s", image[i], (i & 7u) == 7 ? "\n" : " ");
+    std::fprintf(out, "};\nstatic unsigned vu_aot_run_%s(VuUnit& u, uint32_t pc, unsigned budget, bool optimize)\n"
+        "{\nCtx& c = *u.r;\nswitch (pc) {\n", suffix);
+
+    unsigned blocks = 0;
+    for (unsigned pc = 0; pc < 2048; ++pc)
+    {
+        if (visits[pc] == 0)
+            continue;
+        std::string code;
+        unsigned n = 0;
+        for (; n < 8 && pc + n < 2048 && visits[pc + n] != 0; ++n)
+        {
+            const unsigned k = (pc + n) * 2;
+            if (!vu_aot_emit_pair(code, pc + n, image[k], image[k + 1]))
+                break;
+        }
+        if (n < 2)
+            continue;
+        std::fprintf(out, "case %u: { if (budget < %u) return 0;\n%sreturn %u; }\n", pc, n, code.c_str(), n);
+        ++blocks;
+    }
+    std::fprintf(out, "default: return 0;\n}\n}\nstatic const VuAotProgram vu_aot_%s"
+        "{vu_aot_image_%s, vu_aot_run_%s};\n", suffix, suffix, suffix);
+    const bool write_ok = std::ferror(out) == 0;
+    const bool close_ok = std::fclose(out) == 0;
+    if (!write_ok || !close_ok)
+    {
+        std::remove(tmp);
+        std::fprintf(stderr, "  [VU1 AOT] falha ao gravar %s\n", tmp);
+        return false;
+    }
+    // No Windows, um arquivo anterior pode impedir a troca. Preserve-o;
+    // o temporario fica disponivel para o usuario escolher a captura.
+    if (std::rename(tmp, name) != 0)
+    {
+        std::fprintf(stderr, "  [VU1 AOT] falha ao publicar %s; captura em %s\n", name, tmp);
+        return false;
+    }
+    std::fprintf(stderr, "  [VU1 AOT] entrada=0x%04X blocos=%u arquivo=%s\n", entry, blocks, name);
+    return true;
+}
+
+static unsigned vu_run(VuUnit& u, uint32_t byte_addr)
 {
     Ctx& c = *u.r;
+    const bool optimize = u.vu1 && g_vu1_fast;
+    auto arith = [&](int op, int src, int dest, int fd, int fs, int ft, int to_acc)
+    {
+        um_arith(c, op, src, dest, fd, fs, ft, to_acc, optimize);
+    };
+    struct DbgVuMark { DbgVuMark(uint32_t a) { g_dbg_vu[0] = a; g_dbg_vu[1] = 0; g_dbg_vu[2] = 1; } ~DbgVuMark() { g_dbg_vu[2] = 0; } } dbg_vu_mark(byte_addr);
     const uint32_t* mem = reinterpret_cast<const uint32_t*>(u.micro);
     uint32_t pc = (byte_addr >> 3) & u.imask;
     int pend_target = -1, pend_cd = 0;
@@ -6798,19 +11022,57 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
     uint32_t q_val = 0;
     int q_cd = 0;
     unsigned steps = 0;
-    const unsigned kMaxSteps = 300000u, kTraceFrom = kMaxSteps - 64u;
+    // Programa que ja estourou o limite antes (dado de entrada invalido) volta a rodar com um limite 10x menor:
+    // cada estouro de 300000 pares custa ~15 ms de CPU, e o mesmo programa estoura a cada quadro.
+    // PS2_VU_MAXSTEPS=n fixa o limite.
+    static unsigned s_aborts[2][2048];
+    static const unsigned s_env_max = std::getenv("PS2_VU_MAXSTEPS") ? (unsigned)std::atoi(std::getenv("PS2_VU_MAXSTEPS")) : 0u;
+    unsigned& abort_count = s_aborts[u.vu1 ? 1 : 0][(byte_addr >> 3) & 0x7FFu];
+    const unsigned kMaxSteps = s_env_max != 0 ? s_env_max : (abort_count >= 2 ? 20000u : 300000u);
+    const unsigned kTraceFrom = kMaxSteps > 64u ? kMaxSteps - 64u : 0u;
     struct UmRec { uint32_t pc, lo, hi; } ring[64];
     unsigned ring_n = 0;
+    const int target = u.vu1 ? vu_aot_target(byte_addr) : -1;
+    const VuAotSelection aot = vu_aot_match(u, target);
+    uint64_t aot_pairs = 0;
+    static uint32_t visits[2048];
+    static bool captured[3] = {};
+    const bool capture = target >= 0 && !captured[target] &&
+        (!g_vu_aot_capture_0658_only || target == 2) &&
+        g_vu_aot_armed.load(std::memory_order_relaxed);
+    if (capture)
+        std::fill(std::begin(visits), std::end(visits), 0u);
 
     c.vf[0][0] = 0; c.vf[0][1] = 0; c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u;
 
     for (; steps < kMaxSteps; steps++)
     {
+        if ((steps & 0x3FFu) == 0)
+            g_dbg_vu[1] = steps;
+
+        if (aot.program != nullptr && q_cd == 0 && pend_cd == 0 && !end_pending && steps < kTraceFrom)
+        {
+            unsigned budget = std::min(kTraceFrom - steps, 1024u - (steps & 0x3FFu));
+            // O include antigo tambem verifica o tamanho do bloco antes de
+            // executar. Limite o orcamento aos pares de codigo identicos.
+            if (aot.prefix != nullptr)
+                budget = std::min(budget, (unsigned)aot.prefix[pc]);
+            const unsigned count = budget >= 2 ? aot.program->run(u, pc, budget, optimize) : 0;
+            if (count != 0)
+            {
+                pc = (pc + count) & u.imask;
+                steps += count - 1;
+                aot_pairs += count;
+                continue;
+            }
+        }
+
         if (q_cd > 0 && --q_cd == 0)
             c.vi[22] = q_val;
 
         const uint32_t cur = pc;
         const uint32_t lo = mem[cur * 2], hi = mem[cur * 2 + 1];
+        if (capture) ++visits[cur];
         pc = (pc + 1) & u.imask;
 
         if (steps >= kTraceFrom)
@@ -6848,18 +11110,55 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                 {
                     uint32_t* q = um_q(u, c.vi[it] + (uint32_t)imm11);
                     for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vf[is][l];
+                    if (dest & 8) um_trace_header_write(u, c.vi[it] + (uint32_t)imm11, "SQ", cur, q[0]);
                     break;
                 }
                 case 0x04:   // ILW
                 {
-                    const uint32_t* q = um_q(u, c.vi[is] + (uint32_t)imm11);
-                    if (it != 0) c.vi[it] = q[um_first_lane(dest)] & 0xFFFFu;
+                    const uint32_t origem = c.vi[is];
+                    const uint32_t indice = (origem + (uint32_t)imm11) & u.dmask;
+                    const uint32_t* q = um_q(u, origem + (uint32_t)imm11);
+                    uint32_t valor = q[um_first_lane(dest)] & 0xFFFFu;
+
+                    // TESTE A/B APENAS (PS2_VU_FLAG_TEST=1): se o bit 15 de 0x803E for
+                    // realmente um marcador de pacote, experimenta executar com o contador 62.
+                    // Restringe-se a ILW.x -> VI03 em tres PCs observados nos logs;
+                    // nao altera os dados na memoria VU1. NUNCA habilitar como correcao final.
+                    if (u.vu1 && it == 3 && dest == 8 && valor == 0x803Eu &&
+                        (cur * 8u == 0x0090u || cur * 8u == 0x0368u || cur * 8u == 0x0678u) &&
+                        g_vu_flag_test)
+                    {
+                        valor = 0x003Eu;
+                        static uint64_t flags_testados = 0;
+                        ++flags_testados;
+                        if (flags_testados <= 32 || (flags_testados & 4095u) == 0)
+                            std::fprintf(stderr, "  [VU1 TESTE FLAG] n=%llu pc=%04X D[%03X].x=%08X contador=%u (SOMENTE TESTE)\n",
+                                (unsigned long long)flags_testados, cur * 8u, indice, q[um_first_lane(dest)], valor);
+                    }
+
+                    // Diagnostico sob demanda: investiga de onde vem o contador VI03 dos lacos VU1.
+                    // Nao altera registradores, transferencias nem o comportamento do jogo.
+                    // Ative apenas no teste com PS2_VU_COUNT_TRACE=1 (variavel presente).
+                    if (u.vu1 && it == 3 && g_vu_count_trace)
+                    {
+                        static uint64_t amostras = 0;
+                        ++amostras;
+                        if (amostras <= 48 || (amostras & 2047u) == 0)
+                            std::fprintf(stderr,
+                                "  [VU1 CONTAGEM] inicio=0x%05X pc=0x%04X TOP=0x%03X VI%02d=0x%04X desloc=%d D[0x%03X].%c=0x%08X VI03=%u amostra=%llu\n",
+                                byte_addr, cur * 8u, g_vif1_top, is, origem & 0xFFFFu,
+                                imm11, indice, "xyzw"[um_first_lane(dest)], q[um_first_lane(dest)],
+                                valor, (unsigned long long)amostras);
+                    }
+
+                    if (it != 0) c.vi[it] = valor;
                     break;
                 }
                 case 0x05:   // ISW
                 {
                     uint32_t* q = um_q(u, c.vi[is] + (uint32_t)imm11);
                     for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vi[it] & 0xFFFFu;
+                    if (dest & 8) um_trace_header_write(u, c.vi[is] + (uint32_t)imm11, "ISW", cur, q[0]);
                     break;
                 }
                 case 0x08: case 0x09:   // IADDIU / ISUBIU
@@ -6875,6 +11174,8 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                 case 0x14: case 0x15: case 0x16: case 0x17:   // FSEQ FSSET FSAND FSOR
                 {
                     const uint32_t imm12 = ((lo >> 10) & 0x800u) | (lo & 0x7FFu);
+                    if (!u.vu1 && g_vu0_status_trace && op7 != 0x15 && it != 0)
+                        vu0_status_record(Vu0StatusEvent::MicroReadStatus, cur * 8u, c.vi[16]);
                     if (op7 == 0x14 && it != 0) c.vi[it] = ((c.vi[16] & 0xFFFu) == imm12) ? 1u : 0u;
                     else if (op7 == 0x15) c.vi[16] = (c.vi[16] & 0x3Fu) | (imm12 & 0xFC0u);
                     else if (op7 == 0x16 && it != 0) c.vi[it] = c.vi[16] & imm12;
@@ -6933,6 +11234,7 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                             if (idx == 55 && it != 0) c.vi[it] = (c.vi[it] - 1u) & 0xFFFFu;
                             uint32_t* q = um_q(u, c.vi[it]);
                             for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vf[is][l];
+                            if (dest & 8) um_trace_header_write(u, c.vi[it], idx == 53 ? "SQI" : "SQD", cur, q[0]);
                             if (idx == 53 && it != 0) c.vi[it] = (c.vi[it] + 1u) & 0xFFFFu;
                             break;
                         }
@@ -6943,6 +11245,13 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                             if (idx == 56) vu_div(c, is, fsf, it, ftf);
                             else if (idx == 57) vu_sqrt(c, it, ftf);
                             else vu_rsqrt(c, is, fsf, it, ftf);
+                            if (!u.vu1 && g_vu0_status_trace)
+                            {
+                                constexpr Vu0StatusEvent events[] = {
+                                    Vu0StatusEvent::MicroDiv, Vu0StatusEvent::MicroSqrt, Vu0StatusEvent::MicroRsqrt
+                                };
+                                vu0_status_record(events[idx - 56], cur * 8u, c.vi[16]);
+                            }
                             q_val = c.vi[22];
                             c.vi[22] = old_q;
                             q_cd = idx == 58 ? 13 : 7;
@@ -6952,7 +11261,7 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                         case 60: vu_mtir(c, it, is, fsf); break;                          // MTIR
                         case 61: { uint32_t v = (uint32_t)(int32_t)(int16_t)c.vi[is]; uint32_t t[4] = { v, v, v, v }; um_set_vf(lw, it, dest, t); break; }   // MFIR
                         case 62: { const uint32_t* q = um_q(u, c.vi[is]); if (it != 0) c.vi[it] = q[um_first_lane(dest)] & 0xFFFFu; break; }   // ILWR
-                        case 63: { uint32_t* q = um_q(u, c.vi[is]); for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vi[it] & 0xFFFFu; break; }   // ISWR
+                        case 63: { uint32_t* q = um_q(u, c.vi[is]); for (int l = 0; l < 4; l++) if (dest & (8 >> l)) q[l] = c.vi[it] & 0xFFFFu; if (dest & 8) um_trace_header_write(u, c.vi[is], "ISWR", cur, q[0]); break; }   // ISWR
                         case 64:   // RNEXT
                         {
                             uint32_t r = c.vi[20];
@@ -6983,32 +11292,32 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
             if (funct < 0x1C)
             {
                 static const int ops[7] = { VU_ADD, VU_SUB, VU_MADD, VU_MSUB, VU_MAX, VU_MIN, VU_MUL };
-                um_arith(c, ops[funct >> 2], VU_SRC_X + (int)(funct & 3), dest, fd, fs, ft, 0);
+                arith(ops[funct >> 2], VU_SRC_X + (int)(funct & 3), dest, fd, fs, ft, 0);
             }
             else if (funct < 0x30)
             {
                 switch (funct)
                 {
-                    case 0x1C: um_arith(c, VU_MUL,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
-                    case 0x1D: um_arith(c, VU_MAX,  VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x1E: um_arith(c, VU_MUL,  VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x1F: um_arith(c, VU_MIN,  VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x20: um_arith(c, VU_ADD,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
-                    case 0x21: um_arith(c, VU_MADD, VU_SRC_Q, dest, fd, fs, ft, 0); break;
-                    case 0x22: um_arith(c, VU_ADD,  VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x23: um_arith(c, VU_MADD, VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x24: um_arith(c, VU_SUB,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
-                    case 0x25: um_arith(c, VU_MSUB, VU_SRC_Q, dest, fd, fs, ft, 0); break;
-                    case 0x26: um_arith(c, VU_SUB,  VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x27: um_arith(c, VU_MSUB, VU_SRC_I, dest, fd, fs, ft, 0); break;
-                    case 0x28: um_arith(c, VU_ADD,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
-                    case 0x29: um_arith(c, VU_MADD, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
-                    case 0x2A: um_arith(c, VU_MUL,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
-                    case 0x2B: um_arith(c, VU_MAX,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
-                    case 0x2C: um_arith(c, VU_SUB,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
-                    case 0x2D: um_arith(c, VU_MSUB, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x1C: arith(VU_MUL,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x1D: arith(VU_MAX,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x1E: arith(VU_MUL,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x1F: arith(VU_MIN,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x20: arith(VU_ADD,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x21: arith(VU_MADD, VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x22: arith(VU_ADD,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x23: arith(VU_MADD, VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x24: arith(VU_SUB,  VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x25: arith(VU_MSUB, VU_SRC_Q, dest, fd, fs, ft, 0); break;
+                    case 0x26: arith(VU_SUB,  VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x27: arith(VU_MSUB, VU_SRC_I, dest, fd, fs, ft, 0); break;
+                    case 0x28: arith(VU_ADD,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x29: arith(VU_MADD, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2A: arith(VU_MUL,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2B: arith(VU_MAX,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2C: arith(VU_SUB,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;
+                    case 0x2D: arith(VU_MSUB, VU_SRC_VEC, dest, fd, fs, ft, 0); break;
                     case 0x2E: um_opmsub(c, fd, fs, ft); break;
-                    default:   um_arith(c, VU_MIN,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;   // 0x2F MINI
+                    default:   arith(VU_MIN,  VU_SRC_VEC, dest, fd, fs, ft, 0); break;   // 0x2F MINI
                 }
             }
             else if (funct >= 0x3C)
@@ -7018,30 +11327,30 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
                 if (idx < 16)
                 {
                     static const int ops[4] = { VU_ADD, VU_SUB, VU_MADD, VU_MSUB };
-                    um_arith(c, ops[idx >> 2], VU_SRC_X + (int)(idx & 3), dest, 0, fs, ft, 1);
+                    arith(ops[idx >> 2], VU_SRC_X + (int)(idx & 3), dest, 0, fs, ft, 1);
                 }
                 else if (idx < 20) { static const int n[4] = { 0, 4, 12, 15 }; vu_itof(c, dest, ft, fs, n[idx - 16]); }
                 else if (idx < 24) { static const int n[4] = { 0, 4, 12, 15 }; vu_ftoi(c, dest, ft, fs, n[idx - 20]); }
-                else if (idx < 28) um_arith(c, VU_MUL, VU_SRC_X + (int)(idx - 24), dest, 0, fs, ft, 1);
+                else if (idx < 28) arith(VU_MUL, VU_SRC_X + (int)(idx - 24), dest, 0, fs, ft, 1);
                 else switch (idx)
                 {
-                    case 28: um_arith(c, VU_MUL,  VU_SRC_Q, dest, 0, fs, ft, 1); break;   // MULAq
+                    case 28: arith(VU_MUL,  VU_SRC_Q, dest, 0, fs, ft, 1); break;   // MULAq
                     case 29: vu_abs(c, dest, ft, fs); break;
-                    case 30: um_arith(c, VU_MUL,  VU_SRC_I, dest, 0, fs, ft, 1); break;   // MULAi
+                    case 30: arith(VU_MUL,  VU_SRC_I, dest, 0, fs, ft, 1); break;   // MULAi
                     case 31: vu_clipw(c, fs, ft); break;
-                    case 32: um_arith(c, VU_ADD,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
-                    case 33: um_arith(c, VU_MADD, VU_SRC_Q, dest, 0, fs, ft, 1); break;
-                    case 34: um_arith(c, VU_ADD,  VU_SRC_I, dest, 0, fs, ft, 1); break;
-                    case 35: um_arith(c, VU_MADD, VU_SRC_I, dest, 0, fs, ft, 1); break;
-                    case 36: um_arith(c, VU_SUB,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
-                    case 37: um_arith(c, VU_MSUB, VU_SRC_Q, dest, 0, fs, ft, 1); break;
-                    case 38: um_arith(c, VU_SUB,  VU_SRC_I, dest, 0, fs, ft, 1); break;
-                    case 39: um_arith(c, VU_MSUB, VU_SRC_I, dest, 0, fs, ft, 1); break;
-                    case 40: um_arith(c, VU_ADD,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
-                    case 41: um_arith(c, VU_MADD, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
-                    case 42: um_arith(c, VU_MUL,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
-                    case 44: um_arith(c, VU_SUB,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
-                    case 45: um_arith(c, VU_MSUB, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 32: arith(VU_ADD,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 33: arith(VU_MADD, VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 34: arith(VU_ADD,  VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 35: arith(VU_MADD, VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 36: arith(VU_SUB,  VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 37: arith(VU_MSUB, VU_SRC_Q, dest, 0, fs, ft, 1); break;
+                    case 38: arith(VU_SUB,  VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 39: arith(VU_MSUB, VU_SRC_I, dest, 0, fs, ft, 1); break;
+                    case 40: arith(VU_ADD,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 41: arith(VU_MADD, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 42: arith(VU_MUL,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 44: arith(VU_SUB,  VU_SRC_VEC, dest, 0, fs, ft, 1); break;
+                    case 45: arith(VU_MSUB, VU_SRC_VEC, dest, 0, fs, ft, 1); break;
                     case 46: um_opmula(c, fs, ft); break;
                     default: break;   // 47 NOP
                 }
@@ -7049,7 +11358,9 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
         }
 
         // escrita adiada do lower (LQ, MOVE...): depois do upper, para ele ter lido os valores antigos
-        if (lw.vf != 0)
+        if (optimize && lw.vf != 0 && lw.mask == 15)
+            std::memcpy(c.vf[lw.vf], lw.v, sizeof(lw.v));
+        else if (lw.vf != 0)
             for (int l = 0; l < 4; l++)
                 if (lw.mask & (8 >> l)) c.vf[lw.vf][l] = lw.v[l];
 
@@ -7077,7 +11388,10 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
 
     if (steps >= kMaxSteps)
     {
-        std::fprintf(stderr, "  [VU%d] programa em 0x%04X nao terminou em %u instrucoes: abortado\n", u.vu1 ? 1 : 0, byte_addr, kMaxSteps);
+        abort_count++;
+
+        if (abort_count <= 3 || (abort_count & 255u) == 0)
+            std::fprintf(stderr, "  [VU%d] programa em 0x%04X nao terminou em %u instrucoes: abortado (%u vezes)\n", u.vu1 ? 1 : 0, byte_addr, kMaxSteps, abort_count);
 
         // despeja o laco (ultimas 64 instrucoes) e os registradores, uma vez por endereco
         static uint32_t dumped[8];
@@ -7128,7 +11442,18 @@ static void vu_run(VuUnit& u, uint32_t byte_addr)
         }
     }
 
+    if (capture)
+    {
+        // Uma tentativa por entrada evita regravar a captura a cada quadro.
+        captured[target] = true;
+        vu_aot_generate(mem, byte_addr, visits);
+    }
+    g_prof_aot_pairs += aot_pairs;
+    if (aot.prefix != nullptr)
+        g_prof_aot_partial_pairs += aot_pairs;
     u.pc = pc;
+    // A iteracao que sai por break tambem executou um par.
+    return steps + (steps < kMaxSteps ? 1u : 0u);
 }
 
 // VU1: estado proprio (so VF, ACC, VI, Q, P, I, R e flags importam; o resto do Ctx fica sem uso).
@@ -7155,16 +11480,50 @@ void vu1_run(uint32_t byte_addr)
     if (g_vu1_dirty) { g_vu1_flags = um_scan_flag_readers(g_vu1_micro, 2048); g_vu1_dirty = false; }
 
     g_um_flags = g_vu1_flags;
+
+    // Programa 0x1720 (clipper de poligonos do Shadow Hearts): a contagem de triangulos fica em D[0x10].x e o laco a
+    // decrementa ANTES de testar. Com contagem 0 ele da a volta (0xFFFF) e roda 65535 voltas sobre lixo; no hardware o jogo
+    // nunca manda isso, entao pacote com contagem 0 (ou maior que cabe na memoria) e pacote vazio: nao roda.
+    // PS2_VU_NOCNTGUARD=1 desliga.
+    static const bool no_cnt_guard = std::getenv("PS2_VU_NOCNTGUARD") != nullptr;
+
+    if (!no_cnt_guard && byte_addr == 0x1720u)
+    {
+        const uint32_t cnt = reinterpret_cast<const uint32_t*>(g_vu1_data)[16 * 4] & 0xFFFFu;
+
+        if (cnt == 0 || cnt > 400u)
+        {
+            static unsigned skipped = 0;
+            skipped++;
+
+            if (skipped <= 3 || (skipped & 1023u) == 0)
+                std::fprintf(stderr, "  [VU1] 0x1720: contagem de triangulos invalida (%u) -> pacote ignorado (%u vezes)\n", cnt, skipped);
+
+            return;
+        }
+    }
+
     const uint64_t pt0 = prof_now();
+    const uint64_t kick_before = g_prof_kick_ns;
     VuUnit u = { &g_vu1_regs, g_vu1_micro, g_vu1_data, 0x7FFu, 0x3FFu, true, g_vu1_pc };
-    vu_run(u, byte_addr);
+    const unsigned pairs = vu_run(u, byte_addr);
     g_vu1_pc = u.pc;
-    g_prof_vu_ns += prof_now() - pt0;
+    const uint64_t elapsed = prof_now() - pt0;
+    g_prof_vu_ns += elapsed;
+    if (g_perf_vif1)
+    {
+        Vu1Profile& p = g_prof_vu1[(byte_addr >> 3) & 0x7FFu];
+        ++p.calls;
+        p.pairs += pairs;
+        p.ns += elapsed;
+        p.kick_ns += g_prof_kick_ns - kick_before;
+    }
 }
 
 // XGKICK: envia ao GIF (PATH1), a partir do quadword indicado da memoria de dados do VU1, ate o pacote com EOP.
 void vu1_xgkick(uint32_t qaddr)
 {
+    const uint64_t start = g_perf_vif1 ? prof_now() : 0;
     uint32_t a = qaddr & 0x3FFu;
     bool eop = false;
 
@@ -7185,6 +11544,8 @@ void vu1_xgkick(uint32_t qaddr)
     }
 
     g_gs.xgkicks++;
+    if (g_perf_vif1)
+        g_prof_kick_ns += prof_now() - start;
 }
 
 // VCALLMS / VCALLMSR: roda o microprograma (interpretador acima). PS2_VU0LOG=1 mostra o inicio de cada programa novo.
@@ -7248,10 +11609,12 @@ static void irq_debug_print()
 {
     uint64_t now = hw_now_ns();
 
-    std::fprintf(stderr, "interrupcoes: EIE=%d dentro_de_handler=%d mascara_intc=0x%X pendente=%d flags=0x%X\n",
-                 g_irq_enabled ? 1 : 0, g_in_irq ? 1 : 0, g_intc_mask, (int)g_irq_pending, g_irq_flags.load());
-    std::fprintf(stderr, "  timer0: modo=0x%llX comparacao=0x%llX\n", (unsigned long long)g_timer0_mode,
-                 (unsigned long long)g_timer0_comp);
+    const uint32_t pending = g_irq_pending.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "interrupcoes: EIE=%d dentro_de_handler=%d mascara_intc=0x%X vblank_pendente=%u timer0_pendente=%u\n",
+                 g_irq_enabled ? 1 : 0, g_in_irq ? 1 : 0, g_intc_mask.load(),
+                 pending >> irq_timer0_bits, pending & irq_timer0_mask);
+    std::fprintf(stderr, "  timer0: modo=0x%llX comparacao=0x%llX\n", (unsigned long long)g_timer0_mode.load(),
+                 (unsigned long long)g_timer0_comp.load());
 
     for (int cause = 0; cause < 32; cause++)
     {
@@ -7265,8 +11628,32 @@ static void irq_debug_print()
 
 // Chama os handlers da causa com uma copia do contexto e uma pilha propria; o contexto da thread
 // interrompida nao e alterado.
-static void irq_deliver_cause(Ctx& c, uint32_t cause)
+// SysTool::GetTimer le o contador +0x18 desse CTimer passivo.
+static void timer0_restore_sys_ticks(Ctx& c, uint32_t extra)
 {
+    constexpr uint32_t sys_timer_gp_offset = 0xFFFF85D0u;
+    const uint32_t gp_slot = ee_phys((uint32_t)c.r[28].lo + sys_timer_gp_offset);
+    if (!c.mem || gp_slot > (32u << 20) - 4u)
+        return;
+
+    const uint32_t timer = ee_phys(mrd<uint32_t>(c, gp_slot));
+    if (timer == 0 || timer > (32u << 20) - 0x1Cu)
+        return;
+
+    // O relogio e passivo (tipo 0), usa Timer 0 (fonte 2) e respeita pausa.
+    if (mrd<uint8_t>(c, timer + 4u) != 0 ||
+        mrd<uint8_t>(c, timer + 5u) != 2 ||
+        (mrd<uint8_t>(c, timer + 8u) & 9u) != 9u)
+        return;
+
+    const uint32_t ticks = mrd<uint32_t>(c, timer + 0x18u);
+    mwr<uint32_t>(c, timer + 0x18u, ticks + extra);
+    g_timer0_sys_ticks_recovered += extra;
+}
+
+static void irq_deliver_cause(Ctx& c, uint32_t cause, uint32_t timer_events = 1)
+{
+    const Timer0StageScope timer0_stage(cause == 2 ? Timer0EeStage::Vblank : Timer0EeStage::Timer0);
     g_irq_count[cause & 31u]++;
     g_irq_last_ns[cause & 31u] = hw_now_ns();
 
@@ -7319,6 +11706,9 @@ static void irq_deliver_cause(Ctx& c, uint32_t cause)
     if (!(g_intc_mask & (1u << cause)))
         return;
 
+    if (cause == 9)
+        g_timer0_delivered.fetch_add(1, std::memory_order_relaxed);
+
     std::vector<IntcHandler> list = g_intc_handlers;
 
     for (size_t i = 0; i < list.size(); i++)
@@ -7331,8 +11721,67 @@ static void irq_deliver_cause(Ctx& c, uint32_t cause)
         irq.r[4].lo = cause;
         irq.r[5].lo = list[i].arg;
         irq.r[6].lo = 0;
+        if (cause == 9 && list[i].fn == 0x0022E470u && timer_events > 1)
+            timer0_restore_sys_ticks(irq, timer_events - 1);
         ps2_call(irq, list[i].fn);
     }
+}
+
+// Ambos os caminhos consomem os mesmos lotes. No modo de perfil,
+// conta tambem VBLANKs pendentes que excedem o limite de entrega.
+static void irq_deliver_pending(Ctx& c, uint32_t pending, bool idle)
+{
+    if (const uint32_t count = pending >> irq_timer0_bits)
+    {
+        const uint32_t n = g_vsync_catchup ? std::min(count, 4u) : 1u;
+        if (g_perf_cadence)
+        {
+            ++g_cadence_ee.batches;
+            g_cadence_ee.multiple += count > 1;
+            g_cadence_ee.max_pending = std::max(g_cadence_ee.max_pending, count);
+            g_cadence_ee.dropped += count - n;
+        }
+
+        for (uint32_t k = 0; k < n; k++)
+        {
+            if (g_perf_cadence && idle) ++g_cadence_ee.idle_vblanks;
+            irq_deliver_cause(c, 2);
+            g_vsync_del++;
+        }
+    }
+
+    if (const uint32_t timer_events = pending & irq_timer0_mask)
+        irq_deliver_cause(c, 9, timer_events);
+}
+
+// Um handler pode acordar uma thread de prioridade maior.
+static void irq_preempt_if_ready()
+{
+    if (g_kernel_ready)
+    {
+        std::unique_lock<std::mutex> lk(g_mu);
+        maybe_preempt(lk, g_running);
+    }
+}
+
+// Consome so o contador do Timer 0. VBLANK e a apresentacao continuam
+// nos pontos normais do EE. A operacao atomica preserva sinais novos.
+static void irq_poll_timer0_at_dma(Ctx& c)
+{
+    if (g_in_irq || !g_irq_enabled || !(g_intc_mask.load() & (1u << 9)) ||
+        !(g_irq_pending.load(std::memory_order_relaxed) & irq_timer0_mask))
+        return;
+
+    const uint32_t timer_events = g_irq_pending.fetch_and(~irq_timer0_mask,
+        std::memory_order_acq_rel) & irq_timer0_mask;
+    if (!timer_events)
+        return;
+
+    g_in_irq = true;
+    ++g_timer0_dma_delivered;
+    irq_deliver_cause(c, 9, timer_events);
+    g_in_irq = false;
+    irq_preempt_if_ready();
 }
 
 // Chamada pelo codigo gerado quando o tique liga g_irq_pending.
@@ -7341,28 +11790,15 @@ void ps2_irq_poll(Ctx& c)
     if (g_in_irq || !g_irq_enabled)
         return;
 
-    uint32_t flags = g_irq_flags.exchange(0);
-    g_irq_pending = 0;
+    const uint32_t pending = g_irq_pending.exchange(0, std::memory_order_acq_rel);
 
-    if (flags == 0)
+    if (pending == 0)
         return;
 
     g_in_irq = true;
-
-    if (flags & 1u)
-        irq_deliver_cause(c, 2);
-
-    if (flags & 2u)
-        irq_deliver_cause(c, 9);
-
+    irq_deliver_pending(c, pending, false);
     g_in_irq = false;
-
-    // um handler pode ter acordado uma thread de prioridade maior (ex.: iWakeupThread): cede a vez
-    if (g_kernel_ready)
-    {
-        std::unique_lock<std::mutex> lk(g_mu);
-        maybe_preempt(lk, g_running);
-    }
+    irq_preempt_if_ready();
 }
 
 // Chamada pelo escalonador quando nenhuma thread pode rodar (todas esperando).
@@ -7371,19 +11807,14 @@ void ps2_irq_idle(Ctx& c)
     if (g_in_irq)
         return;
 
-    uint32_t flags = g_irq_flags.exchange(0);
-    g_irq_pending = 0;
+    const uint32_t pending = g_irq_pending.exchange(0, std::memory_order_acq_rel);
 
-    if (flags == 0)
+    if (pending == 0)
         return;
 
     g_in_irq = true;
 
-    if (flags & 1u)
-        irq_deliver_cause(c, 2);
-
-    if (flags & 2u)
-        irq_deliver_cause(c, 9);
+    irq_deliver_pending(c, pending, true);
 
     g_in_irq = false;
 }
@@ -7471,6 +11902,11 @@ namespace
         g_hwnd = hw;
 
         unsigned seen = 0;
+        WindowFrameContent frame_content;
+        unsigned distinct = 0, repeated = 0;
+        unsigned last_mark_distinct = 0, last_mark_repeated = 0;
+        uint64_t last_mark_ns = 0;
+        bool f12_last = false;
         std::vector<uint32_t> pix;
         uint32_t w = 0, h = 0;
         unsigned last_flips = g_gs_flips.load();
@@ -7507,50 +11943,57 @@ namespace
                     static unsigned shots = 0;
                     char name[64];
                     std::snprintf(name, sizeof name, "gs_shot_%u.bmp", ++shots);
-                    FILE* f = std::fopen(name, "wb");
-
-                    if (f != nullptr)
-                    {
-                        const uint32_t row = (w * 3 + 3) & ~3u, img = row * h;
-                        unsigned char hdr[54] = { 'B', 'M' };
-                        const uint32_t fsz = 54 + img, off = 54, dib = 40, planes_bpp = (24u << 16) | 1u;
-                        std::memcpy(hdr + 2, &fsz, 4); std::memcpy(hdr + 10, &off, 4); std::memcpy(hdr + 14, &dib, 4);
-                        std::memcpy(hdr + 18, &w, 4);
-                        const int32_t nh = -(int32_t)h;   // de cima para baixo
-                        std::memcpy(hdr + 22, &nh, 4); std::memcpy(hdr + 26, &planes_bpp, 4); std::memcpy(hdr + 34, &img, 4);
-                        std::fwrite(hdr, 1, 54, f);
-                        std::vector<unsigned char> line(row, 0);
-
-                        for (uint32_t y = 0; y < h; y++)
-                        {
-                            for (uint32_t x = 0; x < w; x++)
-                            {
-                                const uint32_t p = pix[(size_t)y * w + x];
-                                line[x * 3] = (unsigned char)(p & 0xFF); line[x * 3 + 1] = (unsigned char)((p >> 8) & 0xFF); line[x * 3 + 2] = (unsigned char)((p >> 16) & 0xFF);
-                            }
-
-                            std::fwrite(line.data(), 1, row, f);
-                        }
-
-                        std::fclose(f);
-                        std::fprintf(stderr, "  [captura] %s gravado\n", name);
-                    }
+                    gs_save_bmp(name, pix, w, h);
                 }
 
                 f10_last = f10;
             }
 
-            unsigned seq = g_win_seq.load();
-            bool fresh = seq != seen;
+            static bool f11_last = false;
+            const bool f11 = ps2_key_down(0x7A); // VK_F11
+            if (f11 && !f11_last)
+                g_font_capture_request.store(true, std::memory_order_relaxed);
+            f11_last = f11;
 
+            const bool f12 = g_perf_gs && ps2_key_down(0x7B); // VK_F12
+            if (f12 && !f12_last)
+            {
+                const uint64_t now = prof_now();
+                if (last_mark_ns == 0)
+                    std::fprintf(stderr, "  [medicao GDI] inicio\n");
+                else
+                {
+                    const double seconds = (now - last_mark_ns) / 1e9;
+                    const unsigned changed = distinct - last_mark_distinct;
+                    std::fprintf(stderr,
+                        "  [medicao GDI] segundos=%.3f distintos=%u repetidos=%u distintos/s=%.2f\n",
+                        seconds, changed, repeated - last_mark_repeated, changed / seconds);
+                }
+                last_mark_ns = now;
+                last_mark_distinct = distinct;
+                last_mark_repeated = repeated;
+            }
+            f12_last = f12;
+
+            FontCapture capture;
+            const bool fresh = g_win_seq.load() != seen;
             if (fresh)
             {
                 std::lock_guard<std::mutex> lk(g_win_mu);
+                const unsigned seq = g_win_seq.load();
                 pix = g_win_pix;
                 w = g_win_w;
                 h = g_win_h;
+                if (g_perf_gs) g_win_coalesced.fetch_add(seq - seen - 1u, std::memory_order_relaxed);
                 seen = seq;
+                if (g_font_capture.w != 0)
+                {
+                    capture = std::move(g_font_capture);
+                    g_font_capture = {};
+                }
             }
+            if (capture.w != 0)
+                gs_save_font_capture(capture);
 
             if ((fresh || g_redraw) && !pix.empty())
             {
@@ -7603,8 +12046,24 @@ namespace
                     PatBlt(dc, 0, dy + dh, (int)cr.right, (int)cr.bottom - dy - dh, BLACKNESS);
                 }
 
-                StretchDIBits(dc, dx, dy, dw, dh, 0, 0, (int)w, (int)h, pix.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+                const int drawn = StretchDIBits(dc, dx, dy, dw, dh, 0, 0, (int)w, (int)h,
+                    pix.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
                 ReleaseDC(hw, dc);
+                // Conta imagens novas aceitas pelo GDI. Redesenhos de uma
+                // imagem antiga e a cadencia do compositor sao outra medida.
+                if (g_perf_gs)
+                {
+                    const bool changed = drawn > 0 && frame_content.record(pix, w, h);
+                    if (fresh && drawn > 0)
+                    {
+                        distinct += changed;
+                        repeated += !changed;
+                        g_win_content_counts.store(((uint64_t)repeated << 32) | distinct, std::memory_order_relaxed);
+                        g_win_blits.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else if (fresh)
+                        g_win_blit_errors.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             else
             {
@@ -7637,6 +12096,47 @@ static LONG WINAPI ps2_exception_filter(EXCEPTION_POINTERS* ep)
 void ps2_install_crash_filter()
 {
     SetUnhandledExceptionFilter(ps2_exception_filter);
+}
+
+// Usa um temporizador de alta resolucao por thread, sem espera ocupada.
+static void irq_wait_tick()
+{
+    static HANDLE timer = []() -> HANDLE {
+        const char* enable = std::getenv("PS2_IRQ_HIGHRES");
+        if (enable && std::strcmp(enable, "1") != 0)
+            return nullptr;
+
+        // Valor documentado, inclusive para SDKs MinGW sem a constante.
+        constexpr DWORD high_resolution = 0x00000002u;
+        HANDLE result = CreateWaitableTimerExW(nullptr, nullptr, high_resolution,
+                                               TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!result)
+            std::fprintf(stderr, "  [irq] temporizador de alta resolucao indisponivel (erro %lu)\n",
+                         (unsigned long)GetLastError());
+        return result;
+    }();
+
+    if (timer)
+    {
+        LARGE_INTEGER due{};
+        // O compare moderno chega em ~1,017 ms. Acordar a cada 1 ms no
+        // Windows pode cruzar dois compares com a latencia do agendador.
+        due.QuadPart = g_gs_timer_clock ? -2500 : -10000;
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) &&
+            WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0)
+        {
+            g_irq_wait_highres_active.store(true, std::memory_order_relaxed);
+            return;
+        }
+
+        std::fprintf(stderr, "  [irq] falha na espera de alta resolucao (erro %lu)\n",
+                     (unsigned long)GetLastError());
+        CloseHandle(timer);
+        timer = nullptr;
+        g_irq_wait_highres_active.store(false, std::memory_order_relaxed);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 // O runtime espera com sleep_for(1 ms) (escalonador ocioso e tique do vsync). No Windows um sleep de 1 ms dura ~15,6 ms
@@ -7685,11 +12185,88 @@ bool ps2_key_down(int vk)
 
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
+
+// XInput carregado em tempo de execucao (sem precisar de -lxinput). Aceita ate 4 controles; usa o primeiro conectado.
+// PS2_NOXINPUT=1 desliga.
+bool ps2_xinput_state(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* sticks)
+{
+    struct XState { uint32_t packet; uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; };   // XINPUT_STATE
+    typedef uint32_t (__stdcall *GetStateFn)(uint32_t, XState*);
+
+    static const bool disabled = std::getenv("PS2_NOXINPUT") != nullptr;
+    static GetStateFn fn = nullptr;
+    static bool tried = false;
+    static int pad_index = -1;
+    static ULONGLONG next_scan = 0;
+
+    if (disabled)
+        return false;
+
+    if (!tried)
+    {
+        tried = true;
+        static const char* const dlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+
+        for (const char* name : dlls)
+        {
+            HMODULE m = LoadLibraryA(name);
+
+            if (m != nullptr && (fn = reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState"))) != nullptr)
+                break;
+        }
+    }
+
+    if (fn == nullptr)
+        return false;
+
+    XState st = {};
+
+    if (pad_index >= 0)
+    {
+        if (fn((uint32_t)pad_index, &st) != 0)
+        {
+            std::fprintf(stderr, "  [pad] controle %d desconectado\n", pad_index);
+            pad_index = -1;
+            return false;
+        }
+    }
+    else
+    {
+        const ULONGLONG now = GetTickCount64();
+
+        if (now < next_scan)   // procurar controle ausente e lento no XInput antigo: so tenta 1x por segundo
+            return false;
+
+        next_scan = now + 1000;
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (fn((uint32_t)i, &st) == 0)
+            {
+                pad_index = i;
+                std::fprintf(stderr, "  [pad] controle XInput %d conectado\n", i);
+                break;
+            }
+        }
+
+        if (pad_index < 0)
+            return false;
+    }
+
+    *buttons = st.buttons; *lt = st.lt; *rt = st.rt;
+    sticks[0] = st.lx; sticks[1] = st.ly; sticks[2] = st.rx; sticks[3] = st.ry;
+    return true;
+}
 #else
 void ps2_window_start() {}
 bool ps2_key_down(int) { return false; }
+bool ps2_xinput_state(uint16_t*, uint8_t*, uint8_t*, int16_t*) { return false; }
 void ps2_install_crash_filter() {}
 void ps2_win_tune() {}
+static void irq_wait_tick()
+{
+    std::this_thread::sleep_for(std::chrono::microseconds(g_gs_timer_clock ? 250 : 1000));
+}
 #endif
 """;
 
@@ -8157,6 +12734,12 @@ void ps2_win_tune() {}
         ["PEXEW"] = "mmi_pexew(c, {rd}, {rt});",
         ["PMFHI"] = "mmi_pmfhi(c, {rd});",
         ["PMFLO"] = "mmi_pmflo(c, {rd});",
+        ["PMULTH"] = "mmi_pmulth(c, {rd}, {rs}, {rt});",
+        ["PMADDH"] = "mmi_pmaddh(c, {rd}, {rs}, {rt});",
+        ["PMSUBH"] = "mmi_pmsubh(c, {rd}, {rs}, {rt});",
+        ["PMULTW"] = "mmi_pmultw(c, {rd}, {rs}, {rt});",
+        ["PMADDW"] = "mmi_pmaddw(c, {rd}, {rs}, {rt});",
+        ["PMSUBW"] = "mmi_pmsubw(c, {rd}, {rs}, {rt});",
         ["MADD"] = "ee_madd(c, {rd}, {rs}, {rt});",
 
         // interrupcoes (COP0)
@@ -8305,6 +12888,26 @@ void ps2_win_tune() {}
             _sb.AppendLine($"void {FunctionName(function)}(Ctx& c)");
             _sb.AppendLine("{");
             _sb.AppendLine($"{I1}PS2_TRACE_ENTER(0x{start:X8}u);");
+            // AddTime de CFieldModel, quando chamado por CField::Refresh.
+            if (start == 0x00320A10u)
+                _sb.AppendLine($"{I1}if (g_field_clock_trace && (uint32_t)c.r[31].lo == 0x0031F3A8u) field_clock_record(c.f[12]);");
+
+            // MoveTranslateCallback na imagem SLUS-20347.
+            bool traceMoveCallback = start == 0x00321230u && labels.Contains(0x0032133Cu);
+            if (traceMoveCallback)
+                _sb.AppendLine($"{I1}MoveCallbackTrace movement_probe(c);");
+
+            // Entradas das tres rotinas SDK na imagem SLUS-20347.
+            string? rotationAxis = start switch
+            {
+                0x00202980u => "Z",
+                0x00202A28u => "X",
+                0x00202AD0u => "Y",
+                _ => null
+            };
+            if (rotationAxis != null)
+                _sb.AppendLine($"{I1}if (g_rotation_caller_trace) rotation_caller_record(c, '{rotationAxis}');");
+
 
             for (int i = 0; i < count; i++)
             {
@@ -8319,6 +12922,8 @@ void ps2_win_tune() {}
                     _sb.AppendLine($"L_{address:X8}:");
                     _sb.AppendLine($"{I1}PS2_LOOP_MARK(0x{address:X8}u);");
                     _sb.AppendLine($"{I1}PS2_POLL_IRQ(c);");
+                    if (traceMoveCallback && address == 0x0032133Cu)
+                        _sb.AppendLine($"{I1}movement_probe.attempt();");
                 }
 
                 // Ja foi emitido junto do branch anterior.
@@ -8359,6 +12964,20 @@ void ps2_win_tune() {}
                 Unsupported(instruction, address, indent);
                 return;
             }
+
+            string? statusEvent = instruction.Mnemonic switch
+            {
+                "VDIV" => "Div",
+                "VSQRT" => "Sqrt",
+                "VRSQRT" => "Rsqrt",
+                "VWAITQ" => "WaitQ",
+                "CFC2" when instruction.Rd == 16 && instruction.Rt != 0 => "ReadStatus",
+                "CTC2" when instruction.Rd == 16 => "WriteStatus",
+                _ => null
+            };
+
+            if (statusEvent != null)
+                _sb.AppendLine($"{indent}if (g_vu0_status_trace) vu0_status_record(Vu0StatusEvent::{statusEvent}, 0x{address:X8}u, c.vi[16]);");
 
             if (statement.Length > 0)
                 _sb.AppendLine($"{indent}{statement}");
