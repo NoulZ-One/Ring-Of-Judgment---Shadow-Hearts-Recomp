@@ -140,7 +140,6 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - Duplicação das imagens corrigida;
 - Paleta de cores das logos corrigidas (aruze e a tela de título do jogo);
 
-
 ## V2
 
 - A janela do jogo agora é exibida sem necessidade de arquivos PPM para visualizar o  jogo e o desenvolvimento;
@@ -153,33 +152,34 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 
 ## V3
 
--
+- Foi corrigido o crash da batalha (testei isso na base do Slow-Motion, fui puramente guerreiro nessa correção);
+- O tremor da tela do game foi corrigido. Isso acontecia conforme precisava testar diferentes perfis de compilação;
 
-## V4
+## V4 Patch de grande impacto
 
--
+- Foi fixado o render da batalha;
+- Foi Fixado um problema anormal em que, quando terminava a batalha, a imagem do jogo quebrava totalmente;
+- Foi Fixado o Slow-Motion do game (VIVA!!!!);
 
-## Próximos objetivos / Futuros
 
-- Corrigir a seleção e a apresentação dos framebuffers do GS.- Validar o endereçamento e a organização da VRAM.
-- Investigar possíveis problemas nas texturas, transparências e composição gráfica.
-- Eliminar artefatos visuais e imagens duplicadas.
-- Estabilizar a renderização da tela de título.
-- Inserir o Áudio do jogo
+## Para os próximos patch's do recompilador irei focar em:
+- No desempenho geral do jogo (rodar 60 FPS e elimitar os stutter).
+- Fixar o Serrilhado das letras (geral);
+- Adicionar o Áudio do jogo;
+- Fixar o pixelado dos personagens
 
-**Objetivo imediato**: 
-- Corrigir problema de desempenho. O Gameplay apresentado está muito lento;
-- Fixar os personagens, estão bastantes pixelados;
-- Melhorar os inputs;
-- Fixar o crash da batalha;
-- Fixar o Menu do game pixelado;
-- Fixar o tremor da janela do jogo;
+## Conforme for aparecendo problemas, serão listados abaixo.
+- Crash imediato do recompilador no diálogo "Up There!?"   
+
+## Nota: O recompilador ainda não está pronto. Volto a Frisar bem: Quando o recompilador estiver pronto, uma BUILD será liberada. Por hora, apenas acompanhe os Logs de desenvolvimento.
+
+## Nota 2: É possível que os próximos Logs demorem um pouco mais que o normal para serem exibidos ou atualizados. Só farei atualizações tanto no repositório, quanto nos logs, quando obtiver avanços significativos.
 
 
 ---
 ## Sobre o código
 
-Ao executar a solução (`dotnet run --project src\SH.Core`), é gerada a pasta `OUT/`, contendo os arquivos C++ (`.cpp`) e o executável `ps2_game.exe`.
+Ao executar a solução (`dotnet run --project src\SH.Core`), é gerada a pasta `OUT/`, contendo os arquivos C++ (`.cpp`). o executável do jogo precisa ser compilado a parte usando msys64.
 Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comportamento do runtime, identificar problemas e investigar os próximos bloqueios durante a execução do jogo.
 
 ---
@@ -278,27 +278,37 @@ Although the initial images are recognizable, the rendering still presents issue
 - The game initiates the first battle. When the characters enter their combat stance, the game crashes;
 - The in-game menu appears, though it is quite pixelated;
 
-## Next Objectives
+## V3
 
-- Correct the selection and presentation of the GS (Graphics Synthesizer) framebuffers.
-- Validate VRAM addressing and organization.
-- Investigate potential issues with textures, transparencies, and graphical composition.
-- Eliminate visual artifacts and duplicated images.
-- Stabilize the rendering of the title screen.
-- Insert game audio
+- Fixed a crash occurring during battles (I tested this using slow-motion; it took a real battle to track down and fix this one).
+- Fixed screen shaking. This issue arose while I was testing different compilation profiles.
 
-## Immediate Goal: 
-- Fix performance issues; the gameplay is currently very slow;
-- Fix the character visuals—they appear overly pixelated;
-- Improve input responsiveness;
-- Fix the crash that occurs during battle;
-- Fix the pixelated game menu;
-- Fix the shaking of the game window;
+## V4 – Major Patch
+
+- Fixed battle rendering.
+- Resolved an issue where the game’s visuals would break completely upon the conclusion of a battle.
+- Fixed the game’s slow-motion functionality (HOORAY!!!!).
+
+## For upcoming patches to the recompiler, I will focus on:
+- Overall game performance (targeting 60 FPS and eliminating stuttering).
+- Fixing jagged edges (aliasing) on ​​text throughout the game.
+- Adding in-game audio.
+- Fixing pixelation issues on character models.
+
+## As issues arise, they will be listed below.
+- Immediate crash of the recompiler during the "Up There!?" dialogue
+
+
+## Note: The recompiler is not yet complete. To reiterate: once the recompiler is finished, a build will be released. For now, please simply follow the development logs.
+
+## Note 2: Future logs may take a bit longer than usual to appear or be updated. I will only push updates to the repository and the logs once significant progress has been made.
+
+
 ---
 
 ## About the code
 
-When running the solution (`dotnet run --project src\SH.Core`) generates an `OUT/` folder, which contains the C++ files (`.cpp`) and the executable `ps2_game.exe`.
+When running the solution (`dotnet run --project src\SH.Core`), an `OUT/` folder is generated, containing C++ (`.cpp`) files. The game executable must be compiled separately using msys64.
 Running `ps2_game.exe` produces logs that make it possible to analyze runtime behavior, identify issues, and investigate any crashes that may occur while the game is running.
 
 ---
