@@ -154,6 +154,7 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 
 - Foi corrigido o crash da batalha (testei isso na base do Slow-Motion, fui puramente guerreiro nessa correção);
 - O tremor da tela do game foi corrigido. Isso acontecia conforme precisava testar diferentes perfis de compilação;
+- Fixado o Yuri Duplicado  
 
 ## V4 Patch de grande impacto
 
@@ -282,7 +283,8 @@ Although the initial images are recognizable, the rendering still presents issue
 
 - Fixed a crash occurring during battles (I tested this using slow-motion; it took a real battle to track down and fix this one).
 - Fixed screen shaking. This issue arose while I was testing different compilation profiles.
-
+- Yuri Duplicated Fixed
+- 
 ## V4 – Major Patch
 
 - Fixed battle rendering.
