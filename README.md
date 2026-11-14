@@ -164,7 +164,7 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 
 
 ## Para os próximos patch's do recompilador irei focar em:
-- No desempenho geral do jogo (rodar 60 FPS e elimitar os stutter).
+- No desempenho geral do jogo (rodar 60 FPS e eliminar os stutter).
 - Fixar o Serrilhado das letras (geral);
 - Adicionar o Áudio do jogo; (essa parte vai dar bastante trabalho....)
 - Fixar o pixelado dos personagens
