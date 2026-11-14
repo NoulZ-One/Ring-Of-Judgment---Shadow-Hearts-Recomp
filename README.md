@@ -151,7 +151,13 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - O menu ingame aparece, embora bastante pixelado; 
 - O jogo inicia a primeira batalha. Quando os personagens entram em pose de combate, o jogo crasha;
 
+## V3
 
+-
+
+## V4
+
+-
 
 ## Próximos objetivos / Futuros
 
