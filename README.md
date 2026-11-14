@@ -166,8 +166,10 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 ## Para os próximos patch's do recompilador irei focar em:
 - No desempenho geral do jogo (rodar 60 FPS e elimitar os stutter).
 - Fixar o Serrilhado das letras (geral);
-- Adicionar o Áudio do jogo;
+- Adicionar o Áudio do jogo; (essa parte vai dar bastante trabalho....)
 - Fixar o pixelado dos personagens
+
+**As músicas do jogo vão dar um enorme trabalho para ajustar e deixar como elas são. peguei como exemplo a Brain Hopper -  tema de batalha do jogo - e o trabalho que está dando é extremamente grande.**
 
 ## Conforme for aparecendo problemas, serão listados abaixo.
 - Crash imediato do recompilador no diálogo "Up There!?"   
@@ -284,7 +286,7 @@ Although the initial images are recognizable, the rendering still presents issue
 - Fixed a crash occurring during battles (I tested this using slow-motion; it took a real battle to track down and fix this one).
 - Fixed screen shaking. This issue arose while I was testing different compilation profiles.
 - Yuri Duplicated Fixed
-- 
+
 ## V4 – Major Patch
 
 - Fixed battle rendering.
@@ -296,6 +298,8 @@ Although the initial images are recognizable, the rendering still presents issue
 - Fixing jagged edges (aliasing) on ​​text throughout the game.
 - Adding in-game audio.
 - Fixing pixelation issues on character models.
+
+**Adjusting the game's music tracks to keep them exactly as they are is going to be a massive undertaking. I’ve been using "Brain Hopper"—the game’s battle theme—as an example, and the amount of work it’s requiring is truly immense.**
 
 ## As issues arise, they will be listed below.
 - Immediate crash of the recompiler during the "Up There!?" dialogue
