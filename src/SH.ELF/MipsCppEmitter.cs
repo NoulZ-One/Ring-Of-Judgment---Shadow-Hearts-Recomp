@@ -888,6 +888,14 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 #include <emmintrin.h>
 #endif
 
+// As opcoes do perfil de batalha ficam ativas se a variavel estiver
+// ausente. Use 0 para desativar uma opcao em um teste A/B.
+static bool battle_profile_enabled(const char* name)
+{
+    const char* value = std::getenv(name);
+    return !value || std::strcmp(value, "0") != 0;
+}
+
 const char* ps2_syscall_name(int number);   // gerado em ps2_syscall_names.cpp
 
 typedef void (*Ps2Func)(Ctx&);
@@ -1063,7 +1071,7 @@ static constexpr uint32_t irq_timer0_mask = (1u << irq_timer0_bits) - 1u;
 static constexpr uint32_t irq_vblank_max = UINT32_MAX >> irq_timer0_bits;
 std::atomic<uint32_t> g_irq_pending{0};
 static std::atomic<uint64_t> g_vsync_gen(0), g_vsync_del(0);   // VBLANKs gerados pelo relogio / entregues ao jogo (diagnostico do slow-motion)
-static const bool g_vsync_catchup = std::getenv("PS2_VSYNC_CATCHUP") != nullptr;   // entrega VBLANKs atrasados (ate 4 por vez)
+static const bool g_vsync_catchup = battle_profile_enabled("PS2_VSYNC_CATCHUP");   // entrega VBLANKs atrasados (ate 4 por vez)
 static std::atomic<uint64_t> g_timer0_mode{0}, g_timer0_comp{0};
 static std::atomic<uint64_t> g_timer0_periods{0}, g_timer0_delivered{0};
 static std::atomic<uint64_t> g_irq_wakes{0}, g_timer0_posts{0}, g_timer0_merged{0};
@@ -1277,11 +1285,15 @@ static bool g_vu0_flags = true, g_vu1_flags = true;   // algum programa le MAC/s
 
 // Perfil (impresso a cada 2 s no resumo [gs]): tempo no DMA do GS/VIF, nos microprogramas e na janela.
 // Opcoes de inicializacao: evita consultar o ambiente por vetor ou instrucao.
+static const bool g_vif_wl0_fix = battle_profile_enabled("PS2_VIF_WL0_FIX");
+static const bool g_vif1_reverse = battle_profile_enabled("PS2_VIF1_REVERSE_TEST");
+static const bool g_vif1_readback = battle_profile_enabled("PS2_VIF1_READBACK_TEST");
+static const bool g_ui_native = battle_profile_enabled("PS2_GS_UI_NATIVE");
 static const bool g_vu_header_trace = std::getenv("PS2_VU_HEADER_TRACE") != nullptr;
-static const bool g_vu_flag_test = std::getenv("PS2_VU_FLAG_TEST") != nullptr;
+static const bool g_vu_flag_test = battle_profile_enabled("PS2_VU_FLAG_TEST");
 static const bool g_vu_count_trace = std::getenv("PS2_VU_COUNT_TRACE") != nullptr;
-static const bool g_vu1_fast = std::getenv("PS2_VU1_FAST") != nullptr;
-static const bool g_sprite_generic_rows = std::getenv("PS2_GS_SPRITE_GENERIC_ROWS") != nullptr;
+static const bool g_vu1_fast = battle_profile_enabled("PS2_VU1_FAST");
+static const bool g_sprite_generic_rows = battle_profile_enabled("PS2_GS_SPRITE_GENERIC_ROWS");
 static const bool g_sprite_wide_fast = [] {
     const char* value = std::getenv("PS2_GS_SPRITE_WIDE_FAST");
     return value == nullptr || std::strcmp(value, "0") != 0;
@@ -1289,38 +1301,38 @@ static const bool g_sprite_wide_fast = [] {
 // Permite comparar o decodificador especializado com o caminho anterior.
 static const bool g_sprite_tex_decode = [] {
     const char* value = std::getenv("PS2_GS_SPRITE_TEX_DECODE");
-    return !value || std::strcmp(value, "0") != 0;
+    return value && std::strcmp(value, "0") != 0;
 }();
-static const bool g_sprite_columns = std::getenv("PS2_GS_SPRITE_COLUMNS") != nullptr;
+static const bool g_sprite_columns = battle_profile_enabled("PS2_GS_SPRITE_COLUMNS");
 // Normalizacao experimental antes da cobertura e interpolacao dos pixels.
 static const bool g_field_raster = [] {
     const char* value = std::getenv("PS2_GS_FIELD_RASTER");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return !value || std::strcmp(value, "1") == 0;
 }();
 static const bool g_field_raster_train = [] {
     const char* value = std::getenv("PS2_GS_FIELD_RASTER_TRAIN");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return !value || std::strcmp(value, "1") == 0;
 }();
 static const bool g_field_train_diag = [] {
     const char* value = std::getenv("PS2_GS_FIELD_TRAIN_DIAG");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return !value || std::strcmp(value, "1") == 0;
 }();
-static const bool g_perf_gs = std::getenv("PS2_PERF_GS") != nullptr;
+static const bool g_perf_gs = battle_profile_enabled("PS2_PERF_GS");
 static const bool g_field_audit = [] {
     const char* value = std::getenv("PS2_GS_FIELD_AUDIT");
     return value != nullptr && std::strcmp(value, "1") == 0;
 }();
-static const bool g_gs_tri_texture_specialize = std::getenv("PS2_GS_TRI_TEXTURE_SPECIALIZE") != nullptr;
+static const bool g_gs_tri_texture_specialize = battle_profile_enabled("PS2_GS_TRI_TEXTURE_SPECIALIZE");
 static const bool g_gs_tri_effects_fast = [] {
     const char* value = std::getenv("PS2_GS_TRI_EFFECTS_FAST");
     return value == nullptr || std::strcmp(value, "0") != 0;
 }();
-static const bool g_gs_tri_early_z = std::getenv("PS2_GS_TRI_EARLY_Z") != nullptr;
-static const bool g_perf_vif1 = std::getenv("PS2_PERF_VIF1") != nullptr;
-static const bool g_vif1_unpack_fast = std::getenv("PS2_VIF1_UNPACK_FAST") != nullptr;
+static const bool g_gs_tri_early_z = battle_profile_enabled("PS2_GS_TRI_EARLY_Z");
+static const bool g_perf_vif1 = battle_profile_enabled("PS2_PERF_VIF1");
+static const bool g_vif1_unpack_fast = battle_profile_enabled("PS2_VIF1_UNPACK_FAST");
 static const bool g_perf_cadence = [] {
     const char* value = std::getenv("PS2_PERF_CADENCE");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return !value || std::strcmp(value, "1") == 0;
 }();
 static const bool g_perf = g_perf_cadence || g_perf_vif1 || g_perf_gs || g_field_audit || std::getenv("PS2_PERF") != nullptr;   // relatorio [prof] sem precisar de PS2_GIFLOG
 std::atomic<bool> g_cap_request{false};   // F9: grava o trace dos proximos vsyncs em gs_captura_N.txt (sem custo quando nao usado)
@@ -1373,7 +1385,7 @@ static const bool g_vu_aot_revision_cache = [] {
     return value && std::strcmp(value, "1") == 0;
 }();
 static uint64_t g_prof_aot_revision_hits = 0;
-static const bool g_vu_aot_enabled = std::getenv("PS2_VU1_AOT") != nullptr;
+static const bool g_vu_aot_enabled = battle_profile_enabled("PS2_VU1_AOT");
 static const bool g_vu_aot_capture_0658_only = g_vu_aot_capture && std::strcmp(g_vu_aot_mode, "auto-0658") == 0;
 static std::atomic<bool> g_vu_aot_armed{g_vu_aot_capture_0658_only ||
     (g_vu_aot_capture && std::strcmp(g_vu_aot_mode, "auto") == 0)};
@@ -6163,6 +6175,11 @@ namespace
         return true;
     }
 
+    static const char* const g_field_recon_mode = [] {
+        const char* value = std::getenv("PS2_FIELD_RECON");
+        return value ? value : "spatial";
+    }();
+
     // Teste P: captura a fonte do menu com resolucao vertical original (54x19).
     // O texto e retirado apenas do framebuffer de baixa resolucao para nao
     // aparecer duas vezes. Os texels e o alfa sao preservados em uma copia.
@@ -6310,9 +6327,9 @@ namespace
         }
 
         // Teste P: caminho opcional para desenhar o atlas de fonte de 19
-        // texels na imagem final de 448 linhas. O GS normal continua intacto
-        // quando a variavel nao existe. Nao usa nenhum campo de outro quadro.
-        static const bool ui_native_enabled = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+        // texels na imagem final de 448 linhas. PS2_GS_UI_NATIVE=0
+        // volta ao desenho direto no framebuffer.
+        static const bool ui_native_enabled = g_ui_native;
         // Teste Q: instrumento diagnostico para verificar POR QUE o teste P nao
         // imprimiu seus registros. Nao altera pixels nem o comportamento do P.
         // [GS UI Q] versao identifica se o .exe foi regenerado/recompilado.
@@ -6324,9 +6341,9 @@ namespace
             if (q_versao.fetch_add(1u) == 0u)
                 std::fprintf(stderr,
                     "  [GS UI Q] versao=Q instalado=1 native=%d vpair=%d field=%s\n",
-                    std::getenv("PS2_GS_UI_NATIVE") != nullptr ? 1 : 0,
+                    g_ui_native ? 1 : 0,
                     std::getenv("PS2_GS_UI_VPAIR") != nullptr ? 1 : 0,
-                    std::getenv("PS2_FIELD_RECON") != nullptr ? std::getenv("PS2_FIELD_RECON") : "(padrao)");
+                    g_field_recon_mode);
 
             // Captura exatamente o atlas PSMT4 identificado pela captura F9 N,
             // mesmo quando outras condicoes do P rejeitam o sprite.
@@ -6419,9 +6436,7 @@ namespace
                     // Teste R: no modo opt-in, um deslocamento vertical de um
                     // pixel final nao cria uma copia extra do mesmo texto.
                     // Sem a variavel, mantem EXATAMENTE o criterio do teste Q.
-                    static const bool ui_r_dedup =
-                        std::getenv("PS2_GS_UI_DEDUP") != nullptr &&
-                        std::getenv("PS2_GS_UI_DEDUP")[0] != '0';
+                    static const bool ui_r_dedup = battle_profile_enabled("PS2_GS_UI_DEDUP");
                     const size_t before = cache.size();
                     cache.erase(std::remove_if(cache.begin(), cache.end(),
                         [&](const UiGlyphP& old)
@@ -7628,7 +7643,7 @@ namespace
     {
         using clk = PresentPacing::Clock;
         static PresentPacing pacing;
-        static const bool flip_pacing = std::getenv("PS2_GS_PRESENT_ON_FLIP") != nullptr;
+        static const bool flip_pacing = battle_profile_enabled("PS2_GS_PRESENT_ON_FLIP");
         const clk::time_point t0 = clk::now();
         unsigned flip = g_gs_flips.load(std::memory_order_relaxed);
         const bool early = t0 < pacing.next;
@@ -7678,9 +7693,7 @@ namespace
         // A reconstrucao usa apenas pixels da imagem atual. O ajuste opcional
         // abaixo usa g_half_vote para alinhar a imagem ja reconstruida.
         // Os testes I/J usavam capturas temporais: com 4-6 FPS a defasagem vira tremor.
-        static const char* const field_recon_k = std::getenv("PS2_FIELD_RECON");
-        const bool spatial_active = field_recon_k != nullptr
-            && std::strcmp(field_recon_k, "spatial") == 0
+        const bool spatial_active = std::strcmp(g_field_recon_mode, "spatial") == 0
             && d.magv == 2 && d.h >= 2 && d.w >= 3;
 
         // O FIELDLOCK legado e aplicado inclusive ao modo espacial.
@@ -7760,7 +7773,7 @@ namespace
             capture.source_h = nlines;
             capture.h = d.h;
             capture.spatial = spatial_active;
-            capture.native_ui = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+            capture.native_ui = g_ui_native;
             capture.source.resize((size_t)d.w * nlines);
             for (uint32_t y = 0; y < nlines; ++y)
                 scanout.read(capture.source.data() + (size_t)y * d.w, d, y, scanout_fast);
@@ -8015,7 +8028,7 @@ namespace
         // Teste P: compoe o TEXTO da propria imagem/FBP sobre o resultado
         // de 640x448. Nao faz weave e nao altera o FIELDLOCK do teste L.
         // O blend GS ALPHA=0x44 e (fonte-destino)*alfa/128+destino.
-        static const bool ui_native_present = std::getenv("PS2_GS_UI_NATIVE") != nullptr;
+        static const bool ui_native_present = g_ui_native;
         if (ui_native_present && d.magv == 2u && d.w == 640u && d.h == 448u &&
             d.dbx == 0u && d.dby == 0u)
         {
@@ -8233,7 +8246,7 @@ namespace
     // Diagnostico: tempo e numero de esperas por fila cheia.
     std::atomic<uint64_t> g_gsq_full_wait_ns{0};
     std::atomic<uint64_t> g_gsq_full_wait_count{0};
-    const bool g_gs_async = std::getenv("PS2_GS_THREAD") != nullptr;
+    const bool g_gs_async = battle_profile_enabled("PS2_GS_THREAD");
 
     static const bool g_gsq_start_fast = [] {
         const char* value = std::getenv("PS2_GS_START_FAST");
@@ -8260,7 +8273,7 @@ namespace
 
     static const bool g_gsq_wake_on_work = [] {
         const char* value = std::getenv("PS2_GS_WAKE_ON_WORK");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     static std::mutex g_gsq_work_mu;
     static std::condition_variable g_gsq_work_cv;
@@ -9273,16 +9286,14 @@ namespace
 
             if (cmd >= 0x60)
             {
-                // EXPERIMENTO VIF1 (reversivel): quando WL=0 e CL>0,
-                // UNPACK nao possui ciclos de escrita. O código antigo
-                // consumia a carga como dados e modificava a memoria VU1.
-                // Mantemos o comportamento anterior ate habilitar
-                // PS2_VIF_WL0_FIX=1 para comparar a mesma cena.
+                // Perfil de batalha: quando WL=0 e CL>0, este caminho
+                // evita consumir os proximos VIFcodes como dados de UNPACK.
+                // PS2_VIF_WL0_FIX=0 restaura o caminho anterior.
                 if (unit == 1 && cl != 0 && wl == 0)
                 {
                     static uint64_t wl0_count = 0;
                     ++wl0_count;
-                    const bool wl0_fix = std::getenv("PS2_VIF_WL0_FIX") != nullptr;
+                    const bool wl0_fix = g_vif_wl0_fix;
 
                     // Limita o volume de logs em cenas que usam muitos UNPACK.
                     if (wl0_count <= 16 || (wl0_count & 4095u) == 0)
@@ -9512,7 +9523,7 @@ namespace
             if (ch == 1 && (chcr & 1u) == 0u)
             {
                 const bool block_reverse_feed =
-                    std::getenv("PS2_VIF1_REVERSE_TEST") != nullptr;
+                    g_vif1_reverse;
                 static uint64_t reverse_count = 0;
                 ++reverse_count;
 
@@ -9533,7 +9544,7 @@ namespace
                 {
                     // Teste H opt-in: agora podemos tentar o caminho VRAM -> RAM.
                     // Se o GS nao estiver em TRXDIR=1, conserva o teste G sem escrita.
-                    if (std::getenv("PS2_VIF1_READBACK_TEST") != nullptr)
+                    if (g_vif1_readback)
                     {
                         const bool ok = gs_download_to_ram(c, d.madr, d.qwc);
                         static uint64_t trials = 0, successes = 0;
