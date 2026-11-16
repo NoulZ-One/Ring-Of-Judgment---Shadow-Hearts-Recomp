@@ -161,6 +161,7 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - Foi fixado o render da batalha;
 - Foi Fixado um problema anormal em que, quando terminava a batalha, a imagem do jogo quebrava totalmente;
 - Foi Fixado o Slow-Motion do game (VIVA!!!!);
+- Suporte a controle adicionado! Agora é possível usar um controle de XBOX para jogar!
 
 
 ## Para os próximos patch's do recompilador irei focar em:
@@ -292,6 +293,7 @@ Although the initial images are recognizable, the rendering still presents issue
 - Fixed battle rendering.
 - Resolved an issue where the game’s visuals would break completely upon the conclusion of a battle.
 - Fixed the game’s slow-motion functionality (HOORAY!!!!).
+- Controller support added! You can now use an Xbox controller to play!
 
 ## For upcoming patches to the recompiler, I will focus on:
 - Overall game performance (targeting 60 FPS and eliminating stuttering).
