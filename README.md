@@ -42,7 +42,7 @@ O progresso atual é aproximadamente:
 
 Current progress:
 
-## **Approximately 50%**
+## **Approximately 80%**
  
 > This percentage represents the structural progress of the project as a whole and does not mean that 80% of the game has already been recompiled.
 > As development progresses, the percentage will be adjusted.
