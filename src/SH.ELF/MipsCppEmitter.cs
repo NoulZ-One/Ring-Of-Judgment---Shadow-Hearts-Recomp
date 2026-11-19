@@ -425,6 +425,7 @@ extern const bool g_rotation_caller_trace;
 void rotation_caller_record(const Ctx& c, uint32_t axis);
 
 extern const bool g_move_callback_trace;
+void ps2_battle_effect_clock(Ctx& c);
 extern const bool g_field_clock_trace;
 void field_clock_record(uint32_t delta_bits);
 
@@ -810,6 +811,7 @@ static inline void ee_madd(Ctx& c, int rd, int rs, int rt)
 
 // Pontos de entrada do runtime (a implementar).
 void ps2_call(Ctx& c, uint32_t target);
+void ps2_ring_hud(Ctx& c, uint32_t object);
 void ps2_tailcall(Ctx& c, uint32_t target);
 void ps2_syscall(Ctx& c);
 void ps2_break(Ctx& c, uint32_t address);
@@ -819,6 +821,8 @@ const char* ps2_cstr(Ctx& c, uint32_t address, char* buffer, size_t capacity);
 // Agenda fn(arg) para rodar daqui a `frames` vsyncs, em contexto de interrupcao (como um callback
 // assincrono do IOP/DMA). Usado pelos HLEs que precisam avisar o fim depois de a funcao voltar.
 void ps2_defer_call(uint32_t frames, uint32_t fn, uint32_t arg);
+bool ps2_fmv_play(const char* path, uint32_t owner, uint32_t end_callback);
+void ps2_fmv_cancel(uint32_t owner);
 uint32_t ps2_alloc_id();
 [[noreturn]] void ps2_hle_unimplemented(Ctx& c, const char* name);
 
@@ -858,14 +862,53 @@ void ps2_di(Ctx& c);
 uint32_t ps2_mfc0(Ctx& c, int reg);
 void ps2_mtc0(Ctx& c, int reg, uint32_t value);
 void ps2_unsupported(Ctx& c, uint32_t address, const char* mnemonic);
+extern const bool g_rssd_audio_trace;
+void rssd_trace_bgm(const Ctx& c, uint32_t function);
+
 // VCALLMS/VCALLMSR: inicia um microprograma do VU0 no endereco indicado (bytes da micro memoria).
 void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 ";
 
     // Runtime minimo (ps2_runtime.cpp): despacho por endereco usando a tabela
     // gerada e paradas claras para o que ainda nao existe.
-    public const string RuntimeSource = """
+    public static string RuntimeSource { get; } = CreateRuntimeSource();
+
+    private static string CreateRuntimeSource()
+    {
+        // As rotinas acompanham SH.ELF.dll e sao inseridas no proprio C++.
+        // Nao dependem de includes opcionais na pasta de compilacao.
+        StringBuilder programs = new();
+        foreach (string id in new[] { "0350", "0078", "0658" })
+        {
+            using Stream resource = typeof(MipsCppEmitter).Assembly
+                .GetManifestResourceStream($"SH.ELF.Vu1.{id}")
+                ?? throw new InvalidOperationException($"Rotina VU1 integrada ausente: {id}");
+            using StreamReader reader = new(resource, Encoding.UTF8);
+            programs.AppendLine(reader.ReadToEnd());
+        }
+        string ReadVulkan(string name)
+        {
+            using Stream resource = typeof(MipsCppEmitter).Assembly.GetManifestResourceStream($"SH.ELF.Vulkan.{name}")
+                ?? throw new InvalidOperationException($"Recurso Vulkan ausente: {name}");
+            using StreamReader reader = new(resource, Encoding.UTF8);
+            return reader.ReadToEnd();
+        }
+        using Stream shader = typeof(MipsCppEmitter).Assembly.GetManifestResourceStream("SH.ELF.Vulkan.shader")
+            ?? throw new InvalidOperationException("Shader Vulkan integrado ausente.");
+        using BinaryReader shaderReader = new(shader);
+        StringBuilder device = new("static const uint32_t roj_vk_shader[] = {\n");
+        for (long i = 0; i < shader.Length; i += 4)
+            device.Append("0x").Append(shaderReader.ReadUInt32().ToString("X8")).Append("u,");
+        device.AppendLine("\n};").AppendLine(ReadVulkan("device"));
+        return RuntimeSourceTemplate.Replace("/* SH_EMBEDDED_VU1_PROGRAMS */", programs.ToString())
+            .Replace("/* SH_EMBEDDED_VULKAN_DEVICE */", device.ToString())
+            .Replace("/* SH_EMBEDDED_VULKAN_BATCH */", ReadVulkan("batch"))
+            .Replace("/* SH_EMBEDDED_RING_HUD */", ReadVulkan("ringhud"));
+    }
+
+    private const string RuntimeSourceTemplate = """
 #include "ps2_functions.h"
+#include "roj_settings.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -874,8 +917,11 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 #include <chrono>
 #include <cctype>
 #include <csignal>
+#include <cmath>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
+#include <ctime>
 #include <string>
 #include <deque>
 #include <map>
@@ -884,8 +930,1059 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 #include <set>
 #include <thread>
 #include <vector>
+#include <utility>
+const roj::Settings& ps2_settings();
+/* SH_EMBEDDED_VULKAN_DEVICE */
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
+#endif
+
+#ifdef _WIN32
+// Reprodutor da sequencia RSSD de batalha. Cada chamada gera apenas o
+// bloco PCM pedido pelo dispositivo, a partir dos eventos e das vozes ativas.
+namespace
+{
+    constexpr unsigned LiveRate = 22050;
+    constexpr unsigned SpuRate = 48000;
+    using LiveBytes = std::vector<uint8_t>;
+
+    uint32_t live_word(const uint8_t* p, unsigned bytes)
+    {
+        uint32_t value = 0;
+        for (unsigned i = 0; i < bytes; ++i)
+            value |= uint32_t(p[i]) << (8 * i);
+        return value;
+    }
+
+    int live_signed(unsigned value, unsigned bits)
+    {
+        return int(value) - ((value & (1u << (bits - 1))) ? int(1u << bits) : 0);
+    }
+
+    struct LiveEnvelope
+    {
+        struct Phase { int step, increment, shift; bool exp, down; };
+        Phase phases[4];
+        int target, stage = 0, level = 0, counter = 0;
+        unsigned clock = 0;
+
+        static Phase make(unsigned rate, bool down, bool exp, bool halt)
+        {
+            int shift = int(rate >> 2);
+            int step = (down ? -8 + int(rate & 3) : 7 - int(rate & 3));
+            return {step * (1 << std::max(0, 11 - shift)),
+                    halt ? 0 : 0x8000 >> std::max(0, shift - 11), shift, exp, down};
+        }
+
+        LiveEnvelope(unsigned a, unsigned b)
+            : phases{make((a >> 8) & 127, false, a & 0x8000, ((a >> 8) & 127) == 127),
+                     make(((a >> 4) & 15) * 4, true, true, false),
+                     make((b >> 6) & 127, b & 0x4000, b & 0x8000, ((b >> 6) & 127) == 127),
+                     make((b & 31) * 4, true, b & 32, (b & 31) == 31)},
+              target(int((a & 15) + 1) * 2048) {}
+
+        void release() { stage = 3; counter = 0; }
+
+        void advance()
+        {
+            clock += SpuRate;
+            while (clock >= LiveRate)
+            {
+                clock -= LiveRate;
+                auto p = phases[stage];
+                if (!p.increment)
+                    break;
+                if (p.exp && p.down)
+                    p.step = (p.step * level) >> 15;
+                else if (p.exp && level > 0x6000)
+                {
+                    if (p.shift <= 10) p.step >>= p.shift == 10 ? 1 : 2;
+                    if (p.shift >= 10) p.increment >>= p.shift == 10 ? 1 : 2;
+                }
+                counter += std::max(1, p.increment);
+                if (counter < 0x8000)
+                    continue;
+                counter = 0;
+                level = std::clamp(level + p.step, 0, 0x7fff);
+                if ((stage == 0 && level == 0x7fff) || (stage == 1 && level <= target))
+                    ++stage;
+            }
+        }
+    };
+
+    struct LiveSample
+    {
+        std::vector<int16_t> pcm;
+        unsigned loop = 0;
+        bool repeat = false;
+        int tuning = 0;
+
+        bool decode(const uint8_t* data, unsigned size)
+        {
+            constexpr int coefficients[][2] = {{0,0}, {60,0}, {115,-52}, {98,-55}, {122,-60}};
+            int previous = 0, older = 0;
+            bool mark = false;
+            for (unsigned pos = 0; pos + 16 <= size; pos += 16)
+            {
+                const unsigned predictor = data[pos] >> 4, shift = data[pos] & 15, flags = data[pos+1];
+                if (predictor >= 5 || shift > 12)
+                    return false;
+                if (flags & 4) { mark = true; loop = unsigned(pcm.size()); }
+                for (unsigned i = 2; i < 16; ++i)
+                {
+                    for (unsigned bit : {0u, 4u})
+                    {
+                        const int raw = live_signed((data[pos+i] >> bit) & 15, 4);
+                        const auto* coef = coefficients[predictor];
+                        const int value = (raw * 4096 >> shift) + ((previous * coef[0] + older * coef[1] + 32) >> 6);
+                        older = previous;
+                        previous = std::clamp(value, -32768, 32767);
+                        pcm.push_back(int16_t(previous));
+                    }
+                }
+                if (flags & 1) { repeat = mark && (flags & 2); break; }
+            }
+            return !pcm.empty();
+        }
+    };
+
+    struct LiveZone { unsigned sample, root, low, high, volume, pan, adsr1, adsr2; };
+    struct LiveControl { unsigned frame; bool pitch; int value; };
+    struct LiveNote
+    {
+        unsigned frame, duration, track, control, velocity, volume;
+        int bend;
+        unsigned sample, adsr1, adsr2, program;
+        double step, left, right;
+    };
+    struct LiveVoice
+    {
+        const LiveNote* note;
+        LiveEnvelope env;
+        unsigned control;
+        double position = 0, step;
+        int volume;
+        explicit LiveVoice(const LiveNote& n)
+            : note(&n), env(n.adsr1,n.adsr2), control(n.control),
+              step(n.step * std::exp2(n.bend / 3072.0)), volume(int(n.volume)) {}
+    };
+
+    class LiveSong
+    {
+        std::vector<LiveSample> samples;
+        std::vector<std::vector<LiveZone>> programs;
+        std::vector<std::vector<LiveControl>> controls;
+        std::vector<LiveNote> notes;
+        std::vector<LiveVoice> voices;
+        bool brain_hopper = false, victory_intro = false, has_loop = false;
+        unsigned bpm = 0, frame = 0, end = 0, loop = 0;
+        size_t next = 0, loop_note = 0;
+
+        unsigned to_frame(unsigned ticks) const
+        {
+            return unsigned(std::nearbyint(double(ticks) * (LiveRate * 60.0 / (48 * bpm))));
+        }
+
+        bool bank(const LiveBytes& b)
+        {
+            if (b.size() < 64 || live_word(b.data()+8,4) != b.size() ||
+                std::memcmp(b.data(),"swdm",4) != 0)
+                return false;
+            const unsigned count = b[0x14], nprogram = b[0x15], size = live_word(b.data()+0x1c,4);
+            const unsigned start = live_word(b.data()+0x20,4), table = 64 + 32*count + 0x16;
+            if (start > b.size() || size > b.size()-start || size % 16 || table+nprogram*0xd8 > start)
+                return false;
+
+            samples.resize(count);
+            std::vector<unsigned> offsets(count, size), boundaries{size};
+            for (unsigned i = 0; i < count; ++i)
+            {
+                const auto* entry = b.data()+64+32*i;
+                if (std::none_of(entry, entry+32, [](uint8_t x){ return x != 0; }))
+                    continue;
+                const unsigned offset = live_word(entry+4,4);
+                if (offset >= size || offset % 16)
+                    return false;
+                offsets[i] = offset;
+                boundaries.push_back(offset);
+                samples[i].tuning = live_signed(live_word(entry+14,2),16);
+            }
+            std::sort(boundaries.begin(), boundaries.end());
+            programs.resize(256);
+            for (unsigned i = 0; i < nprogram; ++i)
+            {
+                const auto* entry = b.data()+table+i*0xd8;
+                if (!programs[entry[0]].empty() || 22+entry[1]*12 > 0xd8)
+                    return false;
+                for (unsigned j = 0; j < entry[1]; ++j)
+                {
+                    const auto* z = entry+22+j*12;
+                    const unsigned index = z[0];
+                    if (index >= count || offsets[index] == size || z[2] > z[3])
+                        return false;
+                    const unsigned offset = offsets[index];
+                    const unsigned limit = *std::upper_bound(boundaries.begin(), boundaries.end(), offset);
+                    if (samples[index].pcm.empty() && !samples[index].decode(b.data()+start+offset,limit-offset))
+                        return false;
+                    programs[entry[0]].push_back({index,z[1],z[2],z[3],z[4],z[5],live_word(z+6,2),live_word(z+8,2)});
+                }
+            }
+            return true;
+        }
+
+        static int operands(unsigned op)
+        {
+            switch (op)
+            {
+                case 0x80: case 0x81: case 0x90: case 0x91: case 0xca: case 0xcb: return 0;
+                case 0x82: case 0x83: case 0x84: case 0x94: case 0x9c: case 0xa8:
+                case 0xa9: case 0xac: case 0xe0: case 0xe8: return 1;
+                case 0x85: case 0xa0: case 0xd4: return 2;
+                case 0xe2: return 3;
+                case 0xfd: return 5;
+                default: return -1;
+            }
+        }
+
+        bool add_note(unsigned track, unsigned tick, unsigned duration, unsigned program,
+                      int key, unsigned velocity, unsigned volume, int pan, int bend)
+        {
+            if (!velocity || !duration)
+                return true;
+            if (program >= programs.size() || programs[program].empty())
+                return false;
+            const auto distance = [key](const LiveZone& z) {
+                return std::max({int(z.low)-key, key-int(z.high), 0});
+            };
+            const auto& zones = programs[program];
+            const auto& z = *std::min_element(zones.begin(),zones.end(),
+                [&](const LiveZone& a,const LiveZone& b){ return distance(a)<distance(b); });
+            // Mesma calibracao da previa de Brain Hopper, sem normalizacao global.
+            constexpr double gains[] = {.667,.904,1.031,.692,1.065,.762,1.054,1.13,.639,1.115,.959,1.628,.972};
+            double gain = velocity * z.volume * (brain_hopper && program < 13 ? gains[program] : 1.0) / (127.0*127*127*32768);
+            if (brain_hopper && program == 8 && z.sample == 14)
+                gain *= 0.6309573445; // -4 dB, batida metalica HUBCAP R8.
+            double balance = std::clamp(pan+int(z.pan)-64,0,127)/127.0;
+            const double step = (SpuRate/double(LiveRate)) *
+                std::exp2((key-int(z.root)+samples[z.sample].tuning/256.0)/12);
+            notes.push_back({tick,duration,track,unsigned(controls[track].size()),velocity,volume,
+                bend,z.sample,z.adsr1,z.adsr2,program,step,gain*std::sqrt(1-balance),gain*std::sqrt(balance)});
+            return true;
+        }
+
+        bool track(const uint8_t* data, unsigned size, bool conductor)
+        {
+            const unsigned index = unsigned(controls.size());
+            controls.emplace_back();
+            unsigned tick = 0, duration = 0, program = 0, volume = 100;
+            int delay = 0, octave = 4, pan = 64, bend = 0;
+            for (unsigned pos = 0; pos < size;)
+            {
+                const unsigned op = data[pos++];
+                const int n = op < 0x80 ? (pos < size ? 1+(data[pos] >> 6) : -1) : operands(op);
+                if (n < 0 || unsigned(n) > size-pos)
+                    return false;
+                const auto* a = data+pos;
+                pos += unsigned(n);
+                if (op < 0x80)
+                {
+                    if (n > 1)
+                    {
+                        duration = 0;
+                        for (int i = 1; i < n; ++i) duration = (duration << 8) | a[i];
+                    }
+                    octave += int((a[0] >> 4) & 3)-1;
+                    const int key = (octave+1)*12+(a[0]&15);
+                    if (key < 0 || key > 127 || (a[0]&15)>11 || duration>200000 ||
+                        !add_note(index,tick,duration,program,key,op,volume,pan,bend))
+                        return false;
+                }
+                else if (op <= 0x85)
+                {
+                    if (op == 0x80) delay = int(duration);
+                    if (op == 0x82 || op == 0x83) delay = (op == 0x82 ? delay : int(duration)) + live_signed(a[0],8);
+                    if (op >= 0x84) delay = int(live_word(a,unsigned(n)));
+                    if (delay < 0 || unsigned(delay) > 200000-tick) return false;
+                    tick += unsigned(delay);
+                }
+                else if (op == 0x90)
+                {
+                    if (conductor) end = tick;
+                    return size-pos <= 3 && std::all_of(data+pos,data+size,[](uint8_t b){ return b == 0; });
+                }
+                else if (op == 0x91 && conductor)
+                {
+                    loop = tick;
+                    has_loop = true;
+                }
+                else if (op == 0x94) octave = a[0];
+                else if (op == 0x9c && conductor) bpm = a[0];
+                else if (op == 0xac) program = a[0];
+                else if (op == 0xe0)
+                {
+                    volume = std::min(127u,unsigned(a[0]));
+                    controls[index].push_back({tick,false,int(volume)});
+                }
+                else if (op == 0xd4)
+                {
+                    bend = live_signed(live_word(a,2),16);
+                    controls[index].push_back({tick,true,bend});
+                }
+                else if (op == 0xe8) pan = std::min(127,int(a[0]));
+            }
+            return false;
+        }
+
+    public:
+        bool load(const LiveBytes& seq, const LiveBytes& swd)
+        {
+            if (seq.size() < 0x78 || swd.size() < 0x40 ||
+                std::memcmp(seq.data(),"smdm",4) != 0 || live_word(seq.data()+8,4) != seq.size() ||
+                live_word(seq.data()+0x1e,2) != live_word(swd.data()+0x12,2) || !bank(swd))
+                return false;
+            brain_hopper = std::memcmp(seq.data()+0x2c,"bgm401",7) == 0;
+            victory_intro = std::memcmp(seq.data()+0x2c,"BGM409",7) == 0;
+            // O campo 0x2A aponta para o primeiro bloco, relativo a 0x28.
+            unsigned pos = 0x28 + live_word(seq.data()+0x2a,2);
+            if (pos >= seq.size())
+                return false;
+            while (pos+8 <= seq.size() && live_word(seq.data()+pos,2) == 3)
+            {
+                const unsigned block = live_word(seq.data()+pos+2,2);
+                if (block < 9 || block > seq.size()-pos ||
+                    !track(seq.data()+pos+8,block-8,live_word(seq.data()+pos+6,2)==0))
+                    return false;
+                pos += block;
+            }
+            constexpr uint8_t finish[] = {4,0,8,0,0,0,0,0,0,0,4,0};
+            if (seq.size()-pos != sizeof finish || std::memcmp(seq.data()+pos,finish,sizeof finish) ||
+                bpm < 30 || end == 0 || (has_loop && loop >= end) || notes.empty())
+                return false;
+
+            end = to_frame(end);
+            loop = to_frame(loop);
+            for (auto& tr : controls)
+                for (auto& c : tr) c.frame = to_frame(c.frame);
+            for (auto& n : notes)
+            {
+                n.frame = to_frame(n.frame);
+                n.duration = to_frame(n.duration);
+            }
+            std::stable_sort(notes.begin(),notes.end(),[](const LiveNote& a,const LiveNote& b){ return a.frame<b.frame; });
+            loop_note = size_t(std::lower_bound(notes.begin(),notes.end(),loop,
+                [](const LiveNote& n,unsigned at){ return n.frame<at; })-notes.begin());
+            voices.reserve(48);
+            return true;
+        }
+
+        void render(int16_t* dest, unsigned frames)
+        {
+            for (unsigned i = 0; i < frames; ++i, ++frame)
+            {
+                if (frame == end)
+                {
+                    // Como na previa validada, as vozes retornam ao ponto de loop.
+                    voices.clear();
+                    if (!has_loop)
+                    {
+                        std::fill_n(dest,2*(frames-i),int16_t(0));
+                        return;
+                    }
+                    victory_intro = false;
+                    frame = loop;
+                    next = loop_note;
+                }
+                while (next < notes.size() && notes[next].frame == frame)
+                    voices.emplace_back(notes[next++]);
+
+                // Calibracao da abertura de BGM409 com a captura do PCSX2.
+                // O orgao recua e as cordas ganham presenca, com retorno gradual
+                // aos ganhos do banco antes dos efeitos registrados na vitoria.
+                const double intro = victory_intro
+                    ? std::clamp((3.0 * LiveRate - frame) / (0.5 * LiveRate), 0.0, 1.0)
+                    : 0.0;
+                double left = 0, right = 0;
+                for (auto v = voices.begin(); v != voices.end();)
+                {
+                    const auto& n = *v->note;
+                    const auto& sample = samples[n.sample];
+                    if (frame == n.frame+n.duration) v->env.release();
+                    auto& tr = controls[n.track];
+                    while (v->control < tr.size() && tr[v->control].frame <= frame)
+                    {
+                        const auto& c = tr[v->control++];
+                        if (c.pitch) v->step = n.step * std::exp2(c.value/3072.0);
+                        else v->volume = c.value;
+                    }
+                    unsigned pos = unsigned(v->position);
+                    const unsigned size = unsigned(sample.pcm.size());
+                    if ((v->env.stage == 3 && !v->env.level) || (pos >= size && !sample.repeat))
+                    {
+                        v = voices.erase(v);
+                        continue;
+                    }
+                    const double fraction = v->position-pos;
+                    if (pos >= size)
+                    {
+                        pos = sample.loop+(pos-sample.loop)%(size-sample.loop);
+                        v->position = pos+fraction;
+                    }
+                    const unsigned next_pos = (pos+1 == size && sample.repeat) ? sample.loop : pos+1;
+                    const int a = sample.pcm[pos], b = next_pos < size ? sample.pcm[next_pos] : 0;
+                    const double value = (a+(b-a)*fraction) * v->volume * (v->env.level/32768.0);
+                    const double gain = 1.0 + intro * (n.program == 0 ? -0.30 : n.program == 1 ? 0.20 : 0.0);
+                    left += value*n.left*gain;
+                    right += value*n.right*gain;
+                    v->env.advance();
+                    v->position += v->step;
+                    ++v;
+                }
+                // Ganho fixo com margem para a soma das vozes; independe da duracao.
+                *dest++ = int16_t(std::clamp(left*16384,-32768.0,32767.0));
+                *dest++ = int16_t(std::clamp(right*16384,-32768.0,32767.0));
+            }
+        }
+    };
+}
+namespace
+{
+    struct EffectBank
+    {
+        std::shared_ptr<const LiveBytes> swd, auxiliary;
+        LiveBytes seds;
+    };
+
+    struct EffectRequest
+    {
+        std::shared_ptr<const EffectBank> bank;
+        unsigned id, volume, pan;
+        uint64_t trace_id = 0;
+        bool use_recording = false;
+        bool item_pickup = false;
+    };
+
+    struct EffectVolumeRamp
+    {
+        unsigned start, length, target;
+    };
+
+    struct EffectVoice
+    {
+        std::shared_ptr<const LiveSample> sample;
+        unsigned id, delay, remaining, release;
+        unsigned total, attack;
+        bool repeat_sample;
+        double position = 0, step, left, right;
+        double pitch_factor = 1.0;
+        unsigned glide_left = 0, glide_delay = 0;
+        double smoothing = 1.0, filtered = 0.0;
+        unsigned shatter_frame = 0;
+        double shatter_low = 0.0, shatter_high = 0.0;
+        bool from_recording = false;
+        bool loop_ambient = false;
+        std::vector<EffectVolumeRamp> ramps;
+        unsigned ramp_index = 0, ramp_remaining = 0, elapsed = 0;
+        double volume_level = 1.0, volume_step = 0.0;
+    };
+
+    class LiveEffects
+    {
+        static constexpr unsigned ShatterDuration = LiveRate*850/1000;
+        static constexpr unsigned ShatterFade = LiveRate*220/1000;
+
+        std::vector<EffectVoice> voices;
+        struct RecordedEffect
+        {
+            std::shared_ptr<const LiveSample> channels[2];
+            double gain;
+        };
+        std::map<unsigned,RecordedEffect> recordings;
+        using CacheKey = std::pair<std::shared_ptr<const LiveBytes>, unsigned>;
+        std::map<CacheKey,std::shared_ptr<const LiveSample>> cache;
+
+        std::shared_ptr<const LiveSample> sample(std::shared_ptr<const LiveBytes> bank, unsigned index)
+        {
+            if (!bank) return {};
+            const auto& b = *bank;
+            if (b.size()<64 || index>=b[20])
+                return {};
+            const auto key = std::make_pair(bank,index);
+            if (auto i = cache.find(key); i != cache.end())
+                return i->second;
+            if (cache.size() >= 64)
+                cache.clear();
+
+            const unsigned start = live_word(b.data()+32,4), size = live_word(b.data()+28,4);
+            const unsigned entries = 64 + 32 * b[20];
+            if (entries > start || start > b.size() || size > b.size()-start)
+                return {};
+            const auto* entry = b.data()+64+32*index;
+            if (std::none_of(entry,entry+32,[](uint8_t v){return v != 0;}))
+                return {};
+            const unsigned offset = live_word(entry+4,4);
+            if (offset >= size || offset%16 || size%16)
+                return {};
+            unsigned end = size;
+            for (unsigned i=0; i<b[20]; ++i)
+            {
+                const unsigned at = live_word(b.data()+68+32*i,4);
+                if (at > offset && at < end) end=at;
+            }
+            auto decoded = std::make_shared<LiveSample>();
+            if (end%16 || !decoded->decode(b.data()+start+offset,end-offset))
+                return {};
+            decoded->tuning = live_signed(live_word(entry+14,2),16);
+            cache.emplace(key,decoded);
+            return decoded;
+        }
+
+    public:
+        bool load_effect_wav(unsigned id, double playback_gain, const LiveBytes& wav)
+        {
+            // O arquivo do efeito usa PCM estereo de 16 bits na taxa do mixer.
+            if (wav.size()<12 || std::memcmp(wav.data(),"RIFF",4) ||
+                std::memcmp(wav.data()+8,"WAVE",4) || live_word(wav.data()+4,4)!=wav.size()-8)
+                return false;
+
+            bool format_ok = false;
+            const uint8_t* pcm = nullptr;
+            unsigned frames = 0;
+            for (size_t offset=12; offset+8<=wav.size();)
+            {
+                const auto* chunk = wav.data()+offset;
+                const unsigned bytes = live_word(chunk+4,4);
+                offset += 8;
+                if (bytes > wav.size()-offset || (bytes&1u) > wav.size()-offset-bytes)
+                    return false;
+                const auto* data = wav.data()+offset;
+                if (!std::memcmp(chunk,"fmt ",4))
+                {
+                    format_ok = bytes>=16 && live_word(data,2)==1 &&
+                        live_word(data+2,2)==2 && live_word(data+4,4)==LiveRate &&
+                        live_word(data+12,2)==4 && live_word(data+14,2)==16;
+                }
+                else if (!std::memcmp(chunk,"data",4))
+                {
+                    if (bytes%4 || bytes<4 || bytes>LiveRate*8)
+                        return false;
+                    pcm = data;
+                    frames = bytes/4;
+                }
+                offset += bytes+(bytes&1u);
+            }
+            if (!format_ok || !pcm)
+                return false;
+
+            RecordedEffect effect{};
+            effect.gain = playback_gain;
+            for (unsigned channel=0; channel<2; ++channel)
+            {
+                auto sample = std::make_shared<LiveSample>();
+                sample->pcm.resize(frames);
+                for (unsigned i=0; i<frames; ++i)
+                    sample->pcm[i] = int16_t(live_signed(live_word(pcm+4*i+2*channel,2),16));
+                effect.channels[channel] = std::move(sample);
+            }
+            recordings.insert_or_assign(id,std::move(effect));
+            return true;
+        }
+
+        unsigned play(const EffectRequest& request)
+        {
+            if (auto it=recordings.find(request.id); request.use_recording && it!=recordings.end())
+            {
+                // Mantem a separacao L/R e aplica o volume do pedido original.
+                const auto& clip = it->second;
+                const double gain = clip.gain*std::min(request.volume,127u)/127.0;
+                if (gain==0.0)
+                    return 0;
+                const unsigned pan = std::min(request.pan,127u);
+                const unsigned frames = unsigned(clip.channels[0]->pcm.size());
+                if (voices.size()>30)
+                    voices.erase(voices.begin(),voices.begin()+(voices.size()-30));
+                const double left = gain*std::min(1.0,(127-pan)/63.0);
+                const double right = gain*std::min(1.0,pan/64.0);
+                voices.push_back({clip.channels[0],request.id,0,frames,0,frames,0,false,0,1.0,left,0});
+                voices.back().from_recording=true;
+                voices.push_back({clip.channels[1],request.id,0,frames,0,frames,0,false,0,1.0,0,right});
+                voices.back().from_recording=true;
+                return 2;
+            }
+
+            if (!request.bank)
+                return 0;
+            const auto& b = *request.bank;
+            const auto& d = b.seds;
+            constexpr unsigned table = 0x34;
+            if (d.size() < table)
+                return 0;
+            const unsigned effect_id = request.id & 0xffffu;
+            const unsigned common_id = request.id >> 16 ? UINT32_MAX : effect_id;
+            // HandleNpcDie1/3/6, StartSequence e Polling de CBtlEnd.
+            const bool death = common_id == 0x22 || common_id == 0x25 || common_id == 0x39;
+            const bool encounter_intro = common_id == 0x15;
+            const bool result_count = common_id == 0x17;
+            const bool ring_hit = common_id == 0x1c || common_id == 0x1d;
+            const bool ring_cue = common_id >= 0x19 && common_id <= 0x21;
+            const bool item_cue = request.item_pickup || common_id == 0x18;
+            const bool automated_effect = ring_cue || item_cue || encounter_intro || death;
+            const bool banked_effect = (request.id >> 16) != 0;
+            const unsigned count = live_word(d.data()+26,2);
+            // SsdPlayEffectParam no SSD.IRX usa SEDS + 0x34 + 2 * ID,
+            // inclusive para regist01. Um offset zero significa ausência.
+            const bool wind_shear = std::memcmp(d.data()+0x20,"39A_S.sav",10) == 0;
+            if (effect_id >= count || table + 2*count > d.size())
+                return 0;
+            const unsigned offset = live_word(d.data()+table+2*effect_id,2);
+            const unsigned wave_bank = live_word(d.data()+0x1c,2);
+            const bool train_bank = effect_id == 0x0c &&
+                (wave_bank == 0x0310 || wave_bank == 0x0311) &&
+                std::memcmp(d.data()+0x20, "TT", 2) == 0;
+            if (offset < table + 2*count || offset+8 > d.size())
+                return 0;
+            const auto* entry = d.data()+offset;
+            const unsigned tracks = entry[3], length = live_word(entry+6,2);
+            const bool train_ambient = train_bank && entry[0] == 0x11;
+            if ((entry[0] != 1 && !train_ambient) ||
+                length < 8+2*tracks || length > d.size()-offset)
+                return 0;
+            if (train_ambient)
+                stop(request.id, false);
+            unsigned played = 0;
+            for (unsigned i=0; i<tracks; ++i)
+            {
+                unsigned at = live_word(entry+8+2*i,2);
+                const unsigned stop = i+1 < tracks ? live_word(entry+10+2*i,2) : length;
+                if (at < 8+2*tracks || at >= stop || stop > length)
+                    continue;
+                unsigned index=256, volume=127, pan=request.pan;
+                unsigned wait=0, duration=0, glide_ticks=0, glide_start=0, volume_ramp=0;
+                int glide_semitones=0, detune_cents=0;
+                int root=-1, pitch=-1, note_offset=0;
+                int next_note=-1, next_pitch=-1;
+                unsigned next_duration=0, next_start=0;
+                bool valid=false, pitched=false;
+                bool repeat_sample=true;
+                std::vector<EffectVolumeRamp> ramps;
+                // Subconjunto dos SEDS para disparos de uma amostra por camada.
+                // Comandos de modulacao conhecidos mantem o alinhamento da pista.
+                while (at < stop)
+                {
+                    const unsigned op=entry[at++];
+                    if (op==0xca || op==0xcb || op==0xc2 || op==0xc1 || op==0xc0 || op==0x99 || op==0x91) continue;
+                    if (op < 0x80)
+                    {
+                        if (at == stop) break;
+                        if (item_cue || ring_hit)
+                            note_offset = op & 15;
+                        duration = entry[at++];
+                        pitched = root >= 0 && pitch >= 0;
+                        valid = true;
+                        break;
+                    }
+                    unsigned width=0;
+                    switch (op)
+                    {
+                        case 0xaa: case 0xe0: case 0xe8: case 0x88:
+                        case 0xb2: case 0xb5: case 0xd0: case 0xd1: case 0xd2: case 0x98: width=1; break;
+                        case 0x96: case 0x97: case 0xd3: case 0xc9: case 0xb7: width=2; break;
+                        case 0x94: case 0xd5: case 0xd8: case 0xd9: case 0xe2: case 0xe5: width=3; break;
+                        default: break;
+                    }
+                    if (!width || width > stop-at)
+                        break;
+                    const auto* args=entry+at;
+                    at+=width;
+                    switch (op)
+                    {
+                        case 0xaa: index=args[0]; break;
+                        case 0xe0: volume=std::min(127u,unsigned(args[0])); break;
+                        case 0xe2:
+                            if (automated_effect)
+                                ramps.push_back({0,live_word(args,2),std::min(127u,unsigned(args[2]))});
+                            else if (!volume && args[2])
+                            {
+                                volume=std::min(127u,unsigned(args[2]));
+                                volume_ramp=live_word(args,2);
+                            }
+                            break;
+                        case 0xe8: pan=unsigned(std::clamp(int(pan)+int(args[0])-64,0,127)); break;
+                        case 0x88: wait+=args[0]; break;
+                        case 0xb2: root=args[0]; break;
+                        case 0xb5: pitch=args[0]; break;
+                        case 0xd3:
+                            // As pistas emparelhadas da transicao usam afinacoes ligeiramente distintas.
+                            if (encounter_intro)
+                                detune_cents = live_signed(live_word(args,2),16);
+                            break;
+                        case 0xd5:
+                            // Interpretacao experimental do D5 do efeito 2:
+                            // duracao little-endian e deslocamento assinado.
+                            glide_ticks=live_word(args,2);
+                            glide_semitones=live_signed(args[2],8);
+                            break;
+                        case 0x97: case 0x94:
+                            // Disparos 94 e 97 observados nos efeitos desta rodada.
+                            valid=true;
+                            pitched=op==0x94 || root>=0;
+                            duration=args[width-1];
+                            break;
+                        default: break;
+                    }
+                    if (op==0x96)
+                    {
+                        valid=true;
+                        repeat_sample=false;
+                        if (automated_effect)
+                            duration=args[1];
+                        break;
+                    }
+                    // Preserve o disparo mesmo se houver automacao posterior na pista.
+                    if (op==0x94 || op==0x97)
+                        break;
+                }
+                if (valid && (automated_effect || banked_effect))
+                {
+                    // Depois do disparo, 89 adianta a pista e E2 interpola o volume.
+                    unsigned tick = 0;
+                    while (at < stop)
+                    {
+                        const unsigned op = entry[at++];
+                        if (op == 0x89 && at < stop)
+                            tick += entry[at++];
+                        else if (op == 0xe2 && stop - at >= 3)
+                        {
+                            const unsigned length = live_word(entry+at,2);
+                            const unsigned target = std::min(127u,unsigned(entry[at+2]));
+                            ramps.push_back({tick, length, target});
+                            at += 3;
+                        }
+                        else if (op == 0xd5 && stop - at >= 3)
+                        {
+                            glide_ticks = live_word(entry+at,2);
+                            glide_semitones = live_signed(entry[at+2],8);
+                            glide_start = tick;
+                            at += 3;
+                        }
+                        else if (ring_cue && op == 0xb5 && at < stop)
+                            next_pitch = entry[at++];
+                        else if (ring_cue && op < 0x80 && at < stop)
+                        {
+                            next_note = op & 15;
+                            next_duration = entry[at++];
+                            next_start = std::max(tick, duration);
+                            break;
+                        }
+                        else if (op == 0xc9 && stop - at >= 2)
+                            at += 2;
+                        else if (op == 0x91 || op == 0x99 || op == 0xca || op == 0xcb ||
+                                 op == 0xc0 || op == 0xc1 || op == 0xc2)
+                            continue;
+                        else
+                            break;
+                    }
+                }
+                if (!valid)
+                    continue;
+
+                // Estas camadas dependem de modulacao ou roteamento que
+                // ainda nao reproduzimos. Preserve o ataque, sem falso eco
+                // no acerto nem prolongar as ondas tonais de cursor/contagem.
+                if (common_id==0x1d && index==13 && i!=2)
+                    continue;
+                // FEFFECT toca duas pistas da mesma onda de ruido ao iniciar a carga.
+                const bool special_charge = common_id == 0x33 && index == 9;
+                if (special_charge && i!=0)
+                    continue;
+                if (common_id==0x21 || death)
+                    repeat_sample=false;
+                auto pcm=sample(b.swd,index);
+                if (!pcm) pcm=sample(b.auxiliary,index);
+                if (!pcm)
+                    continue;
+                // A escala de ticks e a diferenca B2/B5 sao aproximacoes
+                // para as camadas observadas, sem aplicar comandos de modulacao.
+                const int semitones = note_offset + ((pitched && root>=0 && pitch>=0) ? pitch-root : 0);
+                // Na quebra do anel, a amostra de impacto bate com a captura a 75% da taxa.
+                const double rate= (common_id==0x21 && index==10) ? 0.75 : 1.0;
+                const double step=SpuRate/double(LiveRate)*
+                    std::exp2(pcm->tuning/3072.0+semitones/12.0+detune_cents/1200.0)*rate;
+                // Reequilibra o impacto frente a cauda do estilhaco do anel.
+                const double impact_gain = (common_id==0x21 && index==10) ? 0.35 : 1.0;
+                const double gain=0.24*std::min(request.volume,127u)*(ramps.empty()?volume:127u)/(127.0*127)*impact_gain;
+                if (gain==0.0)
+                    continue;
+                const unsigned ticks_per_beat=48;
+                const unsigned tempo=entry[1] ? entry[1] : 75u;
+                const unsigned tick_frames=LiveRate*60/(ticks_per_beat*tempo);
+                unsigned release=(pitched || !repeat_sample)?LiveRate/100:0;
+                unsigned remaining=(pitched || automated_effect) && duration?duration*tick_frames+release:UINT32_MAX;
+                if (common_id==0x21)
+                    // A amostra de impacto pode durar mais que a quebra do anel.
+                    remaining=std::min(remaining,ShatterDuration);
+                unsigned attack=std::min(volume_ramp,96u)*tick_frames;
+                double envelope_gain=gain;
+                if (death)
+                    release = LiveRate * 45u / 1000u;
+                if (result_count)
+                {
+                    release = LiveRate * 16u / 1000u;
+                    attack = LiveRate * 2u / 1000u;
+                    repeat_sample = true;
+                    remaining = LiveRate * 60u / 1000u;
+                    envelope_gain *= 0.8;
+                }
+                if (ring_cue)
+                {
+                    release = LiveRate * 20u / 1000u;
+                    // No erro, os transientes do banco tocam uma vez. Repetir o loop
+                    // sem a modulacao da sequencia alonga o aviso.
+                    if (common_id == 0x1e || common_id == 0x1f)
+                        repeat_sample = false;
+                }
+                if (!ramps.empty())
+                {
+                    const auto& last = ramps.back();
+                    release = LiveRate * (death ? 45u : 20u) / 1000u;
+                    const unsigned end = (last.start + last.length) * tick_frames;
+                    if (last.target == 0)
+                        remaining = end + release;
+                    else if (remaining != UINT32_MAX)
+                        remaining = std::max(remaining, end + release);
+                    attack = 0;
+                }
+                if (item_cue)
+                {
+                    // A própria sequência contém o espaçamento entre os
+                    // dois toques. Preserve o loop da onda durante a nota.
+                    attack = LiveRate * 2u / 1000u;
+                    release = LiveRate * 12u / 1000u;
+                    remaining = duration * tick_frames + release;
+                }
+                if (ring_hit)
+                {
+                    attack = LiveRate * 2u / 1000u;
+                    release = LiveRate * 25u / 1000u;
+                    remaining = std::min(remaining, LiveRate * 210u / 1000u);
+                    repeat_sample = false;
+                }
+                if (wind_shear)
+                {
+                    repeat_sample = false;
+                    release = LiveRate * 25u / 1000u;
+                    remaining = duration * tick_frames + release;
+                }
+                if (train_ambient)
+                {
+                    remaining = UINT32_MAX;
+                    envelope_gain *= 0.45;
+                }
+                if (special_charge)
+                {
+                    repeat_sample = false;
+                    attack = LiveRate * 6u / 1000u;
+                    release = LiveRate * 90u / 1000u;
+                    remaining = std::min(remaining, LiveRate * 180u / 1000u);
+                    envelope_gain *= 0.7;
+                }
+                // O sinal 0x1E do anel usa a mesma onda do cancelamento.
+                // Sem a envoltoria, o laco sustenta um apito ate perto da quebra.
+                const bool short_saw = common_id==4 || (common_id==0x1e && index==5);
+                if (short_saw || common_id==2 || common_id==3)
+                {
+                    // Calibracao de interface. As ondas sinteticas curtas
+                    // do banco precisam de cauda, mas nao de ganho sustentado.
+                    const unsigned length_ms=common_id==3?105:65;
+                    attack=LiveRate*6/1000;
+                    release=LiveRate*55/1000;
+                    remaining=LiveRate*length_ms/1000;
+                    envelope_gain*=common_id==2?0.72:0.56;
+                    // O cursor usa uma amostra gravada. Confirma e cancela
+                    // usam formas de onda que precisam repetir para ter cauda.
+                    repeat_sample=common_id!=2;
+                }
+                if (common_id==0x1d && index==9)
+                {
+                    // A pista de ruido branco entra depois do impacto do acerto.
+                    // Uma cauda breve impede que o ruido acumule nos acertos seguintes.
+                    repeat_sample=false;
+                    remaining=std::min(remaining,LiveRate*100u/1000);
+                    release=LiveRate*80/1000;
+                    envelope_gain*=0.35;
+                }
+                if (voices.size()==32)
+                    voices.erase(voices.begin());
+                voices.push_back({pcm,request.id,wait*tick_frames,remaining,release,
+                    remaining,attack,repeat_sample,0,step,
+                    envelope_gain*std::sqrt(1-pan/127.0),envelope_gain*std::sqrt(pan/127.0)});
+                auto& voice=voices.back();
+                voice.loop_ambient = train_ambient;
+                if (!ramps.empty())
+                {
+                    for (auto& ramp : ramps)
+                    {
+                        ramp.start *= tick_frames;
+                        ramp.length *= tick_frames;
+                    }
+                    voice.ramps = std::move(ramps);
+                    voice.volume_level = volume / 127.0;
+                }
+                if (common_id==2)
+                {
+                    // O ataque e a cauda do cursor foram medidos na gravacao.
+                    // O relogio da amostra e a duracao da voz sao independentes.
+                    constexpr double cursor_rate=2.151;
+                    voice.step*=cursor_rate;
+                    voice.remaining=voice.total=LiveRate*60/1000;
+                    voice.attack=LiveRate*3/1000;
+                    voice.release=LiveRate*15/1000;
+                }
+                if ((common_id==3 || automated_effect) && glide_ticks && std::abs(glide_semitones)<=48)
+                {
+                    voice.glide_left=glide_ticks*tick_frames;
+                    voice.glide_delay=glide_start*tick_frames;
+                    voice.pitch_factor=std::exp2(glide_semitones/(12.0*voice.glide_left));
+                }
+                if (short_saw || result_count || special_charge)
+                {
+                    // Atenua harmonicos agudos das ondas dente de serra.
+                    voice.smoothing=1.0-std::exp(-2.0*3.141592653589793*1800.0/LiveRate);
+                }
+                ++played;
+                if (next_duration && next_note >= 0)
+                {
+                    // Entradas do anel com dois disparos na mesma pista (94/97 seguido de nota).
+                    EffectVoice followup = voice;
+                    followup.delay += next_start*tick_frames;
+                    followup.total = followup.remaining = next_duration*tick_frames + release;
+                    followup.glide_left = followup.glide_delay = 0;
+                    followup.step = step * std::exp2((next_note - note_offset +
+                        (next_pitch >= 0 && root >= 0 ? next_pitch - (pitch >= 0 ? pitch : root) : 0))/12.0);
+                    // A segunda nota continua no volume definido pela última rampa da pista.
+                    if (!followup.ramps.empty())
+                    {
+                        followup.volume_level = followup.ramps.back().target / 127.0;
+                        followup.ramps.clear();
+                    }
+                    if (voices.size()==32)
+                        voices.erase(voices.begin());
+                    voices.push_back(std::move(followup));
+                    ++played;
+                }
+            }
+            return played;
+        }
+
+        void stop(unsigned id, bool whole_bank)
+        {
+            voices.erase(std::remove_if(voices.begin(),voices.end(),[=](const EffectVoice& v){
+                return id == (whole_bank ? v.id >> 16 : v.id);
+            }),voices.end());
+        }
+
+        void render(int16_t* pcm, unsigned frames, double gain = 1.0)
+        {
+            for (unsigned i=0; i<frames && !voices.empty(); ++i)
+            {
+                double left=pcm[2*i], right=pcm[2*i+1];
+                for(auto v=voices.begin(); v!=voices.end();)
+                {
+                    if (v->delay)
+                    {
+                        --v->delay;
+                        ++v;
+                        continue;
+                    }
+                    const auto& sample=*v->sample;
+                    const auto& data=sample.pcm;
+                    const bool looping = sample.repeat && v->repeat_sample &&
+                        (v->remaining != UINT32_MAX || v->loop_ambient);
+                    if (v->position>=data.size() && looping)
+                        v->position=sample.loop+std::fmod(v->position-sample.loop,data.size()-sample.loop);
+                    const auto at=size_t(v->position);
+                    if (!v->remaining || at>=data.size())
+                    {
+                        v=voices.erase(v);
+                        continue;
+                    }
+                    const int next=at+1<data.size()?data[at+1]:
+                        (looping ? data[sample.loop] : 0);
+                    double value=data[at]+(next-data[at])*(v->position-at);
+                    if (v->smoothing<1.0)
+                    {
+                        v->filtered+=v->smoothing*(value-v->filtered);
+                        value=v->filtered;
+                    }
+                    double tail=v->remaining;
+                    if (!looping)
+                        tail=std::min(tail,(data.size()-v->position)/v->step);
+                    if (v->attack)
+                    {
+                        const double envelope=std::min({1.0,double(v->total-v->remaining)/v->attack,tail/v->release});
+                        value*=envelope*envelope;
+                    }
+                    else if (tail<v->release)
+                        value*=tail/v->release;
+                    if (v->id==0x21 && !v->from_recording)
+                    {
+                        // Dois filtros simples destacam de 1,3 a 4,5 kHz na cauda.
+                        constexpr double two_pi = 6.283185307179586;
+                        static const double low = 1.0-std::exp(-two_pi*1300.0/LiveRate);
+                        static const double high = 1.0-std::exp(-two_pi*4500.0/LiveRate);
+                        v->shatter_low += low*(value-v->shatter_low);
+                        v->shatter_high += high*(value-v->shatter_high);
+                        const unsigned frame = v->shatter_frame++;
+                        const double seconds = double(frame)/LiveRate;
+                        const double attack = std::min(1.0,seconds/0.054);
+                        const double rise = std::clamp((seconds-0.12)/0.20,0.0,1.0);
+                        const double fall = std::clamp((0.60-seconds)/0.28,0.0,1.0);
+                        // Suaviza o transiente e realca os fragmentos depois do impacto.
+                        // Aplica a queda final no tempo do efeito, independente do fim da amostra.
+                        const double fade = std::clamp((double(ShatterDuration)-frame)/ShatterFade,0.0,1.0);
+                        value = fade*attack*(value+1.3*rise*fall*(v->shatter_high-v->shatter_low));
+                    }
+                    if (v->remaining!=UINT32_MAX)
+                        --v->remaining;
+                    if (v->ramp_index < v->ramps.size() || v->ramp_remaining)
+                    {
+                        while (v->ramp_index < v->ramps.size() &&
+                               v->ramps[v->ramp_index].start == v->elapsed)
+                        {
+                            const auto& ramp = v->ramps[v->ramp_index++];
+                            const double target = ramp.target / 127.0;
+                            v->ramp_remaining = ramp.length;
+                            if (ramp.length)
+                                v->volume_step = (target - v->volume_level) / ramp.length;
+                            else
+                                v->volume_level = target;
+                        }
+                        if (v->ramp_remaining)
+                        {
+                            --v->ramp_remaining;
+                            v->volume_level += v->volume_step;
+                        }
+                        ++v->elapsed;
+                    }
+                    value *= v->volume_level;
+                    left+=value*v->left*gain;
+                    right+=value*v->right*gain;
+                    v->position+=v->step;
+                    if (v->glide_delay)
+                        --v->glide_delay;
+                    else if (v->glide_left)
+                    {
+                        v->step*=v->pitch_factor;
+                        --v->glide_left;
+                    }
+                    ++v;
+                }
+                pcm[2*i]=int16_t(std::clamp(left,-32768.0,32767.0));
+                pcm[2*i+1]=int16_t(std::clamp(right,-32768.0,32767.0));
+            }
+        }
+    };
+}
+
 #endif
 
 // As opcoes do perfil de batalha ficam ativas se a variavel estiver
@@ -895,6 +1992,11 @@ static bool battle_profile_enabled(const char* name)
     const char* value = std::getenv(name);
     return !value || std::strcmp(value, "0") != 0;
 }
+
+extern const bool g_rssd_audio_trace = [] {
+    const char* value = std::getenv("PS2_RSSD_AUDIO_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+}();
 
 const char* ps2_syscall_name(int number);   // gerado em ps2_syscall_names.cpp
 
@@ -1031,6 +2133,8 @@ static void dump_trace()
     std::abort();
 }
 
+void ps2_ring_hud(Ctx& c, uint32_t object);
+
 void ps2_call(Ctx& c, uint32_t target)
 {
     const Ps2FuncEntry* e = find_entry(target);
@@ -1041,7 +2145,12 @@ void ps2_call(Ctx& c, uint32_t target)
         die();
     }
 
+    // BtlStat::Draw is dispatched by the original battle poller. Snapshot its
+    // own values after drawing, so the extra numbers follow the same actor,
+    // position, visibility and fade as the three gauges.
+    const uint32_t ring_stats = target == 0x002AD950u ? uint32_t(c.r[4].lo) : 0u;
     e->fn(c);
+    if (ring_stats) ps2_ring_hud(c, ring_stats);
 }
 
 // JR indireto: o destino precisa ser o inicio de uma funcao (tail call).
@@ -1055,7 +2164,9 @@ void ps2_tailcall(Ctx& c, uint32_t target)
         die();
     }
 
+    const uint32_t ring_stats = target == 0x002AD950u ? uint32_t(c.r[4].lo) : 0u;
     e->fn(c);
+    if (ring_stats) ps2_ring_hud(c, ring_stats);
 }
 
 // ---- hardware: por enquanto so registra os primeiros acessos ----
@@ -1071,6 +2182,63 @@ static constexpr uint32_t irq_timer0_mask = (1u << irq_timer0_bits) - 1u;
 static constexpr uint32_t irq_vblank_max = UINT32_MAX >> irq_timer0_bits;
 std::atomic<uint32_t> g_irq_pending{0};
 static std::atomic<uint64_t> g_vsync_gen(0), g_vsync_del(0);   // VBLANKs gerados pelo relogio / entregues ao jogo (diagnostico do slow-motion)
+
+void ps2_battle_effect_clock(Ctx& c)
+{
+    static const bool enabled = battle_profile_enabled("PS2_BATTLE_EFFECT_CLOCK");
+    if (!enabled)
+        return;
+
+    // FVMCONTEXT: flags, contador WAIT e PC da instrucao seguinte.
+    const uint32_t context = ee_phys(static_cast<uint32_t>(c.r[5].lo));
+    if (!c.mem || context == 0 || context > 0x02000000u - 0x1b8u)
+        return;
+
+    const uint32_t address = context + 0x1b4u;
+    const int32_t remaining = mrd<int32_t>(c, address);
+    const uint32_t pc = mrd<uint32_t>(c, context + 0x1a0u);
+    const bool waiting = remaining > 0 && (mrd<uint32_t>(c, context + 0x1b0u) & 1u);
+    using EffectClock = std::chrono::steady_clock;
+    using EffectTick = std::chrono::duration<int64_t, std::ratio<1, 60>>;
+    const auto now = EffectClock::now();
+
+    struct Clock
+    {
+        uint32_t context = 0, pc = 0;
+        EffectClock::time_point deadline{}, last{};
+        int32_t remaining = 0;
+    };
+    static Clock clocks[32];
+    auto* clock = std::find_if(std::begin(clocks), std::end(clocks),
+        [context](const Clock& candidate) { return candidate.context == context; });
+    if (clock == std::end(clocks))
+        clock = std::min_element(std::begin(clocks), std::end(clocks),
+            [](const Clock& a, const Clock& b) { return a.last < b.last; });
+
+    // A animacao continua durante quadros que atrasam o polling do script.
+    // O WAIT usa o mesmo periodo de um campo e libera a proxima instrucao
+    // no proprio callback em que vence, inclusive quando faltava um passo.
+    if (!waiting)
+    {
+        if (clock->context == context)
+            *clock = {};
+        return;
+    }
+    if (clock->context != context || clock->pc != pc || remaining > clock->remaining)
+    {
+        *clock = {context, pc, now + std::chrono::ceil<EffectClock::duration>(EffectTick(remaining)),
+                  now, remaining - 1};
+        return;
+    }
+    clock->last = now;
+    const unsigned target = now >= clock->deadline ? 0u :
+        static_cast<unsigned>(std::min<int64_t>(remaining,
+            std::chrono::ceil<EffectTick>(clock->deadline - now).count()));
+    clock->remaining = target ? int32_t(target - 1) : 0;
+    if (target < unsigned(remaining))
+        mwr<uint32_t>(c, address, target);
+}
+
 static const bool g_vsync_catchup = battle_profile_enabled("PS2_VSYNC_CATCHUP");   // entrega VBLANKs atrasados (ate 4 por vez)
 static std::atomic<uint64_t> g_timer0_mode{0}, g_timer0_comp{0};
 static std::atomic<uint64_t> g_timer0_periods{0}, g_timer0_delivered{0};
@@ -1110,7 +2278,7 @@ static void timer0_count_merge()
     }
 }
 
-static uint64_t g_timer0_sys_ticks_recovered = 0; // So o EE atualiza e le.
+static uint64_t g_timer0_ticks_replayed = 0; // So o EE atualiza e le.
 static uint64_t g_timer0_dma_delivered = 0;  // So o EE atualiza e le este contador.
 static const bool g_timer0_dma_poll = [] {
     const char* value = std::getenv("PS2_TIMER0_DMA_POLL");
@@ -1243,7 +2411,7 @@ static void hw_hist_peek(int top_n)
     std::fprintf(stderr, any ? "\n" : " (nenhuma)\n");
 }
 
-// Relogio do host: os timers e o vsync andam com o tempo real, para os laços de espera terminarem.
+// Relogio do host: os timers e o vsync andam com o tempo real, para os laÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§os de espera terminarem.
 static uint64_t hw_now_ns()
 {
     static const auto start = std::chrono::steady_clock::now();
@@ -1313,11 +2481,16 @@ static const bool g_field_raster_train = [] {
     const char* value = std::getenv("PS2_GS_FIELD_RASTER_TRAIN");
     return !value || std::strcmp(value, "1") == 0;
 }();
-static const bool g_field_train_diag = [] {
-    const char* value = std::getenv("PS2_GS_FIELD_TRAIN_DIAG");
-    return !value || std::strcmp(value, "1") == 0;
-}();
-static const bool g_perf_gs = battle_profile_enabled("PS2_PERF_GS");
+
+static bool profile_enabled(const char* name, bool default_value = false)
+{
+    const char* value = std::getenv(name);
+    return value ? std::strcmp(value, "0") != 0 : default_value;
+}
+
+static const bool g_perf_all = profile_enabled("PS2_PERF");
+static const bool g_perf_gs = profile_enabled("PS2_PERF_GS", g_perf_all);
+static const bool g_field_train_diag = profile_enabled("PS2_GS_FIELD_TRAIN_DIAG", g_perf_gs);
 static const bool g_field_audit = [] {
     const char* value = std::getenv("PS2_GS_FIELD_AUDIT");
     return value != nullptr && std::strcmp(value, "1") == 0;
@@ -1328,20 +2501,33 @@ static const bool g_gs_tri_effects_fast = [] {
     return value == nullptr || std::strcmp(value, "0") != 0;
 }();
 static const bool g_gs_tri_early_z = battle_profile_enabled("PS2_GS_TRI_EARLY_Z");
-static const bool g_perf_vif1 = battle_profile_enabled("PS2_PERF_VIF1");
-static const bool g_vif1_unpack_fast = battle_profile_enabled("PS2_VIF1_UNPACK_FAST");
-static const bool g_perf_cadence = [] {
-    const char* value = std::getenv("PS2_PERF_CADENCE");
+static const bool g_gs_tri_row_fast = [] {
+    const char* value = std::getenv("PS2_GS_TRI_ROW_FAST");
     return !value || std::strcmp(value, "1") == 0;
 }();
-static const bool g_perf = g_perf_cadence || g_perf_vif1 || g_perf_gs || g_field_audit || std::getenv("PS2_PERF") != nullptr;   // relatorio [prof] sem precisar de PS2_GIFLOG
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+static const bool g_gs_tri_rgba_sse2 = [] {
+    const char* value = std::getenv("PS2_GS_TRI_RGBA_SSE2");
+    return !value || std::strcmp(value, "1") == 0;
+}();
+#else
+static constexpr bool g_gs_tri_rgba_sse2 = false;
+#endif
+static const bool g_perf_vif1 = profile_enabled("PS2_PERF_VIF1", g_perf_all);
+static const bool g_vif1_unpack_fast = battle_profile_enabled("PS2_VIF1_UNPACK_FAST");
+static const bool g_perf_cadence = profile_enabled("PS2_PERF_CADENCE", g_perf_all);
+static const bool g_perf = g_perf_all || g_perf_cadence || g_perf_vif1 || g_perf_gs || g_field_audit ||
+    profile_enabled("PS2_GS_PROFILE_IMAGE_QWORD");
+
+static const bool g_gs_replay_capture_enabled = [] {
+    const char* value = std::getenv("PS2_GS_VULKAN_CAPTURE");
+    return value && std::strcmp(value, "1") == 0;
+}();
+static std::atomic<bool> g_gs_replay_request{false};
 std::atomic<bool> g_cap_request{false};   // F9: grava o trace dos proximos vsyncs em gs_captura_N.txt (sem custo quando nao usado)
 // A medicao por quadword e opcional: duas consultas ao relogio
 // a cada 16 bytes podem dominar o custo de enfileirar a imagem.
-static const bool g_prof_image_qword = [] {
-    const char* value = std::getenv("PS2_GS_PROFILE_IMAGE_QWORD");
-    return !value || std::strcmp(value, "0") != 0;
-}();
+static const bool g_prof_image_qword = profile_enabled("PS2_GS_PROFILE_IMAGE_QWORD", g_perf_gs);
 // 1 preserva a medicao completa. Potencias de dois permitem
 // escolher a amostra sem divisao no caminho de cada quadword.
 static const unsigned g_prof_image_stride = [] {
@@ -1356,6 +2542,8 @@ uint64_t g_prof_dma_ns = 0, g_prof_vu_ns = 0, g_prof_present_ns = 0, g_prof_img_
 // O GS assincrono registra o tempo no worker e o EE le o perfil.
 static std::atomic<uint64_t> g_prof_tri_ns{0}, g_prof_sprite_ns{0};
 static std::atomic<uint64_t> g_prof_sprite_fast_pixels{0}, g_prof_sprite_generic_pixels{0};
+static std::atomic<uint64_t> g_prof_sprite_z16_pixels{0};
+static const bool g_sprite_z16_early = battle_profile_enabled("PS2_GS_SPRITE_Z16_EARLY");
 static inline uint64_t prof_now()
 {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1382,7 +2570,7 @@ static const char* const g_vu_aot_mode = std::getenv("PS2_VU1_AOT_CAPTURE");
 static const bool g_vu_aot_capture = g_vu_aot_mode != nullptr;
 static const bool g_vu_aot_revision_cache = [] {
     const char* value = std::getenv("PS2_VU1_AOT_REVISION_CACHE");
-    return value && std::strcmp(value, "1") == 0;
+    return !value || std::strcmp(value, "1") == 0;
 }();
 static uint64_t g_prof_aot_revision_hits = 0;
 static const bool g_vu_aot_enabled = battle_profile_enabled("PS2_VU1_AOT");
@@ -1397,8 +2585,11 @@ struct RasterProfScope
 {
     std::atomic<uint64_t>& acc;
     uint64_t start;
-    explicit RasterProfScope(std::atomic<uint64_t>& a) : acc(a), start(prof_now()) {}
-    ~RasterProfScope() { acc.fetch_add(prof_now() - start, std::memory_order_relaxed); }
+    explicit RasterProfScope(std::atomic<uint64_t>& a) : acc(a), start(g_perf ? prof_now() : 0) {}
+    ~RasterProfScope()
+    {
+        if (g_perf) acc.fetch_add(prof_now() - start, std::memory_order_relaxed);
+    }
 };
 
 void vu0_run(Ctx& c, uint32_t byte_addr);
@@ -2770,9 +3961,33 @@ namespace
     }
 }
 
-bool ps2_iso_open(const char* path)
+static std::filesystem::path g_game_directory;
+#ifdef _WIN32
+static std::filesystem::path ps2_windows_executable_path();
+static bool ps2_windows_replace_file(const std::filesystem::path& source, const std::filesystem::path& target);
+#endif
+
+static std::filesystem::path ps2_executable_directory(const char* argv0)
 {
-    std::ifstream f(path, std::ios::binary);
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    const fs::path executable = ps2_windows_executable_path();
+#else
+    std::error_code link_error;
+    const fs::path executable = fs::read_symlink("/proc/self/exe", link_error);
+#endif
+    if (!executable.empty())
+        return executable.parent_path();
+
+    std::error_code error;
+    const fs::path fallback = fs::absolute(argv0 && *argv0 ? fs::u8path(argv0) : fs::path("."), error);
+    return error ? fs::path(".") : (argv0 && *argv0 ? fallback.parent_path() : fallback);
+}
+
+static bool ps2_iso_open_path(const std::filesystem::path& file)
+{
+    const std::string path = file.u8string();
+    std::ifstream f(file, std::ios::binary);
 
     if (!f.is_open())
         return false;
@@ -2784,7 +3999,7 @@ bool ps2_iso_open(const char* path)
 
     if (f.gcount() != (std::streamsize)sizeof(pvd) || pvd[0] != 1 || std::memcmp(pvd + 1, "CD001", 5) != 0)
     {
-        std::fprintf(stderr, "%s nao parece uma ISO9660\n", path);
+        std::fprintf(stderr, "%s nao parece uma ISO9660\n", path.c_str());
         return false;
     }
 
@@ -2797,9 +4012,15 @@ bool ps2_iso_open(const char* path)
 
     g_iso = std::move(f);
 
-    std::fprintf(stderr, "ISO: %s (%llu setores)\n", path, (unsigned long long)g_iso_sectors);
+    std::fprintf(stderr, "ISO: %s (%llu setores)\n", path.c_str(), (unsigned long long)g_iso_sectors);
     return true;
 }
+
+bool ps2_iso_open(const char* path)
+{
+    return ps2_iso_open_path(std::filesystem::u8path(path));
+}
+
 
 // Ctrl+C: mostra o que o jogo estava fazendo (util quando ele fica preso em um laco).
 void ps2_install_crash_filter();   // filtro de excecoes do Windows (definido no fim do arquivo)
@@ -3004,7 +4225,7 @@ static void irq_tick_thread()
     }
 }
 
-// ---- entrada do controle: teclado (Windows) e roteiro por variavel de ambiente ----
+// ---- entrada configuravel no launcher: teclado, XInput e roteiro de diagnostico ----
 //   Teclado (so com a janela do jogo em foco): Enter=START, Backspace=SELECT, setas=direcional, Z=cruz, X=bola,
 //            C=quadrado, V=triangulo, Q=L1, E=R1, 1=L2, 3=R2, WASD=analogico esquerdo (com diagonais), IJKL=analogico direito.
 //   PS2_PAD_SCRIPT="START@10+0.2,CROSS@14+0.2": BOTAO@segundos+duracao (segundos desde o inicio do programa).
@@ -3015,56 +4236,15 @@ bool ps2_xinput_state(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* stic
 
 namespace
 {
-    struct PadButton { const char* name; uint16_t bit; int vk; };
+    struct PadButton { const char* name; uint16_t bit; };
 
     const PadButton k_pad_buttons[] =
     {
-        { "SELECT",   0x0100, 0x08 }, { "L3",     0x0200, 0 }, { "R3",    0x0400, 0 }, { "START",  0x0800, 0x0D },
-        { "UP",       0x1000, 0x26 }, { "RIGHT",  0x2000, 0x27 }, { "DOWN", 0x4000, 0x28 }, { "LEFT", 0x8000, 0x25 },
-        { "L2",       0x0001, 0x31 }, { "R2",     0x0002, 0x33 }, { "L1",   0x0004, 0x51 }, { "R1",   0x0008, 0x45 },
-        { "TRIANGLE", 0x0010, 0x56 }, { "CIRCLE", 0x0020, 0x58 }, { "CROSS", 0x0040, 0x5A }, { "SQUARE", 0x0080, 0x43 }
+        { "SELECT", 0x0100 }, { "L3", 0x0200 }, { "R3", 0x0400 }, { "START", 0x0800 },
+        { "UP", 0x1000 }, { "RIGHT", 0x2000 }, { "DOWN", 0x4000 }, { "LEFT", 0x8000 },
+        { "L2", 0x0001 }, { "R2", 0x0002 }, { "L1", 0x0004 }, { "R1", 0x0008 },
+        { "TRIANGLE", 0x0010 }, { "CIRCLE", 0x0020 }, { "CROSS", 0x0040 }, { "SQUARE", 0x0080 }
     };
-
-    // XInput -> botoes do PS2. A=X(cruz), B=O(bolinha), X=quadrado, Y=triangulo, LB/RB=L1/R1, gatilhos=L2/R2, Back=Select.
-    // Controles DualShock 4 / DualSense / Switch Pro entram por aqui via Steam Input, DS4Windows, DualSenseX ou BetterJoy
-    // (eles se apresentam ao Windows como controle Xbox).
-    uint16_t pad_buttons_from_xinput(uint16_t xb, uint8_t lt, uint8_t rt)
-    {
-        uint16_t p = 0;
-
-        if (xb & 0x0001) p |= 0x1000;   // cima
-        if (xb & 0x0008) p |= 0x2000;   // direita
-        if (xb & 0x0002) p |= 0x4000;   // baixo
-        if (xb & 0x0004) p |= 0x8000;   // esquerda
-        if (xb & 0x0010) p |= 0x0800;   // Start
-        if (xb & 0x0020) p |= 0x0100;   // Select (Back)
-        if (xb & 0x0040) p |= 0x0200;   // L3
-        if (xb & 0x0080) p |= 0x0400;   // R3
-        if (xb & 0x0100) p |= 0x0004;   // L1
-        if (xb & 0x0200) p |= 0x0008;   // R1
-        if (xb & 0x1000) p |= 0x0040;   // A -> cruz
-        if (xb & 0x2000) p |= 0x0020;   // B -> bolinha
-        if (xb & 0x4000) p |= 0x0080;   // X -> quadrado
-        if (xb & 0x8000) p |= 0x0010;   // Y -> triangulo
-        if (lt > 30) p |= 0x0001;       // L2
-        if (rt > 30) p |= 0x0002;       // R2
-        return p;
-    }
-
-    // eixo do XInput (-32768..32767, cima positivo) -> byte do PS2 (0x80 no centro). Retorna false dentro da zona morta.
-    bool pad_axis_from_xinput(int16_t v, int dead, bool invert, uint8_t& out)
-    {
-        const int a = v < 0 ? -(int)v : (int)v;
-
-        if (a < dead)
-            return false;
-
-        int d = (int)(((long long)(a - dead) * 127) / (32767 - dead));
-        d = d > 127 ? 127 : d;
-        const int signed_v = (v < 0 ? -d : d) * (invert ? -1 : 1);
-        out = (uint8_t)(0x80 + signed_v);
-        return true;
-    }
 
     struct PadScriptEntry { uint16_t bit; double start; double end; };
 
@@ -3113,6 +4293,7 @@ namespace
 }
 
 // Ative somente ao comparar o teclado com os pacotes lidos pelo jogo.
+static std::atomic<bool> g_fmv_start_pressed{false};
 static const bool g_pad_read_trace = [] {
     const char* value = std::getenv("PS2_PAD_READ_TRACE");
     return value && std::strcmp(value, "1") == 0;
@@ -3135,19 +4316,14 @@ static void pad_input_thread()
                 pressed |= e.bit;
         }
 
-        for (const PadButton& b : k_pad_buttons)
-        {
-            if (b.vk != 0 && ps2_key_down(b.vk))
-                pressed |= b.bit;
-        }
-
         uint16_t gp_buttons = 0;
         uint8_t gp_lt = 0, gp_rt = 0;
         int16_t gp_sticks[4] = {};
         const bool has_gamepad = ps2_xinput_state(&gp_buttons, &gp_lt, &gp_rt, gp_sticks);
 
-        if (has_gamepad)
-            pressed |= pad_buttons_from_xinput(gp_buttons, gp_lt, gp_rt);
+        const auto mapped = roj::map_input(ps2_settings().input, ps2_key_down, has_gamepad,
+            gp_buttons, gp_lt, gp_rt, gp_sticks);
+        pressed |= mapped.pressed;
 
         if (pressed != last)
         {
@@ -3155,21 +4331,7 @@ static void pad_input_thread()
             last = pressed;
         }
 
-        auto axis = [](int neg, int pos) -> uint8_t
-        {
-            const bool n = ps2_key_down(neg), p = ps2_key_down(pos);
-            return (uint8_t)(n == p ? 0x80 : (n ? 0x00 : 0xFF));
-        };
-
-        uint8_t lx = axis('A', 'D'), ly = axis('W', 'S'), rx = axis('J', 'L'), ry = axis('I', 'K');
-
-        if (has_gamepad)
-        {
-            pad_axis_from_xinput(gp_sticks[0], 7849, false, lx);
-            pad_axis_from_xinput(gp_sticks[1], 7849, true, ly);
-            pad_axis_from_xinput(gp_sticks[2], 8689, false, rx);
-            pad_axis_from_xinput(gp_sticks[3], 8689, true, ry);
-        }
+        const uint8_t lx = mapped.lx, ly = mapped.ly, rx = mapped.rx, ry = mapped.ry;
 
         static uint32_t last_sticks = 0x80808080u;
         const uint32_t sticks = ((uint32_t)lx << 24) | ((uint32_t)ly << 16) | ((uint32_t)rx << 8) | ry;
@@ -3186,25 +4348,37 @@ static void pad_input_thread()
 
         {
             static bool f9_last = false;
-            const bool f9 = ps2_key_down(0x78);   // VK_F9
+            const bool f9 = ps2_key_down(0x78) && !roj::input_uses_key(ps2_settings().input, 0x78);
 
             if (f9 && !f9_last)
-                g_cap_request = true;
+            {
+                if (g_gs_replay_capture_enabled)
+                    g_gs_replay_request = true;
+                else
+                    g_cap_request = true;
+            }
 
             f9_last = f9;
-            if (g_vu_aot_capture && ps2_key_down(0x77) && !g_vu_aot_armed.exchange(true))
+            if (g_vu_aot_capture && ps2_key_down(0x77) && !roj::input_uses_key(ps2_settings().input, 0x77) && !g_vu_aot_armed.exchange(true))
                 std::fprintf(stderr, "  [VU1 AOT] F8: capturando as proximas chamadas em 0x0350, 0x0078 e 0x0658\n");
         }
 
         ps2_pad_set_state(0, (uint16_t)~pressed, rx, ry, lx, ly);
+        g_fmv_start_pressed.store((pressed & 0x0800u) != 0, std::memory_order_relaxed);
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 }
 
-// Procura a ISO: argumento, variavel PS2_ISO, ou o nome padrao perto da pasta atual.
+// Procura a ISO: argumento, PS2_ISO, Data junto do executavel, depois os caminhos antigos.
 // (Aqui tambem liga o tratamento de Ctrl+C, porque e chamada no inicio do programa.)
+namespace { int gs_replay_cpu_1x(const char* path); }
+
 void ps2_iso_open_default(int argc, char** argv)
 {
+    if (const char* replay = std::getenv("PS2_GS_REPLAY_1X"); replay && *replay)
+        std::exit(gs_replay_cpu_1x(replay));
+
+    g_game_directory = ps2_executable_directory(argc > 0 ? argv[0] : nullptr);
     std::signal(SIGINT, on_interrupt);
     std::signal(SIGSEGV, on_crash);
     std::signal(SIGABRT, on_crash);
@@ -3225,10 +4399,15 @@ void ps2_iso_open_default(int argc, char** argv)
             std::thread(watchdog_thread, seconds).detach();
     }
 
+    if (argc > 1 && ps2_iso_open(argv[1]))
+        return;
+    if (const char* iso = std::getenv("PS2_ISO"); iso && *iso && ps2_iso_open(iso))
+        return;
+    if (ps2_iso_open_path(g_game_directory / "Data" / "Shadow Hearts (USA).iso"))
+        return;
+
     const char* candidates[] =
     {
-        argc > 1 ? argv[1] : nullptr,
-        std::getenv("PS2_ISO"),
         "Shadow Hearts (USA).iso",
         "..\\Shadow Hearts (USA).iso",
         "..\\..\\Shadow Hearts (USA).iso",
@@ -3242,7 +4421,7 @@ void ps2_iso_open_default(int argc, char** argv)
             return;
     }
 
-    std::fprintf(stderr, "ISO nao encontrada (use: ps2_game.exe caminho.iso, ou a variavel PS2_ISO)\n");
+    std::fprintf(stderr, "ISO nao encontrada (use Data/Shadow Hearts (USA).iso ou informe o caminho)\n");
 }
 
 // libcdvd: argumentos em a0..a3 (c.r[4..7]), retorno em v0. As leituras sao feitas na hora:
@@ -3548,7 +4727,9 @@ namespace
         // Comandos de consulta (4 getStatus, 12 strDataCh, 20 CdSync, 21 GetError) sao repetidos o
         // tempo todo pelas threads do jogo: so os 3 primeiros de cada um aparecem no log, para nao
         // gastar o limite de linhas do rpc_log nem esconder os comandos que importam.
-        bool polling = (cmd == 4u || cmd == 12u || cmd == 20u || cmd == 21u);
+        // Blocos VAG validos tambem chegam continuamente; limite o log desse trafego.
+        const bool vag_block = cmd == 18u && send != 0 && ssize == 0x1000u && recv != 0 && rsize == 0x20u;
+        bool polling = vag_block || cmd == 4u || cmd == 12u || cmd == 20u || cmd == 21u;
         static unsigned s_poll_logged[32] = {};
 
         if (polling)
@@ -3581,6 +4762,17 @@ namespace
         //   comando 20 (CdSync)  : palavra 3 da resposta != 0 significa "ainda ocupado".
         //   comando 21 (GetErr)  : palavra 3 da resposta e o codigo de erro (0 = nenhum).
         rpc_zero_recv(c, recv, rsize);
+
+        // FileIOLib::strVagDebugData envia um bloco de 4 KiB e le a palavra 3.
+        // PlayStreamADPCM so avanca o contador e libera o bloco quando esse retorno
+        // e positivo. Consuma o bloco em silencio enquanto o IOP VAG nao tem mixer.
+        if (vag_block)
+        {
+            mwr<uint32_t>(c, recv + 0xCu, ssize);
+            if (s_poll_logged[18] == 1u)
+                std::fprintf(stderr, "  FIO VAG: bloco de 4096 bytes aceito em modo silencioso\n");
+            return;
+        }
 
         // Leitura de arquivo dos PKB (protocolo deduzido do disassembly de FileIOLib::read/getStatus):
         //   cmd 2 com +0x64 (destino) e +0x68 (bytes) zerados = "carregue o arquivo do FIOHND"; o IOP
@@ -3777,11 +4969,334 @@ namespace
         }
     }
 
-    // RSSD.IRX: som. Por enquanto so registra as chamadas.
+    bool rssd_trace_record(uint32_t kind, uint32_t code, const void* data, uint32_t size)
+    {
+        // Um fluxo por sessao conserva a ordem entre comandos e chamadas de BGM.
+        struct Capture
+        {
+            std::FILE* file = nullptr;
+            uint64_t bytes = 0;
+            ~Capture() { if (file) std::fclose(file); }
+        };
+        static Capture capture;
+        static bool stopped = false;
+        if (stopped)
+            return false;
+        if (!capture.file)
+        {
+            capture.file = std::fopen("rssd_audio_trace.bin", "wb");
+            const char magic[] = "ROJRSSD1";
+            if (!capture.file || std::fwrite(magic, 1, 8, capture.file) != 8)
+            {
+                stopped = true;
+                std::fprintf(stderr, "  [audio RSSD] falha ao abrir rssd_audio_trace.bin\n");
+                return false;
+            }
+            capture.bytes = 8;
+            std::fprintf(stderr, "  [audio RSSD] gravando rssd_audio_trace.bin\n");
+        }
+
+        const uint32_t header[] = {kind, code, size};
+        if (capture.bytes + sizeof header + size > (128ull << 20))
+        {
+            stopped = true;
+            std::fprintf(stderr, "  [audio RSSD] limite de 128 MiB atingido\n");
+            return false;
+        }
+        if (std::fwrite(header, 1, sizeof header, capture.file) != sizeof header ||
+            (size && std::fwrite(data, 1, size, capture.file) != size))
+        {
+            stopped = true;
+            std::fprintf(stderr, "  [audio RSSD] falha ao gravar a captura\n");
+            return false;
+        }
+        capture.bytes += sizeof header + size;
+        return true;
+    }
+
+    void rssd_trace_rpc(const Ctx& c, uint32_t cmd, uint32_t send, uint32_t size)
+    {
+        constexpr uint32_t ee_ram_size = 32u << 20;
+        const uint32_t address = ee_phys(send);
+        if (!c.mem || address == 0 || address >= ee_ram_size ||
+            size < 32 || size > 0x8020u || size > ee_ram_size - address)
+            return;
+
+        // O mesmo buffer pode ser usado como resposta e zerado pelo RPC.
+        rssd_trace_record(0, cmd, c.mem + address, size);
+    }
+
+#ifdef _WIN32
+    bool rssd_fx_trace_enabled()
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("PS2_RSSD_FX_TRACE");
+            return value && std::strcmp(value,"1") == 0;
+        }();
+        return enabled;
+    }
+
+    long long rssd_fx_ms()
+    {
+        using namespace std::chrono;
+        static const auto start = steady_clock::now();
+        return duration_cast<milliseconds>(steady_clock::now()-start).count();
+    }
+
+    void rssd_live_play(LiveBytes sequence, std::shared_ptr<const LiveBytes> bank);
+    void rssd_live_stop();
+    void rssd_live_effect(EffectRequest request);
+    void rssd_live_effect_stop(unsigned id, bool whole_bank = false);
+
+    // Leia a origem real da chamada sincrona de PlayCmnEffect na SLUS-20347.
+    // O RPC pode carregar um efeito com o mesmo ID a partir de scripts e animacoes.
+    const Ps2FuncEntry* rssd_common_effect_caller(const Ctx& c, uint32_t cmd)
+    {
+        if (cmd != 0x70u || uint32_t(c.r[31].lo) != 0x0046AEF0u)
+            return nullptr;
+        const uint32_t stack = ee_phys(uint32_t(c.r[29].lo));
+        if (!c.mem || stack > (32u << 20) - 0xb4u)
+            return nullptr;
+        const uint8_t* frames = c.mem + stack;
+        // RssdCallFunc salva $ra em +0x70. SsdPlayEffectNormal e
+        // PlayCmnEffect salvam o link no inicio de seus quadros de 0x30 bytes.
+        if (live_word(frames + 0x70, 4) != 0x0046B908u ||
+            live_word(frames + 0x80, 4) != 0x004175CCu)
+            return nullptr;
+        const uint32_t link = live_word(frames + 0xb0, 4);
+        return link >= 0x00200008u && link < 0x004D7000u ? find_containing(link - 8u) : nullptr;
+    }
+
+    bool rssd_menu_effect_caller(const Ps2FuncEntry* caller)
+    {
+        if (!caller || !caller->name)
+            return false;
+        const char* name = caller->name;
+        // Callbacks da interface. A transicao automatica do mapa e
+        // processada por ControlRequest, que tambem usa o ID 1.
+        return std::strstr(name, "MenuSelect__") || std::strstr(name, "MenuDecision__") ||
+            std::strstr(name, "MenuCancel__") || std::strstr(name, "MenuControlFunc__") ||
+            std::strstr(name, "Polling__4Logo") || std::strstr(name, "Polling__5Title") ||
+            std::strstr(name, "Polling__8LoadMenu") ||
+            std::strstr(name, "cbDecide__7BtlMenu") || std::strstr(name, "cbCancel__7BtlMenu") ||
+            std::strstr(name, "cbSelect__7BtlMenu") || std::strstr(name, "UpdateCharActSelPC__7CBattle");
+    }
+
+    // O retorno de AddEffectData vai para CSe. O jogo combina esse
+    // identificador com o indice local ao montar o comando de som.
+    uint32_t rssd_live_event(const Ctx& c, uint32_t cmd, const uint8_t* packet, uint32_t size)
+    {
+        static LiveBytes incoming, sequence;
+        static std::map<unsigned,std::shared_ptr<const LiveBytes>> waves;
+        static std::deque<unsigned> recent_waves;
+        static std::map<unsigned,std::shared_ptr<const EffectBank>> effects;
+        static unsigned expected = 0, incoming_id = 0;
+        static bool active = false;
+        static uint64_t trace_serial = 0;
+        const bool trace = rssd_fx_trace_enabled();
+        if (size < 32)
+            return 0;
+
+        const auto* data = packet + 32;
+        const unsigned length = live_word(packet+12,4);
+        if (length > size-32)
+            return 0;
+
+        if (cmd == 0x20 || cmd == 0x21)
+        {
+            if (cmd == 0x20)
+            {
+                incoming.clear();
+                expected = 0;
+                if (length >= 0x40 && !std::memcmp(data,"swdm",4))
+                {
+                    incoming_id = live_word(data+0x12,2);
+                    const unsigned declared = live_word(data+8,4);
+                    if (declared >= length && declared <= (8u << 20))
+                    {
+                        expected = declared;
+                        incoming.reserve(expected);
+                    }
+                }
+            }
+            if (!expected)
+                return 0;
+            if (length > expected-incoming.size())
+            {
+                expected = 0;
+                incoming.clear();
+                return 0;
+            }
+            incoming.insert(incoming.end(),data,data+length);
+            if (incoming.size() == expected)
+            {
+                waves[incoming_id] = std::make_shared<LiveBytes>(std::move(incoming));
+                incoming.clear();
+                expected = 0;
+                if (incoming_id > 1)
+                {
+                    recent_waves.erase(std::remove(recent_waves.begin(),recent_waves.end(),incoming_id),
+                        recent_waves.end());
+                    recent_waves.push_back(incoming_id);
+                    if (recent_waves.size() > 16)
+                    {
+                        waves.erase(recent_waves.front());
+                        recent_waves.pop_front();
+                    }
+                }
+            }
+            return 0;
+        }
+
+        const auto effect_command = [&](unsigned op, const uint8_t* record, bool batch)
+        {
+            const unsigned id = live_word(record+16,4);
+            const unsigned handle = id >> 16;
+            if (op == 0x61)
+            {
+                if (id != 0 && effects.erase(id))
+                    rssd_live_effect_stop(id, true);
+                return;
+            }
+            if (op == 0x79 || op == 0x7a)
+            {
+                rssd_live_effect_stop(id, op == 0x7a);
+                return;
+            }
+            if (op != 0x70 && op != 0x71)
+                return;
+
+            const unsigned arg1 = live_word(record+20,4), arg2 = live_word(record+24,4);
+            const auto bank = effects.find(handle);
+            const bool menu_id = id >= 1 && id <= 3;
+            const auto* caller = !batch && (menu_id || id == 0x10 || trace)
+                ? rssd_common_effect_caller(c, op) : nullptr;
+            const bool item_pickup = id == 0x10 && caller && caller->name &&
+                std::strcmp(caller->name, "k2script_decoder__8K2ScriptFv") == 0;
+            const bool use_recording = handle == 0 && (!menu_id || rssd_menu_effect_caller(caller));
+            const uint64_t serial = trace ? ++trace_serial : 0;
+            if (trace)
+                std::fprintf(stderr,"  [RSSD FX] t=%lldms n=%llu origem=%s cmd=%02X id=%08X arg1=%u arg2=%u resultado=%s chamador=%s\n",
+                    rssd_fx_ms(),static_cast<unsigned long long>(serial),batch?"lote":"direta",op,id,arg1,arg2,
+                    bank!=effects.end()||use_recording?"enviado":"sem-banco",
+                    caller && caller->name ? caller->name : "-");
+            if (bank != effects.end() || use_recording)
+                rssd_live_effect({bank!=effects.end()?bank->second:nullptr,id,op==0x71?arg1:127,
+                    op==0x71?std::min(127u,arg2):64,serial,use_recording,item_pickup});
+        };
+
+        if (cmd == 4)
+        {
+            const unsigned count = live_word(packet+20,4);
+            if (length%32 || count > length/32)
+                return 0;
+            for (unsigned i=0; i<count; ++i)
+            {
+                const auto* record = data+32*i;
+                effect_command(live_word(record,2),record,true);
+            }
+            return 0;
+        }
+
+        if (cmd == 0x60)
+        {
+            if (length < 0x34 || std::memcmp(data,"seds",4) || live_word(data+8,4)!=length)
+                return UINT32_MAX;
+            const unsigned primary_id = live_word(data+28,2);
+            const bool common = std::memcmp(data+0x20,"regist01.sav",13) == 0;
+            constexpr unsigned table = 0x34;
+            if (table+2*live_word(data+26,2)>length)
+                return UINT32_MAX;
+            const unsigned auxiliary_id = common ? 1 : live_word(data+30,2);
+            const auto primary = waves.find(primary_id), auxiliary = waves.find(auxiliary_id);
+            if (primary == waves.end() && auxiliary == waves.end())
+                return UINT32_MAX;
+            unsigned handle = common ? 0 : std::max(1u,primary_id);
+            if (!common)
+            {
+                while (effects.count(handle))
+                {
+                    const auto& existing = effects.at(handle)->seds;
+                    if (existing.size() == length && std::equal(existing.begin(),existing.end(),data))
+                        break;
+                    handle = handle == 0xffffu ? 1u : handle+1u;
+                    if (handle == std::max(1u,primary_id))
+                        return UINT32_MAX;
+                }
+            }
+            effects[handle] = std::make_shared<EffectBank>(EffectBank{
+                primary!=waves.end()?primary->second:nullptr,
+                auxiliary!=waves.end()?auxiliary->second:nullptr,LiveBytes(data,data+length)});
+            if (trace)
+                std::fprintf(stderr,"  [RSSD FX] t=%lldms banco=%.16s id=%04X registros=%u\n",
+                    rssd_fx_ms(),reinterpret_cast<const char*>(data+0x20),handle,live_word(data+26,2));
+            return handle;
+        }
+
+        if (cmd == 0x31)
+        {
+            if (length >= 0x78 && !std::memcmp(data,"smdm",4) && live_word(data+8,4)==length)
+                sequence.assign(data,data+length);
+            else
+                sequence.clear();
+            return 0;
+        }
+
+        if (cmd == 0x34 || cmd == 0x36 || cmd == 0x32)
+        {
+            // As faixas observadas usam o canal de musica 0.
+            if (live_word(packet+16,4) != 0)
+                return 0;
+            if (cmd == 0x34 && !sequence.empty())
+            {
+                const auto bank = waves.find(live_word(sequence.data()+0x1e,2));
+                if (bank != waves.end())
+                {
+                    rssd_live_play(sequence,bank->second);
+                    active = true;
+                }
+            }
+            else if (cmd != 0x34)
+            {
+                if (active)
+                    rssd_live_stop();
+                active = false;
+                if (cmd == 0x32)
+                    sequence.clear();
+            }
+            return 0;
+        }
+
+        effect_command(cmd,packet,false);
+        return 0;
+    }
+
+#endif
+
+    // RSSD.IRX: protocolo de som do jogo.
     void rssd_service(Ctx& c, uint32_t cmd, uint32_t send, uint32_t ssize, uint32_t recv, uint32_t rsize)
     {
         rpc_log(c, "RSSD", cmd, send, ssize, recv, rsize);
+        if (g_rssd_audio_trace)
+            rssd_trace_rpc(c, cmd, send, ssize);
+#ifdef _WIN32
+        // RssdCallFunc pode reutilizar o buffer de envio para a resposta.
+        // Leia o cabecalho e o payload inteiros antes de escrever nesse buffer.
+        uint32_t result = 0;
+        static const bool live_audio = battle_profile_enabled("PS2_RSSD_LIVE_AUDIO");
+        if (live_audio)
+        {
+            constexpr uint32_t ee_ram_size = 32u << 20;
+            const uint32_t address = ee_phys(send);
+            if (c.mem && address && address < ee_ram_size && ssize <= ee_ram_size - address)
+                result = rssd_live_event(c, cmd, c.mem + address, ssize);
+        }
+#endif
         rpc_zero_recv(c, recv, rsize);
+#ifdef _WIN32
+        if (cmd == 0x60 && recv && rsize >= 12 && rsize <= 0x10000u)
+            mwr<uint32_t>(c, recv + 8, result);
+#endif
 
         // comando 1 = inicializar o RSSD. O RssdSifRpcServer do jogo (sid 0x901) trata o
         // comando 0x1000 como "IOP pronto": faz SignalSema no semaforo que o SsdInit espera.
@@ -3804,132 +5319,488 @@ namespace
         }
     }
 
-    // MCSERV.IRX: cartao de memoria (libmc). Protocolo deduzido do disassembly de sceMcInit/GetInfo/Sync:
-    //   comando 0xFE (init): resposta de 12 bytes = { resultado, versao do mcserv, versao do mcman };
-    //                        a biblioteca exige mcserv >= 0x20A e mcman >= 0x20E.
-    //   demais comandos    : a palavra 0 da resposta e o resultado que sceMcSync devolve ao jogo.
-    // Por enquanto o cartao esta "ausente": resultado < -2 (0 = mesmo cartao, -1 = trocado, -2 = sem formato).
-    int mc_env_int(const char* name, int fallback, bool* present = nullptr)
+    namespace fs = std::filesystem;
+
+    // Cartao de PS2 em uma pasta local. O protocolo do jogo continua sendo o MCSERV.
+    class MemoryCard
     {
-        const char* v = std::getenv(name);
-
-        if (present)
-            *present = (v != nullptr && *v != 0);
-
-        return (v != nullptr && *v != 0) ? (int)std::strtol(v, nullptr, 0) : fallback;
-    }
-
-    // Experimento (variaveis de ambiente, lidas uma vez):
-    //   PS2_MC_RESULT  resultado do comando 1 (GetInfo) e dos demais comandos. Padrao -10 (sem cartao).
-    //                  0 = mesmo cartao, -1 = cartao trocado, -2 = sem formato, < -2 = ausente.
-    //   PS2_MC_FIRST   se definida, resultado do primeiro GetInfo depois de cada init (um cartao real
-    //                  responde -1 ali); os seguintes usam PS2_MC_RESULT.
-    //   PS2_MC_INFO    "tipo,livre,formato" (ex.: 2,8000,1): escrito como 3 palavras no ponteiro que
-    //                  vai em send+0x1C do GetInfo. O layout NAO foi confirmado: e um palpite para teste.
-    void mcserv_service(Ctx& c, uint32_t cmd, uint32_t send, uint32_t ssize, uint32_t recv, uint32_t rsize)
-    {
-        static unsigned s_mc_log = 0;
-        static unsigned s_mc_inits = 0;
-        static bool s_cfg = false;
-        static bool s_has_first = false;
-        static int s_result = -10;
-        static int s_first = -10;
-        static bool s_has_info = false;
-        static uint32_t s_info[3] = { 2, 8000, 1 };
-        static bool s_first_pending = true;
-        static std::set<uint32_t> s_seen_cmds;
-
-        if (!s_cfg)
+        static constexpr uint32_t ClusterSize = 1024, Capacity = 8000 * ClusterSize;
+        static constexpr int Missing = -4, Denied = -5, Full = -3, Absent = -10, Unformatted = -2;
+        struct File
         {
-            s_cfg = true;
-            // Padrao (testado): cartao "novo" no primeiro GetInfo, depois "mesmo"; tipo 2, 8000 livres, formatado.
-            s_result = mc_env_int("PS2_MC_RESULT", 0);
-            s_first = mc_env_int("PS2_MC_FIRST", -1, &s_has_first);
-            s_has_first = true;
-            s_has_info = true;
+            fs::path path;
+            std::vector<uint8_t> bytes;
+            size_t pos = 0;
+            uint32_t flags = 0;
+            bool dirty = false;
+        };
+        struct DirectoryEntry
+        {
+            fs::path path;
+            std::string name;
+        };
 
-            const char* info = std::getenv("PS2_MC_INFO");
+        fs::path current;
+        std::map<uint32_t, File> handles;
+        std::vector<DirectoryEntry> listing;
+        size_t listed = 0;
+        bool first_info = true;
 
-            if (info != nullptr && std::strcmp(info, "off") == 0)
+        static fs::path root() { return g_game_directory / "Saves" / "Slot1"; }
+
+        // Use apenas RAM do EE, incluindo seus aliases, para os buffers do RPC.
+        static uint8_t* ram(Ctx& c, uint32_t addr, uint32_t count)
+        {
+            const uint32_t physical = ee_phys(addr);
+            return c.mem && physical && uint64_t(physical) + count <= 0x02000000u
+                ? c.mem + physical : nullptr;
+        }
+
+        static bool safe_name(const std::string& name, bool pattern = false)
+        {
+            if (name.empty() || name.size() > 32 || name.back() == '.' || name.back() == ' ')
+                return false;
+            for (unsigned char ch : name)
+                if (ch < 32 || ch >= 127 || std::strchr("\\/:<>|\"", ch) ||
+                    (!pattern && (ch == '*' || ch == '?')))
+                    return false;
+            std::string stem = name.substr(0, name.find('.'));
+            for (char& ch : stem)
+                ch = (char)std::toupper((unsigned char)ch);
+            return stem != "CON" && stem != "PRN" && stem != "AUX" && stem != "NUL" &&
+                !(stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) &&
+                  stem[3] >= '0' && stem[3] <= '9');
+        }
+
+        fs::path resolve(std::string name) const
+        {
+            fs::path relative = !name.empty() && name[0] == '/' ? fs::path{} : current;
+            for (size_t start = 0; start < name.size();)
             {
-                s_has_info = false;   // PS2_MC_INFO=off desliga a escrita das informacoes
-            }
-            else if (info != nullptr && *info != 0)
-            {
-                unsigned a = 0, b = 0, f = 0;
-
-                if (std::sscanf(info, "%u,%u,%u", &a, &b, &f) == 3)
+                const size_t slash = name.find('/', start);
+                const std::string part = name.substr(start, slash - start);
+                start = slash == std::string::npos ? name.size() : slash + 1;
+                if (part == "..")
+                    relative = relative.parent_path();
+                else if (!part.empty() && part != ".")
                 {
-                    s_info[0] = a; s_info[1] = b; s_info[2] = f;
+                    if (!safe_name(part))
+                        return {};
+                    relative /= part;
                 }
             }
 
-            std::fprintf(stderr, "  [MC] resultado=%d primeiro=%d info=%s\n", s_result, s_first,
-                         s_has_info ? "sim" : "nao");
+            // Um link simbolico num save copiado nao pode redirecionar operacoes para fora do cartao.
+            fs::path target = root();
+            for (const auto& part : relative)
+            {
+                target /= part;
+                if (fs::is_symlink(fs::symlink_status(target)))
+                    return {};
+            }
+            return target;
         }
 
-        if (s_mc_log < 20)
+        static bool match(const char* pattern, const char* name)
         {
-            s_mc_log++;
-            rpc_log(c, "MCSERV", cmd, send, ssize, recv, rsize);
+            const char* star = nullptr;
+            const char* retry = nullptr;
+            while (*name)
+            {
+                if (*pattern == '?' || *pattern == *name)
+                {
+                    ++pattern;
+                    ++name;
+                }
+                else if (*pattern == '*')
+                {
+                    star = pattern++;
+                    retry = name;
+                }
+                else if (star)
+                {
+                    pattern = star + 1;
+                    name = ++retry;
+                }
+                else
+                    return false;
+            }
+            while (*pattern == '*')
+                ++pattern;
+            return !*pattern;
         }
 
-        // Todo comando novo aparece uma vez no log: mostra o que o jogo pede depois do GetInfo.
-        if (cmd != 0xFEu && cmd != 1u && s_seen_cmds.insert(cmd).second)
-            std::fprintf(stderr, "  [MC] comando novo 0x%X (enviar=%u bytes, receber=%u bytes)\n", cmd, ssize, rsize);
+        static uint32_t free_clusters()
+        {
+            uint64_t used = 0;
+            for (const auto& entry : fs::recursive_directory_iterator(root()))
+            {
+                if (fs::is_symlink(entry.symlink_status()))
+                    continue;
+                if (entry.is_directory())
+                    ++used;
+                else if (entry.is_regular_file())
+                    used += (entry.file_size() + ClusterSize - 1) / ClusterSize;
+            }
+            return used < Capacity / ClusterSize ? uint32_t(Capacity / ClusterSize - used) : 0;
+        }
 
-        rpc_zero_recv(c, recv, rsize);
+        static bool commit(File& file)
+        {
+            if (!file.dirty)
+                return true;
 
-        if (recv == 0)
+            // Grave e feche uma copia temporaria antes de substituir o save anterior.
+            // O sufixo nao e um nome de Memory Card valido e fica fora de GetDir.
+            fs::path temporary = file.path;
+            temporary += ".ring-of-judgment-memory-card-temporary";
+            const auto status = fs::symlink_status(temporary);
+            if (fs::exists(status) && !fs::is_regular_file(status))
+                return false;
+            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+            if (!file.bytes.empty())
+                out.write(reinterpret_cast<const char*>(file.bytes.data()), file.bytes.size());
+            out.close();
+            std::error_code error;
+            bool replaced = false;
+            if (out)
+            {
+#ifdef _WIN32
+                replaced = ps2_windows_replace_file(temporary, file.path);
+#else
+                fs::rename(temporary, file.path, error);
+                replaced = !error;
+#endif
+            }
+            if (!replaced)
+            {
+                fs::remove(temporary, error);
+                return false;
+            }
+            std::fprintf(stderr, "  [MC] save gravado: %s (%zu bytes)\n",
+                file.path.filename().string().c_str(), file.bytes.size());
+            file.dirty = false;
+            return true;
+        }
+
+        int open(const fs::path& path, uint32_t flags)
+        {
+            constexpr uint32_t Write = 2, Create = 0x0200, Truncate = 0x0400, Append = 0x0100;
+            if (path == root() || !fs::is_directory(path.parent_path()))
+                return Missing;
+            if (flags & 0x40u) // sceMcMkdir usa sceMcOpen com este bit.
+            {
+                if (fs::is_directory(path))
+                    return 0;
+                return fs::create_directory(path) ? 0 : Denied;
+            }
+            const bool exists = fs::exists(path);
+            if (!exists && !(flags & Create))
+                return Missing;
+            if (exists && !fs::is_regular_file(path))
+                return Denied;
+            for (const auto& item : handles)
+                if (item.second.path == path && ((flags | item.second.flags) & Write))
+                    return Denied;
+
+            uint32_t fd = 0;
+            while (fd < 16 && handles.count(fd))
+                ++fd;
+            if (fd == 16)
+                return -7;
+
+            File file;
+            file.path = path;
+            file.flags = flags;
+            file.dirty = !exists || ((flags & Write) && (flags & Truncate));
+            if (exists && !file.dirty)
+            {
+                const auto length = fs::file_size(path);
+                if (length > Capacity)
+                    return Denied;
+                file.bytes.resize(size_t(length));
+                std::ifstream in(path, std::ios::binary);
+                if (!in || (!file.bytes.empty() && !in.read(reinterpret_cast<char*>(file.bytes.data()), file.bytes.size())))
+                    return Denied;
+            }
+            if (flags & Append)
+                file.pos = file.bytes.size();
+            handles.emplace(fd, std::move(file));
+            return int(fd);
+        }
+
+        static void fill_time(Ctx& c, uint32_t address, const fs::path& path)
+        {
+            const auto timestamp = fs::last_write_time(path);
+            const auto now = std::chrono::system_clock::now();
+            const auto time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                timestamp - fs::file_time_type::clock::now() + now);
+            const auto seconds = std::chrono::system_clock::to_time_t(time + std::chrono::hours(9));
+            const std::tm* date = std::gmtime(&seconds);
+            if (!date)
+                return;
+            mwr<uint8_t>(c, address + 1, uint8_t(date->tm_sec));
+            mwr<uint8_t>(c, address + 2, uint8_t(date->tm_min));
+            mwr<uint8_t>(c, address + 3, uint8_t(date->tm_hour));
+            mwr<uint8_t>(c, address + 4, uint8_t(date->tm_mday));
+            mwr<uint8_t>(c, address + 5, uint8_t(date->tm_mon + 1));
+            mwr<uint16_t>(c, address + 6, uint16_t(date->tm_year + 1900));
+        }
+
+        int get_dir(Ctx& c, const std::string& name, uint32_t mode, uint32_t count, uint32_t output)
+        {
+            if (count > 4096 || (count && !ram(c, output, count * 64u)))
+                return Denied;
+            if (mode == 0)
+            {
+                listing.clear();
+                listed = 0;
+                const size_t slash = name.rfind('/');
+                const fs::path dir = resolve(slash == std::string::npos ? "" : name.substr(0, slash + 1));
+                const std::string pattern = name.substr(slash == std::string::npos ? 0 : slash + 1);
+                if (dir.empty() || !fs::is_directory(dir))
+                    return Missing;
+                const std::string search = pattern.empty() ? "*" : pattern;
+                if (search != "." && search != ".." && !safe_name(search, true))
+                    return Denied;
+
+                // A libmc inclui estas duas entradas antes dos arquivos. O menu
+                // Load de Shadow Hearts comeca a validar o save no indice 2.
+                if (match(search.c_str(), "."))
+                    listing.push_back({dir, "."});
+                if (match(search.c_str(), ".."))
+                    listing.push_back({dir == root() ? dir : dir.parent_path(), ".."});
+                const size_t first_child = listing.size();
+                for (const auto& entry : fs::directory_iterator(dir))
+                {
+                    const std::string item = entry.path().filename().string();
+                    const auto status = entry.symlink_status();
+                    if (safe_name(item) && match(search.c_str(), item.c_str()) &&
+                        (fs::is_regular_file(status) || fs::is_directory(status)))
+                        listing.push_back({entry.path(), item});
+                }
+                std::sort(listing.begin() + first_child, listing.end(),
+                    [](const DirectoryEntry& left, const DirectoryEntry& right) { return left.name < right.name; });
+            }
+            unsigned written = 0;
+            while (written < count && listed < listing.size())
+            {
+                const DirectoryEntry& entry = listing[listed++];
+                const fs::path& path = entry.path;
+                const auto status = fs::symlink_status(path);
+                const bool directory = fs::is_directory(status);
+                if (!directory && !fs::is_regular_file(status))
+                    continue;
+                const uint32_t address = output + written++ * 64u;
+                std::memset(ram(c, address, 64), 0, 64);
+                fill_time(c, address, path);
+                fill_time(c, address + 8, path);
+                mwr<uint32_t>(c, address + 16, directory ? 0u : uint32_t(fs::file_size(path)));
+                mwr<uint16_t>(c, address + 20, directory ? 0x8427u : 0x8497u);
+                std::memcpy(ram(c, address + 32, 32), entry.name.data(), entry.name.size());
+            }
+            return int(written);
+        }
+
+        int file_command(Ctx& c, uint32_t cmd, uint32_t send)
+        {
+            const auto field = [&](uint32_t offset) { return mrd<uint32_t>(c, send + offset); };
+            const auto it = handles.find(field(0));
+            if (it == handles.end())
+                return Denied;
+            File& file = it->second;
+            if (cmd == 3 || cmd == 10)
+            {
+                if (!commit(file))
+                    return Denied;
+                if (cmd == 3)
+                    handles.erase(it);
+                return 0;
+            }
+            if (cmd == 4)
+            {
+                const uint32_t origin = field(20);
+                if (origin > 2)
+                    return Denied;
+                const int64_t base = origin == 0 ? 0 : (origin == 1 ? file.pos : file.bytes.size());
+                const int64_t next = base + int32_t(field(16));
+                if (next < 0 || next > Capacity)
+                    return Denied;
+                file.pos = size_t(next);
+                return int(next);
+            }
+            const uint32_t size = field(12), buffer = field(24);
+            if (size > Capacity)
+                return Denied;
+            if (cmd == 5)
+            {
+                // A copia direta ja entrega inclusive as pontas desalinhadas. O callback
+                // da libmc recebe zero nos dois comprimentos para nao copiar dados antigos.
+                uint8_t* alignment = ram(c, field(28), 8);
+                uint8_t* dest = size ? ram(c, buffer, size) : nullptr;
+                if (!(file.flags & 1u) || !alignment || (size && !dest))
+                    return Denied;
+                std::memset(alignment, 0, 8);
+                const size_t bytes = std::min<size_t>(size, file.bytes.size() - std::min(file.pos, file.bytes.size()));
+                if (bytes)
+                    std::memcpy(dest, file.bytes.data() + file.pos, bytes);
+                file.pos += bytes;
+                return int(bytes);
+            }
+
+            // O pacote de escrita separa os primeiros 0..16 bytes do restante em RAM.
+            const uint32_t prefix = field(20);
+            const uint8_t* rest = size ? ram(c, buffer, size) : nullptr;
+            if (!(file.flags & 2u) || prefix > 16 || (size && !rest))
+                return Denied;
+            const size_t bytes = size + prefix;
+            if (!bytes)
+                return 0;
+            const size_t pos = file.flags & 0x0100u ? file.bytes.size() : file.pos;
+            const size_t end = pos + bytes;
+            const uint64_t disk_size = fs::exists(file.path) ? fs::file_size(file.path) : 0;
+            if (end > Capacity || (end + ClusterSize - 1) / ClusterSize >
+                (disk_size + ClusterSize - 1) / ClusterSize + free_clusters())
+                return Full;
+            if (end > file.bytes.size())
+                file.bytes.resize(end);
+            if (prefix)
+                std::memcpy(file.bytes.data() + pos, ram(c, send + 32, prefix), prefix);
+            if (size)
+                std::memcpy(file.bytes.data() + pos + prefix, rest, size);
+            file.pos = end;
+            file.dirty = true;
+            return int(bytes);
+        }
+
+    public:
+        void init()
+        {
+            current.clear();
+            handles.clear();
+            listing.clear();
+            listed = 0;
+            first_info = true;
+        }
+
+        int command(Ctx& c, uint32_t cmd, uint32_t send, uint32_t size)
+        {
+            const bool descriptor = cmd == 1 || (cmd >= 3 && cmd <= 6) || cmd == 10 || cmd == 16;
+            if (size != (descriptor ? 0x30u : 0x414u) || !ram(c, send, size))
+                return Denied;
+
+            const auto field = [&](uint32_t offset) { return mrd<uint32_t>(c, send + offset); };
+            const bool file_rpc = (cmd >= 3 && cmd <= 6) || cmd == 10;
+            const bool port_present = file_rpc || (field(descriptor ? 4 : 0) == 0 && field(descriptor ? 8 : 4) == 0);
+            const auto status = fs::symlink_status(root());
+            // A pasta Slot1 e o marcador de formato. Um cartao ja existente nunca e apagado aqui.
+            if (fs::is_symlink(fs::symlink_status(root().parent_path())) ||
+                (fs::exists(status) && !fs::is_directory(status)))
+                return Denied;
+            const bool formatted = port_present && fs::is_directory(status);
+            if (cmd == 1)
+            {
+                const uint32_t out = field(28);
+                if (!ram(c, out, 0x94))
+                    return Denied;
+                mwr<uint32_t>(c, out, port_present ? 2u : 0u);
+                mwr<uint32_t>(c, out + 4, formatted ? free_clusters() : 0);
+                mwr<uint32_t>(c, out + 0x90, formatted ? 1u : 0u);
+                if (!port_present)
+                    return Absent;
+                if (!formatted)
+                    return Unformatted;
+                const int result = first_info ? -1 : 0;
+                first_info = false;
+                return result;
+            }
+            if (!port_present)
+                return Absent;
+            if (cmd == 16)
+            {
+                if (!formatted)
+                    fs::create_directories(root());
+                return 0;
+            }
+            if (!formatted)
+                return Unformatted;
+            if (file_rpc)
+                return file_command(c, cmd, send);
+
+            const char* start = reinterpret_cast<const char*>(ram(c, send + 20, size - 20));
+            const char* end = static_cast<const char*>(std::memchr(start, 0, size - 20));
+            if (!end)
+                return Denied;
+            const std::string name(start, end);
+            if (cmd == 13)
+                return get_dir(c, name, field(8), field(12), field(16));
+            const fs::path path = resolve(name);
+            if (path.empty())
+                return Denied;
+            switch (cmd)
+            {
+                case 2: return open(path, field(8));
+                case 12:
+                {
+                    if (!fs::is_directory(path))
+                        return Missing;
+                    const uint32_t out = field(16);
+                    const std::string absolute = path == root() ? "/" : "/" + path.lexically_relative(root()).generic_string();
+                    if (out)
+                    {
+                        uint8_t* buffer = ram(c, out, 1024);
+                        if (!buffer || absolute.size() >= 1024)
+                            return Denied;
+                        std::memcpy(buffer, absolute.c_str(), absolute.size() + 1);
+                    }
+                    current = path == root() ? fs::path{} : path.lexically_relative(root());
+                    return 0;
+                }
+                case 15:
+                    if (path == root() || !fs::exists(path))
+                        return Missing;
+                    for (const auto& item : handles)
+                        if (item.second.path == path)
+                            return Denied;
+                    if (fs::is_directory(path) && !fs::is_empty(path))
+                        return -6;
+                    return fs::remove(path) ? 0 : Denied;
+                case 18: return fs::is_directory(path) ? int(free_clusters()) : Missing;
+                default: return Denied;
+            }
+        }
+    };
+
+    void mcserv_service(Ctx& c, uint32_t cmd, uint32_t send, uint32_t ssize, uint32_t recv, uint32_t rsize)
+    {
+        static MemoryCard card;
+        static std::set<uint32_t> seen;
+        if (!recv || rsize < 4)
             return;
-
-        if (cmd == 0xFEu)
+        rpc_zero_recv(c, recv, rsize);
+        if (cmd == 0xFE)
         {
-            s_mc_inits++;
-            s_first_pending = true;
-
-            if (s_mc_inits == 1 || s_mc_inits % 100 == 0)
-                std::fprintf(stderr, "  [MC] sceMcInit numero %u\n", s_mc_inits);
-
+            card.init();
             if (rsize >= 12)
             {
-                mwr<uint32_t>(c, recv + 0, 0u);       // resultado: ok
-                mwr<uint32_t>(c, recv + 4, 0x20Au);   // versao do mcserv
-                mwr<uint32_t>(c, recv + 8, 0x20Eu);   // versao do mcman
+                mwr<uint32_t>(c, recv + 4, 0x20Au);
+                mwr<uint32_t>(c, recv + 8, 0x20Eu);
             }
-
             return;
         }
 
-        int result = s_result;
-
-        if (cmd == 1u)
+        int result = -5;
+        try
         {
-            if (s_first_pending && s_has_first)
-                result = s_first;
-
-            s_first_pending = false;
-
-            if (s_has_info)
-            {
-                uint32_t out = mrd<uint32_t>(c, send + 0x1Cu);
-
-                if (out != 0)
-                    for (int i = 0; i < 3; i++)
-                        mwr<uint32_t>(c, out + 4u * (uint32_t)i, s_info[i]);
-            }
-
-            static unsigned s_get_log = 0;
-
-            if (s_get_log < 12)
-            {
-                s_get_log++;
-                std::fprintf(stderr, "  [MC] GetInfo -> %d (saida=0x%08X)\n", result, mrd<uint32_t>(c, send + 0x1Cu));
-            }
+            result = card.command(c, cmd, send, ssize);
         }
-
-        if (rsize >= 4)
-            mwr<uint32_t>(c, recv + 0, (uint32_t)result);
+        catch (const fs::filesystem_error& e)
+        {
+            std::fprintf(stderr, "  [MC] erro de arquivo: %s\n", e.what());
+        }
+        mwr<uint32_t>(c, recv, uint32_t(result));
+        if (seen.insert(cmd).second || cmd == 16 || (cmd == 3 && result < 0))
+            std::fprintf(stderr, "  [MC] comando 0x%02X -> %d\n", cmd, result);
     }
 
     // Servico desconhecido: registra e devolve zeros (sucesso), para o boot nao parar.
@@ -4206,6 +6077,14 @@ namespace
     {
         return port == 0 && slot == 0 && g_pads[0].open;
     }
+}
+
+void rssd_trace_bgm(const Ctx& c, uint32_t function)
+{
+    const uint32_t args[] = {
+        (uint32_t)c.r[4].lo, (uint32_t)c.r[5].lo, (uint32_t)c.r[6].lo, (uint32_t)c.r[31].lo
+    };
+    rssd_trace_record(1, function, args, sizeof args);
 }
 
 void ps2_pad_set_state(int port, uint16_t buttons_active_low, uint8_t right_x, uint8_t right_y, uint8_t left_x, uint8_t left_y)
@@ -4889,6 +6768,8 @@ namespace
     };
 
     GsState g_st;
+    void gs_vk_flush();
+    void gs_vk_palette_barrier(uint32_t bp);
 
     // Registradores privilegiados (para saber qual area esta sendo exibida)
     uint64_t g_gs_priv[0x100 / 8];
@@ -4914,6 +6795,7 @@ namespace
 
     void gs_load_clut(uint64_t tex0)
     {
+        gs_vk_palette_barrier(uint32_t((tex0 >> 37) & 0x3FFFu));
         uint32_t psm = (uint32_t)((tex0 >> 20) & 0x3F);
         uint32_t cbp = (uint32_t)((tex0 >> 37) & 0x3FFF);
         uint32_t cpsm = (uint32_t)((tex0 >> 51) & 0xF);
@@ -5256,6 +7138,22 @@ namespace
         TexInfo ti;
     };
 
+    static inline bool gs_alpha_pass(const PixCfg& pc, int alpha)
+    {
+        if (!pc.ate) return true;
+        switch (pc.atst)
+        {
+            case 0: return false;
+            case 2: return alpha < pc.aref;
+            case 3: return alpha <= pc.aref;
+            case 4: return alpha == pc.aref;
+            case 5: return alpha >= pc.aref;
+            case 6: return alpha > pc.aref;
+            case 7: return alpha != pc.aref;
+            default: return true;
+        }
+    }
+
     void gs_pix_cfg(int ci, PixCfg& p)
     {
         const GsCtx& c = g_st.ctx[ci];
@@ -5359,32 +7257,15 @@ namespace
 
         bool afail_rgb_only = false, fb_ok = true, z_write_ok = true;
 
-        if (pc.ate)
+        if (!gs_alpha_pass(pc, a))
         {
-            bool pass = true;
-
-            switch (pc.atst)
+            // AFAIL: 0 KEEP (nada), 1 FB_ONLY (cor, sem Z), 2 ZB_ONLY (so Z), 3 RGB_ONLY (RGB, sem alfa e sem Z)
+            switch (pc.afail)
             {
-                case 0: pass = false; break;
-                case 2: pass = a < pc.aref; break;
-                case 3: pass = a <= pc.aref; break;
-                case 4: pass = a == pc.aref; break;
-                case 5: pass = a >= pc.aref; break;
-                case 6: pass = a > pc.aref; break;
-                case 7: pass = a != pc.aref; break;
-                default: break;
-            }
-
-            if (!pass)
-            {
-                // AFAIL: 0 KEEP (nada), 1 FB_ONLY (cor, sem Z), 2 ZB_ONLY (so Z), 3 RGB_ONLY (RGB, sem alfa e sem Z)
-                switch (pc.afail)
-                {
-                    case 0: return;
-                    case 1: z_write_ok = false; break;
-                    case 2: fb_ok = false; break;
-                    default: z_write_ok = false; afail_rgb_only = true; break;
-                }
+                case 0: return;
+                case 1: z_write_ok = false; break;
+                case 2: fb_ok = false; break;
+                default: z_write_ok = false; afail_rgb_only = true; break;
             }
         }
 
@@ -5477,6 +7358,7 @@ namespace
     // Versao avulsa (pontos): decodifica o estado a cada chamada.
     void gs_pixel(int ci, int x, int y, float fr, float fg, float fb, float fa, float u, float v, uint32_t z = 0)
     {
+        gs_vk_flush();
         PixCfg pc;
         gs_pix_cfg(ci, pc);
         gs_pixel(pc, x, y, fr, fg, fb, fa, u, v, z);
@@ -5902,7 +7784,7 @@ namespace
         }
 
         // u,v no centro do pixel xs; du,dv por pixel
-        template <bool cached_columns = false>
+        template <bool cached_columns = false, bool constant_z16s = false>
         void row(int y, int xs, int xe, float u, float du, float v, float dv, float z0, float dz) const
         {
             const PixCfg& c = *pc;
@@ -5930,8 +7812,25 @@ namespace
             }
 
             const uint32_t vram_y = cached_columns ? ix_ct32(fbp, fbw, 0, (uint32_t)y) : 0;
+            // Sprites estao a profundidade constante. No Z16S, tanto o
+            // endereco de Y quanto a conversao de Z sao comuns a linha toda.
+            const uint16_t depth = constant_z16s
+                ? uint16_t(z0 <= 0.0f ? 0u : (z0 >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)z0)) : 0;
+            const uint32_t zpage = constant_z16s
+                ? (((c.zbp >> 5) + ((uint32_t)y >> 6) * fbw) << 12) + ((c.zbp & 31u) << 7) : 0;
             for (int x = xs; x <= xe; x++)
             {
+                uint8_t* zpixel = nullptr;
+                if constexpr (constant_z16s)
+                {
+                    const uint32_t offset = (zpage + (((uint32_t)x >> 6) << 12) +
+                        g_page_z16s[y & 63][x & 63]) & 0x1FFFFFu;
+                    zpixel = vram8() + (size_t)offset * 2;
+                    uint16_t resident;
+                    std::memcpy(&resident, zpixel, sizeof(resident));
+                    if (depth < resident || (depth == resident && c.ztst == 3u))
+                        continue;
+                }
                 const float uc = u + du * (float)(x - xs), vc = v + dv * (float)(x - xs);   // multiplicacao (sem acumular erro)
                 int r = vr, g = vg, bl = vb, al = va;
 
@@ -6036,7 +7935,14 @@ namespace
                     }
                 }
 
-                if (c.zactive)
+                if constexpr (constant_z16s)
+                {
+                    // AFAIL ainda decide a escrita. A ordem Z antes da cor
+                    // e preservada mesmo quando ambos usam a mesma VRAM.
+                    if (z_write_ok && !c.zmsk)
+                        std::memcpy(zpixel, &depth, sizeof(depth));
+                }
+                else if (c.zactive)
                 {
                     const float zf = z0 + dz * (float)(x - xs);
                     const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
@@ -6163,10 +8069,17 @@ namespace
         if (g_sprite_columns)
             fr.prepare_sprite_columns(px0, px1 - 1, u_first, du);
 
+        const bool z16_early = g_sprite_z16_early && g_sprite_columns &&
+            pc.zactive && pc.zpsm == 0x3Au && pc.ztst >= 2u;
+        if (z16_early && g_perf_gs)
+            g_prof_sprite_z16_pixels.fetch_add((uint64_t)(px1 - px0) * (py1 - py0), std::memory_order_relaxed);
+
         for (int y = py0; y < py1; y++)
         {
             const float v = a.v + (b.v - a.v) * (((float)y + 0.5f - a.y) * iyr);
-            if (g_sprite_columns)
+            if (z16_early)
+                fr.row<true, true>(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
+            else if (g_sprite_columns)
                 fr.row<true>(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
             else
                 fr.row(y, px0, px1 - 1, u_first, du, v, 0.0f, (float)b.z, 0.0f);
@@ -6180,7 +8093,8 @@ namespace
         return value ? value : "spatial";
     }();
 
-    // Teste P: captura a fonte do menu com resolucao vertical original (54x19).
+    // Captura os sprites de texto em resolucao vertical original, antes
+    // de perder linhas ao reduzir o atlas para o framebuffer entrelacado.
     // O texto e retirado apenas do framebuffer de baixa resolucao para nao
     // aparecer duas vezes. Os texels e o alfa sao preservados em uma copia.
     // A composicao ocorre mais tarde em gs_present_frame(), apos a ampliacao.
@@ -6190,10 +8104,243 @@ namespace
         uint32_t fbp = 0;
         unsigned vsync = 0;
         int x = 0, y = 0, w = 0, h = 0;
+        uint32_t tint = 0;
+        bool outline = false;
+        bool ring_hud = false;
+        int clip_x0 = 0, clip_y0 = 0, clip_x1 = 640, clip_y1 = 448;
         std::vector<uint32_t> rgba; // 0xAABBGGRR, um texel por pixel final
     };
     std::mutex g_ui_native_mu;
     std::vector<UiGlyphP> g_ui_native_glyphs;
+
+    // A sombra e um segundo sprite preto. Preserve o alfa original do GS;
+    // reduzi-lo apaga o fundo escuro que separa as letras do cenario.
+    static int gs_text_vertex_alpha(const GsVertex& vertex)
+    {
+        return gs_f2i255(vertex.a);
+    }
+
+    static uint32_t gs_text_lerp(uint32_t top, uint32_t bottom, unsigned fraction)
+    {
+        const unsigned a = (top >> 24) * (256u - fraction), b = (bottom >> 24) * fraction;
+        const unsigned coverage = a + b;
+        if (!coverage)
+            return 0;
+        uint32_t texel = ((coverage + 128) / 256) << 24;
+        for (unsigned shift = 0; shift < 24; shift += 8)
+        {
+            const unsigned color = (((top >> shift) & 255u) * a +
+                ((bottom >> shift) & 255u) * b) / coverage;
+            texel |= color << shift;
+        }
+        return texel;
+    }
+
+    static uint32_t gs_text_pair(uint32_t top, uint32_t bottom)
+    {
+        return gs_text_lerp(top, bottom, 128);
+    }
+
+    static uint32_t gs_ui_glyph_pixel(const PixCfg& pc, uint32_t tex, uint32_t tint, int alpha, int tested_alpha)
+    {
+        const uint32_t r = std::min(255u, ((tex & 255u) * (tint & 255u)) >> 7);
+        const uint32_t g = std::min(255u, (((tex >> 8) & 255u) * ((tint >> 8) & 255u)) >> 7);
+        const uint32_t b = std::min(255u, (((tex >> 16) & 255u) * ((tint >> 16) & 255u)) >> 7);
+        const uint32_t a = std::min(128u, ((tex >> 24) * unsigned(alpha)) >> 7);
+        const int test = std::min(255u, ((tex >> 24) * unsigned(tested_alpha)) >> 7);
+        return gs_alpha_pass(pc, test) || pc.afail == 1 || pc.afail == 3
+            ? r | (g << 8) | (b << 16) | (a << 24) : 0u;
+    }
+
+    static void gs_ui_sprite_auxiliary(const PixCfg& pc, const GsVertex& a, const GsVertex& b)
+    {
+        // RGB is composed at native height later. Keep the original alpha
+        // and Z writes now, including ALWAYS + writable depth in menus.
+        PixCfg aux = pc;
+        aux.fbmsk = 0x00FFFFFFu;
+        aux.need_dst = true;
+        const int x0 = std::max({0, pc.sx0, fast_ceil(std::min(a.x,b.x) - .5f)});
+        const int x1 = std::min({2048, pc.sx1+1, fast_ceil(std::max(a.x,b.x) - .5f)});
+        const int y0 = std::max({0, pc.sy0, fast_ceil(std::min(a.y,b.y) - .5f)});
+        const int y1 = std::min({2048, pc.sy1+1, fast_ceil(std::max(a.y,b.y) - .5f)});
+        if (x0 >= x1 || y0 >= y1 || gs_sprite_fast(aux,a,b,x0,x1,y0,y1)) return;
+        const float ix = 1.0f/(b.x-a.x), iy = 1.0f/(b.y-a.y);
+        for (int y=y0; y<y1; ++y) for (int x=x0; x<x1; ++x)
+            gs_pixel(aux,x,y,b.r,b.g,b.b,b.a,
+                a.u+(b.u-a.u)*((x+.5f-a.x)*ix),
+                a.v+(b.v-a.v)*((y+.5f-a.y)*iy),b.z);
+    }
+
+    static void gs_ui_apply_black_mask(std::vector<uint32_t>& pixels, const std::vector<uint8_t>& mask)
+    {
+        for (size_t i = 0; i < mask.size(); ++i)
+        {
+            const int alpha = mask[i];
+            if (!alpha) continue;
+            const uint32_t color = pixels[i];
+            const int red = int((color >> 16) & 255u), green = int((color >> 8) & 255u), blue = int(color & 255u);
+            pixels[i] = uint32_t((red + ((-red * alpha) >> 7)) << 16) |
+                uint32_t((green + ((-green * alpha) >> 7)) << 8) |
+                uint32_t(blue + ((-blue * alpha) >> 7));
+        }
+    }
+
+    static void gs_ui_outline(std::vector<uint32_t>& pixels, int width, int height,
+                              const std::vector<UiGlyphP>& glyphs)
+    {
+        if (std::none_of(glyphs.begin(), glyphs.end(), [](const UiGlyphP& glyph) { return glyph.outline; }))
+            return;
+        // Uma mascara comum evita que a borda de uma letra cubra a letra
+        // vizinha. O contorno acompanha a cobertura, inclusive nos fades.
+        static std::vector<uint8_t> mask;
+        mask.assign(size_t(width) * height, 0);
+        for (const auto& glyph : glyphs)
+        {
+            if (!glyph.outline) continue;
+            for (int y = 0; y < glyph.h; ++y)
+                for (int x = 0; x < glyph.w; ++x)
+                {
+                    const unsigned alpha = std::min(128u, glyph.rgba[size_t(y) * glyph.w + x] >> 24);
+                    if (!alpha) continue;
+                    for (int oy = -1; oy <= 1; ++oy)
+                        for (int ox = -1; ox <= 1; ++ox)
+                        {
+                            const int dx = glyph.x + x + ox, dy = glyph.y + y + oy;
+                            if (dx < 0 || dx >= width || dy < 0 || dy >= height ||
+                                dx < glyph.clip_x0 || dx >= glyph.clip_x1 ||
+                                dy < glyph.clip_y0 || dy >= glyph.clip_y1) continue;
+                            auto& coverage = mask[size_t(dy) * width + dx];
+                            const unsigned edge = ox && oy ? (alpha * 3 + 2) / 4 : alpha;
+                            coverage = uint8_t(std::max(unsigned(coverage), edge));
+                        }
+                }
+        }
+        gs_ui_apply_black_mask(pixels, mask);
+    }
+
+    static void gs_ui_caption_band(std::vector<uint32_t>& pixels, int width, int height,
+                                   const std::vector<UiGlyphP>& glyphs)
+    {
+        struct Band { int x0, y0, x1, y1, cx0, cy0, cx1, cy1; unsigned alpha; };
+        std::vector<Band> bands;
+        for (const auto& glyph : glyphs)
+        {
+            if (!glyph.outline) continue;
+            unsigned alpha = 0;
+            for (uint32_t texel : glyph.rgba) alpha = std::max(alpha, std::min(127u, texel >> 24));
+            if (!alpha) continue;
+            bands.push_back({glyph.x, glyph.y, glyph.x + glyph.w, glyph.y + glyph.h,
+                glyph.clip_x0, glyph.clip_y0, glyph.clip_x1, glyph.clip_y1, alpha});
+        }
+        if (bands.empty()) return;
+        std::sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) {
+            return a.y0 != b.y0 ? a.y0 < b.y0 : a.x0 < b.x0;
+        });
+        // Forma um fundo unico para cada bloco de texto, incluindo espacos
+        // e linhas consecutivas, sem escurecer duas vezes as intersecoes.
+        std::vector<Band> blocks;
+        for (const auto& band : bands)
+        {
+            auto same = std::find_if(blocks.begin(), blocks.end(), [&](const Band& block) {
+                return band.y0 <= block.y1 + 4 && band.y1 >= block.y0 - 4 &&
+                    band.cx0 == block.cx0 && band.cy0 == block.cy0 && band.cx1 == block.cx1 && band.cy1 == block.cy1;
+            });
+            if (same == blocks.end()) blocks.push_back(band);
+            else
+            {
+                same->x0 = std::min(same->x0, band.x0); same->x1 = std::max(same->x1, band.x1);
+                same->y0 = std::min(same->y0, band.y0); same->y1 = std::max(same->y1, band.y1);
+                same->alpha = std::max(same->alpha, band.alpha);
+            }
+        }
+        static std::vector<uint8_t> mask;
+        mask.assign(size_t(width) * height, 0);
+        // A referencia do emulador conserva aproximadamente 25% da cena
+        // no centro da faixa. Bordas suaves: convolucao da caixa com sigma=4.
+        constexpr double inverse_sigma = 0.1767766952966369;
+        for (const auto& block : blocks)
+        {
+            const int left = block.x0 - 2, right = block.x1 + 2;
+            const int top = block.y0 - 3, bottom = block.y1 + 1;
+            const int x0 = std::max({0, block.cx0, left - 12}), x1 = std::min({width, block.cx1, right + 12});
+            const int y0 = std::max({0, block.cy0, top - 12}), y1 = std::min({height, block.cy1, bottom + 12});
+            if (x1 <= x0 || y1 <= y0) continue;
+            std::vector<double> horizontal(size_t(x1 - x0), 0.0);
+            for (int x = x0; x < x1; ++x)
+                horizontal[size_t(x - x0)] = 0.5 * (std::erf((x + 0.5 - left) * inverse_sigma) -
+                    std::erf((x + 0.5 - right) * inverse_sigma));
+            for (int y = y0; y < y1; ++y)
+            {
+                const double vertical = 0.5 * (std::erf((y + 0.5 - top) * inverse_sigma) -
+                    std::erf((y + 0.5 - bottom) * inverse_sigma));
+                for (int x = x0; x < x1; ++x)
+                {
+                    const unsigned alpha = unsigned(std::clamp(std::lround(96.0 * block.alpha / 127.0 *
+                        horizontal[size_t(x - x0)] * vertical), 0l, 96l));
+                    auto& coverage = mask[size_t(y) * width + x];
+                    coverage = uint8_t(std::max(unsigned(coverage), alpha));
+                }
+            }
+        }
+        gs_ui_apply_black_mask(pixels, mask);
+    }
+
+    static void gs_ui_text_background(std::vector<uint32_t>& pixels, int width, int height,
+                                      const std::vector<UiGlyphP>& glyphs, int style)
+    {
+        if (style == 0) gs_ui_outline(pixels, width, height, glyphs);
+        else gs_ui_caption_band(pixels, width, height, glyphs);
+    }
+
+    static void gs_ui_filter(UiGlyphP& glyph)
+    {
+        const auto source = glyph.rgba;
+        for (int y = 0; y < glyph.h; ++y)
+            for (int x = 0; x < glyph.w; ++x)
+            {
+                unsigned coverage = 0, red = 0, green = 0, blue = 0;
+                const auto add = [&](int sx, int sy, unsigned weight)
+                {
+                    if (sx < 0 || sx >= glyph.w || sy < 0 || sy >= glyph.h)
+                        return;
+                    const uint32_t texel = source[size_t(sy) * glyph.w + sx];
+                    const unsigned alpha = (texel >> 24) * weight;
+                    coverage += alpha;
+                    red += (texel & 255u) * alpha;
+                    green += ((texel >> 8) & 255u) * alpha;
+                    blue += ((texel >> 16) & 255u) * alpha;
+                };
+                add(x, y, 12);
+                add(x-1, y, 1);
+                add(x+1, y, 1);
+                add(x, y-1, 1);
+                add(x, y+1, 1);
+                // Filtra a cobertura junto com a cor para que texels
+                // transparentes do atlas nao escurecam os contornos.
+                if (coverage)
+                    glyph.rgba[size_t(y) * glyph.w + x] = (red / coverage) |
+                        ((green / coverage) << 8) | ((blue / coverage) << 16) |
+                        (((coverage + 8) / 16) << 24);
+            }
+    }
+
+/* SH_EMBEDDED_RING_HUD */
+
+    static void gs_ui_on_sprite(const PixCfg& pc, int x0, int y0, int x1, int y1)
+    {
+        // A limpeza opaca deste framebuffer tambem descarta a sua camada de
+        // interface. O outro framebuffer ainda pode estar na janela.
+        if (!g_ui_native || pc.tme || pc.abe || pc.ate || pc.fbmsk || pc.fpsm ||
+            pc.fbw != 10 || (pc.fbp != 0 && pc.fbp != 2240) ||
+            (pc.zte && pc.ztst != 1) ||
+            x0 > 0 || y0 > 0 || x1 < 640 || y1 < 224 ||
+            pc.sx0 > 0 || pc.sy0 > 0 || pc.sx1 < 639 || pc.sy1 < 223)
+            return;
+        std::lock_guard<std::mutex> lk(g_ui_native_mu);
+        auto& glyphs = g_ui_native_glyphs;
+        glyphs.erase(std::remove_if(glyphs.begin(), glyphs.end(),
+            [&](const UiGlyphP& glyph) { return glyph.fbp == pc.fbp; }), glyphs.end());
+    }
 
     // O sprite ja foi recortado pelo scissor. Prepara so coordenadas e
     // enderecos: os texels continuam a ser lidos pixel a pixel da VRAM.
@@ -6248,6 +8395,7 @@ namespace
 
     void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
     {
+        gs_vk_flush();
         float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
 
         if (x1 <= x0 || y1 <= y0)
@@ -6261,6 +8409,8 @@ namespace
 
         PixCfg pc;
         gs_pix_cfg(ci, pc);
+
+        gs_ui_on_sprite(pc, px0, py0, px1, py1);
 
         // Teste M: usa a escolha basal de TEX1 do proprio decodificador, sem os
         // overrides posteriores para sprites. Opcao experimental: por padrao
@@ -6326,8 +8476,8 @@ namespace
             }
         }
 
-        // Teste P: caminho opcional para desenhar o atlas de fonte de 19
-        // texels na imagem final de 448 linhas. PS2_GS_UI_NATIVE=0
+        // Compoe os atlas de texto na imagem final de 448 linhas.
+        // PS2_GS_UI_NATIVE=0
         // volta ao desenho direto no framebuffer.
         static const bool ui_native_enabled = g_ui_native;
         // Teste Q: instrumento diagnostico para verificar POR QUE o teste P nao
@@ -6379,26 +8529,43 @@ namespace
                 }
             }
         }
-        if (ui_native_enabled && pc.tme && !pc.ti.linear &&
-            pc.ti.psm == 0x14u && pc.ti.tbp == 9504u &&
+        // As capturas de itens e da conversa com Bacon usam a mesma
+        // paleta de fonte. Os atlas mudam de endereco e podem ter 128 ou
+        // 256 texels de largura (nome, primeira e segunda linha da fala).
+        const bool caption_font = pc.ti.psm == 0x13u && pc.ti.h == 64 &&
+            (pc.ti.w == 128 || pc.ti.w == 256) && pc.ti.tbw == unsigned(pc.ti.w / 64) &&
+            ((g_st.ctx[ci].tex0 >> 37) & 0x3FFFu) == 16348u;
+        const unsigned font_palette = unsigned((g_st.ctx[ci].tex0 >> 37) & 0x3FFFu);
+        const bool system_font = pc.ti.psm == 0x14u && font_palette == 16344u;
+        const bool menu_font = pc.ti.psm == 0x14u &&
+            ((font_palette == 5492u && pc.ti.w == 128 && pc.ti.h == 64) ||
+             (font_palette == 5613u && pc.ti.w == 256 && pc.ti.h == 64));
+        const bool known_font = caption_font || system_font || menu_font;
+        const bool writable_font_depth = known_font && pc.zactive && pc.ztst == 1u &&
+            pc.zbp >= 4480u && pc.zbp <= 15000u && pc.ti.tbp >= 5760u;
+        if (ui_native_enabled && g_gs_crt_int && g_gs_crt_ffmd &&
+            pc.tme && (!pc.ti.linear || known_font) && (pc.ti.psm == 0x14u || caption_font) &&
             pc.ti.tfx == 0u && pc.ti.tcc &&
             pc.fpsm == 0u && pc.fbmsk == 0u &&
             (pc.fbp == 0u || pc.fbp == 2240u) &&
-            !pc.zactive && pc.abe &&
+            (!pc.ate || pc.afail == 0u || known_font) &&
+            (!pc.zactive || writable_font_depth) && pc.abe &&
             g_st.ctx[ci].alpha == 0x44u &&
-            (x1 - x0) >= 32.0f && (x1 - x0) <= 55.0f &&
-            (y1 - y0) >= 9.0f && (y1 - y0) <= 10.0f)
+            (x1 - x0) >= 1.0f && (x1 - x0) <= 640.0f &&
+            (y1 - y0) >= 7.0f && (y1 - y0) <= (known_font ? 32.0f : 13.0f))
         {
             const float du = (b.u - a.u) / (b.x - a.x);
             const float dv = (b.v - a.v) / (b.y - a.y);
             const int w = (int)std::lround(x1 - x0);
             const int h = (int)std::lround((y1 - y0) * 2.0f);
 
-            // Nao substitui o sprite caso o modo ou a geometria sejam
-            // diferentes do comando confirmado na captura F9 do teste N.
-            if (std::fabs(du - 1.0f) < 0.03f &&
-                std::fabs(dv - 2.0f) < 0.03f &&
-                w >= 32 && w <= 55 && h >= 18 && h <= 20 &&
+            // Os atlas de dialogo tambem usam duas linhas de textura por
+            // linha do campo. Preserve ambas na imagem final, como no menu.
+            const bool shadow = b.r == 0 && b.g == 0 && b.b == 0;
+            if ((std::fabs(du - 1.0f) < 0.03f || (known_font && shadow && std::fabs((b.u-a.u)-w) <= 1.05f)) &&
+                (std::fabs(dv - 2.0f) < 0.03f || (caption_font && std::fabs(dv - 1.0f) < 0.03f) ||
+                 (known_font && shadow && std::fabs((b.v-a.v)-h) <= 1.05f)) &&
+                w >= 1 && w <= 640 && h >= 14 && h <= 64 &&
                 a.u >= 0.0f && a.v >= 0.0f)
             {
                 UiGlyphP glyph;
@@ -6408,6 +8575,9 @@ namespace
                 glyph.y = (int)std::lround(y0 * 2.0f);
                 glyph.w = w;
                 glyph.h = h;
+                glyph.outline = caption_font;
+                glyph.clip_x0 = pc.sx0; glyph.clip_x1 = pc.sx1 + 1;
+                glyph.clip_y0 = pc.sy0 * 2; glyph.clip_y1 = (pc.sy1 + 1) * 2;
                 glyph.rgba.resize((size_t)w * (size_t)h);
 
                 // Faz snapshot dos texels enquanto a CLUT e o TEX0 deste
@@ -6415,57 +8585,55 @@ namespace
                 const int vr = gs_f2i255(b.r);
                 const int vg = gs_f2i255(b.g);
                 const int vb = gs_f2i255(b.b);
-                const int va = gs_f2i255(b.a);
+                glyph.tint = uint32_t(vr | (vg << 8) | (vb << 16));
+                const int original_alpha = gs_f2i255(b.a);
+                const int va = gs_text_vertex_alpha(b);
+                TexInfo native_texture = pc.ti;
+                native_texture.ui_vpair = false;
                 for (int py = 0; py < h; ++py)
                     for (int px = 0; px < w; ++px)
                     {
+                        const int screen_x = glyph.x + px, screen_y = glyph.y + py;
+                        if (screen_x < pc.sx0 || screen_x > pc.sx1 ||
+                            screen_y < pc.sy0 * 2 || screen_y >= (pc.sy1 + 1) * 2)
+                            continue;
                         const float u = a.u + (b.u - a.u) * ((px + 0.5f) / w);
                         const float v = a.v + (b.v - a.v) * ((py + 0.5f) / h);
-                        const uint32_t tex = gs_texel(pc.ti, fast_floor(u), fast_floor(v));
-                        const uint32_t r = std::min(255u, ((tex & 255u) * (uint32_t)vr) >> 7);
-                        const uint32_t g = std::min(255u, (((tex >> 8) & 255u) * (uint32_t)vg) >> 7);
-                        const uint32_t bl = std::min(255u, (((tex >> 16) & 255u) * (uint32_t)vb) >> 7);
-                        const uint32_t al = std::min(255u, (((tex >> 24) & 255u) * (uint32_t)va) >> 7);
-                        glyph.rgba[(size_t)py * w + px] = r | (g << 8) | (bl << 16) | (al << 24);
+                        uint32_t tex = gs_sample(native_texture, u, v);
+                        if (caption_font)
+                        {
+                            const float sample_y = v - 0.5f;
+                            const int row = fast_floor(sample_y);
+                            const int first = fast_floor(a.v), last = fast_floor(b.v - 0.01f);
+                            const unsigned fraction = unsigned(std::lround((sample_y - row) * 256.0f));
+                            tex = gs_text_lerp(gs_texel(pc.ti, fast_floor(u), std::clamp(row, first, last)),
+                                gs_texel(pc.ti, fast_floor(u), std::clamp(row + 1, first, last)), fraction);
+                        }
+                        glyph.rgba[(size_t)py*w+px] = gs_ui_glyph_pixel(pc,tex,glyph.tint,va,original_alpha);
                     }
+
+                static const bool smooth_text = ps2_settings().text_aa && battle_profile_enabled("PS2_GS_UI_EDGEAA");
+                if (smooth_text && !caption_font)
+                    gs_ui_filter(glyph);
+                // O filtro de cobertura nao deve vazar para fora da janela
+                // de dialogo, inclusive durante rolagem e abertura.
+                if (glyph.x < pc.sx0 || glyph.x + w > pc.sx1 + 1 ||
+                    glyph.y < pc.sy0 * 2 || glyph.y + h > (pc.sy1 + 1) * 2)
+                    for (int py = 0; py < h; ++py)
+                        for (int px = 0; px < w; ++px)
+                            if (glyph.x + px < pc.sx0 || glyph.x + px > pc.sx1 ||
+                                glyph.y + py < pc.sy0 * 2 || glyph.y + py >= (pc.sy1 + 1) * 2)
+                                glyph.rgba[size_t(py) * w + px] = 0;
 
                 {
                     std::lock_guard<std::mutex> lk(g_ui_native_mu);
                     auto& cache = g_ui_native_glyphs;
 
-                    // Teste R: no modo opt-in, um deslocamento vertical de um
-                    // pixel final nao cria uma copia extra do mesmo texto.
-                    // Sem a variavel, mantem EXATAMENTE o criterio do teste Q.
-                    static const bool ui_r_dedup = battle_profile_enabled("PS2_GS_UI_DEDUP");
-                    const size_t before = cache.size();
-                    cache.erase(std::remove_if(cache.begin(), cache.end(),
-                        [&](const UiGlyphP& old)
-                        {
-                            // Textos vizinhos ficam separados ~18 pixels.
-                            // Limitar a mesma posicao X, largura e FBP evita
-                            // substituir outras opcoes do menu.
-                            const bool same_row = ui_r_dedup
-                                ? (old.w == glyph.w &&
-                                   old.y >= glyph.y - 1 &&
-                                   old.y <= glyph.y + 1)
-                                : (old.y == glyph.y);
-                            return old.fbp == glyph.fbp &&
-                                old.x == glyph.x && same_row;
-                        }), cache.end());
-
-                    // Registro restrito: o tamanho antes/depois demonstra
-                    // quando um glifo antigo foi realmente substituido.
-                    if (ui_r_dedup && before > cache.size())
-                    {
-                        static unsigned reports_r = 0;
-                        if (reports_r++ < 16u)
-                            std::fprintf(stderr,
-                                "  [GS UI R] dedup=1 fbp=%u x=%d y=%d removidos=%zu\n",
-                                glyph.fbp / 32u, glyph.x, glyph.y,
-                                before - cache.size());
-                    }
-
-                    if (cache.size() >= 16)
+                    // O contorno pode ter varias passagens pretas, separadas
+                    // por apenas um pixel. Preserve cada desenho e sua ordem,
+                    // inclusive quando ele reutiliza a cor ou a paleta da letra.
+                    // A limpeza no reuso do framebuffer evita acumulo temporal.
+                    if (cache.size() >= 2048)
                         cache.erase(cache.begin());
                     cache.push_back(std::move(glyph));
                 }
@@ -6477,6 +8645,7 @@ namespace
 
                 // Nao desenhar a versao de 9,5 linhas: sera composta apos
                 // a reconstrucao espacial, com 19 linhas originais.
+                gs_ui_sprite_auxiliary(pc,a,b);
                 return;
             }
         }
@@ -6533,6 +8702,45 @@ namespace
         // recorta ao scissor uma vez (em vez de testar pixel a pixel)
         px0 = std::max(px0, pc.sx0); px1 = std::min(px1, pc.sx1 + 1);
         py0 = std::max(py0, pc.sy0); py1 = std::min(py1, pc.sy1 + 1);
+
+        // As outras fontes desenhadas em modo campo usam duas linhas do
+        // atlas por pixel. Integre as duas coberturas antes do blend.
+        static const bool smooth_text = ps2_settings().text_aa && battle_profile_enabled("PS2_GS_UI_EDGEAA");
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const float du = b.u - a.u, dv = b.v - a.v;
+        if (smooth_text && g_gs_crt_int && pc.tme && pc.ti.psm == 0x14u &&
+            !pc.ti.linear && pc.ti.tfx == 0u && pc.ti.tcc && pc.abe &&
+            g_st.ctx[ci].alpha == 0x44u && !pc.zactive && (!pc.ate || pc.afail == 0) &&
+            dx >= 4 && dx <= 480 && dy >= 7 && dy <= 13 &&
+            du >= dx * 0.5f && du <= dx * 1.5f && std::fabs(dv - dy * 2) < 0.13f)
+        {
+            const int r = gs_f2i255(b.r), g = gs_f2i255(b.g), bl = gs_f2i255(b.b);
+            const int original_alpha = gs_f2i255(b.a), alpha = gs_text_vertex_alpha(b);
+            const int first_v = fast_floor(a.v), last_v = fast_floor(b.v - 0.01f);
+            const PixCfg test = pc;
+            pc.ate = false;
+            const auto sample = [&](int u, int v)
+            {
+                const uint32_t texel = gs_texel(pc.ti, u, std::clamp(v, first_v, last_v));
+                const int tex_alpha = std::min(255, int(texel >> 24) * original_alpha >> 7);
+                if (!gs_alpha_pass(test, tex_alpha))
+                    return 0u;
+                const unsigned coverage = std::min(128, int(texel >> 24) * alpha >> 7);
+                return (texel & 0x00FFFFFFu) | (coverage << 24);
+            };
+            for (int y = py0; y < py1; ++y)
+            {
+                const int v = fast_floor(a.v + (y + 0.5f - a.y) * (dv / dy) - 0.5f);
+                for (int x = px0; x < px1; ++x)
+                {
+                    const int u = fast_floor(a.u + (x + 0.5f - a.x) * (du / dx));
+                    const uint32_t texel = gs_text_pair(sample(u, v), sample(u, v + 1));
+                    if (texel >> 24)
+                        gs_shade_pixel<true>(pc, x, y, r, g, bl, 128, texel, b.z);
+                }
+            }
+            return;
+        }
 
         if ((long long)(px1 - px0) * (long long)(py1 - py0) >= 2048 && gs_sprite_fast(pc, a, b, px0, px1, py0, py1))
             return;
@@ -6609,7 +8817,69 @@ namespace
         return bias;
     }
 
+    unsigned g_gs_replay_triangles = 0; // Acesso exclusivo do executor GS.
     std::atomic<uint64_t> g_tex_u_3d{0}, g_tex_u_linear{0}, g_tex_u_nearest{0};
+/* SH_EMBEDDED_VULKAN_BATCH */
+
+    static bool gs_ui_copyright(int ci, const GsVertex& a, const GsVertex& b,
+                                const GsVertex& c, const PixCfg& pc)
+    {
+        // This title-screen strip uses two triangles, unlike the menu sprites.
+        // Restrict the lift to its font palette; never move the logo's shadow.
+        if (!g_ui_native || !g_gs_crt_int || !g_gs_crt_ffmd || !pc.tme ||
+            pc.ti.psm != 0x14u || pc.ti.w != 1024 || pc.ti.h != 64 ||
+            ((g_st.ctx[ci].tex0 >> 37) & 16383u) != 5470u ||
+            pc.fbmsk || pc.fpsm || pc.zactive || !pc.abe || pc.ti.tfx || !pc.ti.tcc ||
+            g_st.ctx[ci].alpha != 0x44u || (pc.fbp != 0u && pc.fbp != 2240u) ||
+            a.r != b.r || b.r != c.r || a.g != b.g || b.g != c.g ||
+            a.b != b.b || b.b != c.b || a.a != b.a || b.a != c.a ||
+            a.q != b.q || b.q != c.q || a.q == 0) return false;
+        const float x0=std::min({a.x,b.x,c.x}), y0=std::min({a.y,b.y,c.y});
+        const int w=int(std::lround(std::max({a.x,b.x,c.x})-x0));
+        const int h=int(std::lround((std::max({a.y,b.y,c.y})-y0)*2));
+        if (w<1 || w>640 || h<14 || h>64) return false;
+        gs_vk_flush();
+        const float area=(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+        if (!area) return false;
+        UiGlyphP glyph;
+        glyph.fbp=pc.fbp; glyph.vsync=g_gs_vsyncs;
+        glyph.x=int(std::lround(x0)); glyph.y=int(std::lround(y0*2));
+        glyph.w=w; glyph.h=h; glyph.rgba.resize(size_t(w)*h);
+        glyph.tint=uint32_t(gs_f2i255(c.r)|(gs_f2i255(c.g)<<8)|(gs_f2i255(c.b)<<16));
+        TexInfo texture=pc.ti; texture.ui_vpair=false;
+        auto weights=[&](float x,float y,float& wa,float& wb,float& wc) {
+            wa=((b.x-x)*(c.y-y)-(b.y-y)*(c.x-x))/area;
+            wb=((c.x-x)*(a.y-y)-(c.y-y)*(a.x-x))/area;
+            wc=1-wa-wb;
+        };
+        for(int y=0;y<h;++y) for(int x=0;x<w;++x) {
+            float wa,wb,wc; weights(x0+x+.5f,y0+(y+.5f)*.5f,wa,wb,wc);
+            const float u=a.persp ? (wa*a.us+wb*b.us+wc*c.us)/a.q : wa*a.u+wb*b.u+wc*c.u;
+            const float v=a.persp ? (wa*a.vs+wb*b.vs+wc*c.vs)/a.q : wa*a.v+wb*b.v+wc*c.v;
+            glyph.rgba[size_t(y)*w+x]=gs_ui_glyph_pixel(pc,gs_sample(texture,u,v),glyph.tint,
+                gs_text_vertex_alpha(c),gs_f2i255(c.a));
+        }
+        if(ps2_settings().text_aa && battle_profile_enabled("PS2_GS_UI_EDGEAA")) gs_ui_filter(glyph);
+        auto edge=[&](const GsVertex& p,const GsVertex& q,float x,float y) {
+            const float dx=(q.x-p.x)*(area>0?1:-1), dy=(q.y-p.y)*(area>0?1:-1);
+            const float e=dx*(y-p.y)-dy*(x-p.x);
+            return e>0 || (e==0 && (dy>0 || (dy==0 && dx<0)));
+        };
+        for(int y=0;y<h;++y) for(int x=0;x<w;++x) {
+            const float sx=x0+x+.5f, sy=y0+(y+.5f)*.5f;
+            if(sx<pc.sx0 || sx>=pc.sx1+1 || sy<pc.sy0 || sy>=pc.sy1+1 ||
+                !edge(a,b,sx,sy) || !edge(b,c,sx,sy) || !edge(c,a,sx,sy))
+                glyph.rgba[size_t(y)*w+x]=0;
+        }
+        { std::lock_guard<std::mutex> lock(g_ui_native_mu);
+          if(g_ui_native_glyphs.size()>=2048) g_ui_native_glyphs.erase(g_ui_native_glyphs.begin());
+          g_ui_native_glyphs.push_back(std::move(glyph)); }
+        const uint64_t frame=g_st.ctx[ci].frame;
+        g_st.ctx[ci].frame=frame|(uint64_t(0x00FFFFFFu)<<32);
+        gs_draw_triangle(ci,a,b,c); // Preserve alpha; mask also prevents recursion.
+        g_st.ctx[ci].frame=frame;
+        return true;
+    }
 
     void gs_draw_triangle(int ci, const GsVertex& a, const GsVertex& b, const GsVertex& c)
     {
@@ -6632,6 +8902,8 @@ namespace
 
         PixCfg pc;
         gs_pix_cfg(ci, pc);
+
+        if (gs_ui_copyright(ci,a,b,c,pc)) return;
 
         // Condicoes reais da batalha: somente triangulos com STQ/perspectiva
         // destinados aos framebuffers FBP 0/70 (nao os sprites TEX1=0 da UI).
@@ -6661,6 +8933,13 @@ namespace
         }
         minx = std::max(minx, pc.sx0); maxx = std::min(maxx, pc.sx1);
         miny = std::max(miny, pc.sy0); maxy = std::min(maxy, pc.sy1);
+
+        if (g_gs_replay_capture_enabled && minx <= maxx && miny <= maxy)
+            ++g_gs_replay_triangles;
+
+        if (gs_vk_enqueue(ci, a, b, c, pc, minx, maxx, miny, maxy))
+            return;
+        gs_vk_flush();
 
         const bool persp = a.persp && b.persp && c.persp;
 
@@ -6707,8 +8986,26 @@ namespace
         // O caminho especializado do GS ja conhece o formato de cor.
         // Em Z16S, reutiliza o mesmo endereco no teste e na escrita.
         const bool fast_effect = g_gs_tri_effects_fast && sampler != nullptr;
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+        const bool rgba_sse2 = g_gs_tri_rgba_sse2 && early_z && pc.fpsm == 0 &&
+            (!pc.tme || sampler != nullptr);
+        const __m128 rgba_a = _mm_setr_ps(a.r, a.g, a.b, a.a);
+        const __m128 rgba_b = _mm_setr_ps(b.r, b.g, b.b, b.a);
+        const __m128 rgba_c = _mm_setr_ps(c.r, c.g, c.b, c.a);
+        const __m128 rgba_min = _mm_setzero_ps();
+        const __m128 rgba_max = _mm_set1_ps(255.0f);
+        const bool direct_z16s = (fast_effect || (rgba_sse2 && !pc.tme)) && pc.zactive && pc.zpsm == 0x3Au;
+#else
         const bool direct_z16s = fast_effect && pc.zactive && pc.zpsm == 0x3Au;
+#endif
 
+        const bool row_address = g_gs_tri_row_fast && (sampler != nullptr || direct_z16s);
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+        const bool row_address_rgba = g_gs_tri_row_fast && rgba_sse2;
+#else
+        constexpr bool row_address_rgba = false;
+#endif
+        const bool use_row_address = row_address || row_address_rgba;
         for (int y = miny; y <= maxy; y++)
         {
             const float py = (float)y + 0.5f;
@@ -6743,11 +9040,57 @@ namespace
                 continue;
             }
 
+            // FBP/ZBP e a faixa em Y ficam fixos nesta linha. O pixel
+            // conserva a selecao de pagina em X e a mascara de wrap da VRAM.
+            const uint32_t row_y = (uint32_t)y;
+            const uint16_t* color_row = use_row_address ? g_page_ct32[row_y & 31u] : nullptr;
+            const uint16_t* depth_row = use_row_address && direct_z16s ? g_page_z16s[row_y & 63u] : nullptr;
+            const uint32_t color_base = use_row_address
+                ? (((pc.fbp >> 5) + (row_y >> 5) * pc.fbw) << 11) + ((pc.fbp & 31u) << 6) : 0u;
+            const uint32_t depth_base = depth_row
+                ? (((pc.zbp >> 5) + (row_y >> 6) * pc.fbw) << 12) + ((pc.zbp & 31u) << 7) : 0u;
+
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+            alignas(16) float weights0[4], weights1[4], weights2[4], depths[4];
+            const bool group_depth = use_row_address && rgba_sse2 && xe - xs >= 7;
+#endif
             for (int x = xs; x <= xe; x++)
             {
-                const float px = (float)x + 0.5f;
-                const float w0 = k0 + s0 * px, w1 = k1 + s1 * px, w2 = 1.0f - w0 - w1;
-                const float zf = (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2;
+                const uint32_t ux = (uint32_t)x;
+                float w0, w1, w2, zf;
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+                if (group_depth)
+                {
+                    const unsigned lane = (unsigned)(x - xs) & 3u;
+                    if (lane == 0u)
+                    {
+                        // Agrupa somente a matematica. A VRAM ainda e lida e
+                        // escrita na ordem original, pixel por pixel.
+                        const __m128 px4 = _mm_add_ps(_mm_set1_ps((float)x), _mm_setr_ps(0.5f, 1.5f, 2.5f, 3.5f));
+                        const __m128 w04 = _mm_add_ps(_mm_set1_ps(k0), _mm_mul_ps(_mm_set1_ps(s0), px4));
+                        const __m128 w14 = _mm_add_ps(_mm_set1_ps(k1), _mm_mul_ps(_mm_set1_ps(s1), px4));
+                        const __m128 w24 = _mm_sub_ps(_mm_sub_ps(_mm_set1_ps(1.0f), w04), w14);
+                        const __m128 zab = _mm_add_ps(_mm_mul_ps(_mm_set1_ps((float)a.z), w04),
+                            _mm_mul_ps(_mm_set1_ps((float)b.z), w14));
+                        _mm_store_ps(weights0, w04);
+                        _mm_store_ps(weights1, w14);
+                        _mm_store_ps(weights2, w24);
+                        _mm_store_ps(depths, _mm_add_ps(zab, _mm_mul_ps(_mm_set1_ps((float)c.z), w24)));
+                    }
+                    w0 = weights0[lane];
+                    w1 = weights1[lane];
+                    w2 = weights2[lane];
+                    zf = depths[lane];
+                }
+                else
+#endif
+                {
+                    const float px = (float)x + 0.5f;
+                    w0 = k0 + s0 * px;
+                    w1 = k1 + s1 * px;
+                    w2 = 1.0f - w0 - w1;
+                    zf = (float)a.z * w0 + (float)b.z * w1 + (float)c.z * w2;
+                }
                 const uint32_t zi = zf <= 0.0f ? 0u : (zf >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)zf);
                 // xs..xe e miny..maxy ja estao no scissor. Testa Z antes de UV/STQ e RGBA.
                 // A escrita de Z ainda depende de AFAIL e continua dentro de gs_pixel.
@@ -6756,7 +9099,10 @@ namespace
                 {
                     if (pc.ztst == 0u)
                         continue;
-                    depth_pixel = vram8() + (size_t)ix_z16s(pc.zbp, pc.fbw, (uint32_t)x, (uint32_t)y) * 2;
+                    const uint32_t zindex = depth_row
+                        ? (depth_base + ((ux >> 6) << 12) + depth_row[ux & 63u]) & 0x1FFFFFu
+                        : ix_z16s(pc.zbp, pc.fbw, ux, row_y);
+                    depth_pixel = vram8() + (size_t)zindex * 2;
                     if (pc.ztst >= 2u)
                     {
                         uint16_t previous;
@@ -6783,6 +9129,31 @@ namespace
                     u = a.u * w0 + b.u * w1 + c.u * w2;
                     v = a.v * w0 + b.v * w1 + c.v * w2;
                 }
+
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(__FMA__) && !defined(__FAST_MATH__)
+                if (rgba_sse2)
+                {
+                    // Paraleliza os quatro canais de um pixel sem reordenar as somas.
+                    // O Z ja foi testado; a escrita ainda depende do teste de alfa.
+                    const __m128 ab = _mm_add_ps(_mm_mul_ps(rgba_a, _mm_set1_ps(w0)),
+                        _mm_mul_ps(rgba_b, _mm_set1_ps(w1)));
+                    const __m128 rgba = _mm_add_ps(ab, _mm_mul_ps(rgba_c, _mm_set1_ps(w2)));
+                    int32_t channels[4];
+                    const __m128 clipped = _mm_min_ps(_mm_max_ps(rgba, rgba_min), rgba_max);
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(channels), _mm_cvttps_epi32(clipped));
+                    const uint32_t addr = color_row
+                        ? (color_base + ((ux >> 6) << 11) + color_row[ux & 63u]) & 0xFFFFFu
+                        : ix_ct32(pc.fbp, pc.fbw, ux, row_y);
+                    const uint32_t texel = sampler ? sampler(pc.ti, u + tex_u_bias, v + tex_u_bias) : 0u;
+                    if (fast_effect || !pc.tme)
+                        gs_shade_pixel<true, true>(pc, x, y, channels[0], channels[1], channels[2],
+                            channels[3], texel, zi, addr, depth_pixel);
+                    else
+                        gs_shade_pixel<false, true>(pc, x, y, channels[0], channels[1], channels[2],
+                            channels[3], texel, zi, addr);
+                    continue;
+                }
+#endif
 
                 // A interpolacao e o Z-test originais continuam inalterados.
                 // Calcular a cobertura 2x2 SOMENTE quando a posicao esta perto
@@ -6839,7 +9210,9 @@ namespace
                 if (sampler != nullptr)
                 {
                     // CT32 usa o mesmo endereco para o blend e a escrita.
-                    const uint32_t addr = ix_ct32(pc.fbp, pc.fbw, (uint32_t)x, (uint32_t)y);
+                    const uint32_t addr = color_row
+                        ? (color_base + ((ux >> 6) << 11) + color_row[ux & 63u]) & 0xFFFFFu
+                        : ix_ct32(pc.fbp, pc.fbw, ux, row_y);
                     const uint32_t texel = sampler(pc.ti, u + tex_u_bias, v + tex_u_bias);
                     if (fast_effect)
                         gs_shade_pixel<true, true>(pc, x, y, gs_f2i255(r), gs_f2i255(g), gs_f2i255(blue),
@@ -7091,6 +9464,7 @@ namespace
 
     void gs_xfer_begin()
     {
+        gs_vk_flush();
         gs_init_tables();
         g_st.dbp = (uint32_t)((g_st.bitbltbuf >> 32) & 0x3FFF);
         g_st.dbw = (uint32_t)((g_st.bitbltbuf >> 48) & 0x3F);
@@ -7142,6 +9516,7 @@ namespace
 
     void gs_core_image(uint64_t lo, uint64_t hi)
     {
+        gs_vk_flush();
         if (!g_st.xfer)
             return;
 
@@ -7370,7 +9745,7 @@ namespace
     struct PresentProfile
     {
         unsigned pacing = 0, invalid = 0, fieldlock = 0, same_flip = 0, aligned = 0, early_flip = 0;
-        unsigned queue_skips = 0;
+        unsigned queue_skips = 0, unchanged = 0;
         uint64_t queue_wait_ns = 0;
         unsigned raster_fields = 0, raster_mixed = 0, raster_unknown = 0, raster_train = 0, raster_train_zero = 0;
         uint64_t raster_sprite_vertices = 0, raster_triangle_vertices = 0;
@@ -7595,6 +9970,54 @@ namespace
         }
     }
 
+#if defined(__SSE2__) || defined(_M_X64)
+    static unsigned gs_spatial_row_sse2(uint32_t* out, const uint32_t* a, const uint32_t* b,
+                                        uint32_t width, uint32_t& x)
+    {
+        const __m128i low = _mm_set1_epi32(255);
+        const __m128i one = _mm_set1_epi8(1);
+        const __m128i threshold = _mm_set1_epi32(30);
+        const __m128i margin = _mm_set1_epi32(12);
+        const auto delta = [&](const __m128i lhs, const __m128i rhs) {
+            const __m128i d = _mm_or_si128(_mm_subs_epu8(lhs, rhs), _mm_subs_epu8(rhs, lhs));
+            return _mm_add_epi32(_mm_and_si128(d, low),
+                _mm_add_epi32(_mm_and_si128(_mm_srli_epi32(d, 8), low),
+                              _mm_and_si128(_mm_srli_epi32(d, 16), low)));
+        };
+        const auto load = [](const uint32_t* p) {
+            return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+        };
+        const auto select = [](const __m128i mask, const __m128i yes, const __m128i no) {
+            return _mm_or_si128(_mm_and_si128(mask, yes), _mm_andnot_si128(mask, no));
+        };
+        unsigned diagonals = 0;
+        for (; x + 4 < width; x += 4)
+        {
+            const auto top = load(a + x), bottom = load(b + x);
+            const auto vert = delta(top, bottom);
+            auto t = top, s = bottom;
+            if (_mm_movemask_epi8(_mm_cmpgt_epi32(vert, threshold)))
+            {
+                const auto tl = load(a + x - 1), tr = load(a + x + 1);
+                const auto bl = load(b + x - 1), br = load(b + x + 1);
+                const auto left = delta(tl, br), right = delta(tr, bl);
+                const auto l = _mm_and_si128(_mm_cmpgt_epi32(vert, _mm_add_epi32(left, threshold)),
+                                              _mm_cmpgt_epi32(right, _mm_add_epi32(left, margin)));
+                const auto r = _mm_and_si128(_mm_cmpgt_epi32(vert, _mm_add_epi32(right, threshold)),
+                                              _mm_cmpgt_epi32(left, _mm_add_epi32(right, margin)));
+                t = select(l, tl, select(r, tr, top));
+                s = select(l, br, select(r, bl, bottom));
+                const unsigned axes = (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(l, r)));
+                diagonals += (axes & 1u) + ((axes >> 1) & 1u) + ((axes >> 2) & 1u) + (axes >> 3);
+            }
+            const auto rounded = _mm_avg_epu8(t, s);
+            const auto avg = _mm_sub_epi8(rounded, _mm_and_si128(_mm_xor_si128(t, s), one));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(out + x), avg);
+        }
+        return diagonals;
+    }
+#endif
+
     struct PresentPacing
     {
         using Clock = std::chrono::steady_clock;
@@ -7626,14 +10049,28 @@ namespace
             return published && flip != last_flip && now >= next_flip;
         }
 
-        void did_publish(Clock::time_point start, Clock::time_point finish, unsigned flip, bool legacy)
+        void did_publish(Clock::time_point frame_start, Clock::time_point work_start,
+                         Clock::time_point finish, unsigned flip, bool legacy)
         {
-            const auto work = finish - start;
-            // Conserva a reserva de CPU quando reconstruir o quadro e caro.
-            next = legacy
-                ? finish + std::max<Clock::duration>(std::chrono::milliseconds(33), work * 3)
-                : start + std::max<Clock::duration>(std::chrono::milliseconds(33), work * 4);
-            next_flip = start + std::max<Clock::duration>(std::chrono::milliseconds(16), work * 4);
+            const auto work = finish - work_start;
+            const auto period = roj::presentation_period(ps2_settings().fps);
+            if (legacy)
+            {
+                next = finish + std::max<Clock::duration>(std::chrono::milliseconds(33), work * 3);
+                next_flip = work_start + std::chrono::milliseconds(16);
+            }
+            else
+            {
+                // Mantem a fase entre apresentacoes. Iniciar o prazo apos
+                // drenar a fila atrasava cada prazo e descartava o VBlank seguinte.
+                next = published ? next + period : frame_start + period;
+                if (next < frame_start) next = frame_start + period;
+                if (next < finish) next = finish;
+                // Tolera ate 1 ms de variacao do VBlank apenas se houver
+                // uma troca nova; o mesmo framebuffer nao ganha essa antecipacao.
+                const auto tolerance = std::min<Clock::duration>(period / 4, std::chrono::milliseconds(1));
+                next_flip = next - tolerance;
+            }
             last_flip = flip;
             published = true;
         }
@@ -7685,10 +10122,14 @@ namespace
             return;
         }
 
-        // Campo: o jogo desloca meia linha (OFY / Y dos sprites) nos quadros "impares". Por padrao so os quadros "pares" sao
-        // mostrados (eliminou o tremor nos testes). PS2_FIELDLOCK=0 permite os dois campos.
-        // PS2_FIELDSHIFT controla o deslocamento no caminho sem reconstrucao espacial.
-        static const bool fieldlock = !(std::getenv("PS2_FIELDLOCK") != nullptr && std::getenv("PS2_FIELDLOCK")[0] == '0');
+        // O jogo desloca meia linha nos campos impares. A protecao contra
+        // campos ainda desalinhados independe do limite de FPS do launcher.
+        // Campos normalizados na rasterizacao continuam elegiveis abaixo.
+        // PS2_FIELDLOCK=0 permite desativar a protecao em testes A/B.
+        static const bool fieldlock = [] {
+            const char* value = std::getenv("PS2_FIELDLOCK");
+            return !value || value[0] != '0';
+        }();
         // Teste K: reconstrucao APENAS ESPACIAL, com linhas da MESMA imagem.
         // A reconstrucao usa apenas pixels da imagem atual. O ajuste opcional
         // abaixo usa g_half_vote para alinhar a imagem ja reconstruida.
@@ -7715,6 +10156,17 @@ namespace
             d.dbx == 0u && d.dby == 0u && (d.fbp == 0u || d.fbp == 2240u) &&
             raster_state.shifted != 0 && (raster_state.unknown == 0 || train_zero_pair) &&
             (raster_state.base == 0 || raster_state.shifted_train);
+        // No framebuffer entrelacado conhecido, uma troca nova identifica
+        // a imagem concluida. Reprocessar a mesma troca repete os pixels e
+        // compete com a renderizacao do proximo campo sem melhorar o movimento.
+        if (flip_pacing && pacing.published && flip != 0 && flip == pacing.last_flip &&
+            !capture_pending && spatial_active && g_gs_crt_int && g_gs_crt_ffmd &&
+            d.w == 640u && d.h == 448u && d.fbw == 10u && d.psm == 0u &&
+            d.dbx == 0u && d.dby == 0u && (d.fbp == 0u || d.fbp == 2240u))
+        {
+            if (g_perf_gs) ++g_present_profile.unchanged;
+            return;
+        }
         FieldFlipAudit* audit = nullptr;
         if (g_field_audit && flip != 0)
         {
@@ -7743,7 +10195,7 @@ namespace
         // Mede o trabalho de apresentacao a partir daqui. A espera para
         // drenar comandos do GS nao deve prolongar o prazo entre quadros.
         const auto work_start = clk::now();
-        const uint64_t prof_t0 = prof_now();
+        const uint64_t prof_t0 = g_perf ? prof_now() : 0;
         // O swap devolve o buffer anterior para a proxima apresentacao.
         static std::vector<uint32_t> pix;
         pix.resize((size_t)d.w * d.h);
@@ -7818,7 +10270,16 @@ namespace
                     continue;
                 }
                 const uint32_t* b = &source[(size_t)(row + 1u) * d.w];
-                for (uint32_t x = 0; x < d.w; ++x)
+                uint32_t x = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+                if (scanout_fast && d.w)
+                {
+                    out[0] = avg_rgb(a[0], b[0]);
+                    x = 1;
+                    diagonals += gs_spatial_row_sse2(out, a, b, d.w, x);
+                }
+#endif
+                for (; x < d.w; ++x)
                 {
                     const int vertical = color_delta(a[x], b[x]);
                     uint32_t top = a[x], bottom = b[x];
@@ -8025,6 +10486,11 @@ namespace
             if (g_perf_gs) ++g_present_profile.aligned;
         }
 
+        // Suavize a cena antes de compor o texto nativo. Os glifos ja
+        // receberam seu proprio filtro de cobertura, preservando o contorno.
+        if (ps2_settings().text_aa)
+            gs_aa_apply_s(pix, int(d.w), int(d.h), 24.0f, 2.0f, 0.45f, nullptr);
+
         // Teste P: compoe o TEXTO da propria imagem/FBP sobre o resultado
         // de 640x448. Nao faz weave e nao altera o FIELDLOCK do teste L.
         // O blend GS ALPHA=0x44 e (fonte-destino)*alfa/128+destino.
@@ -8036,10 +10502,10 @@ namespace
             {
                 std::lock_guard<std::mutex> lk(g_ui_native_mu);
                 for (const UiGlyphP& glyph : g_ui_native_glyphs)
-                    if (glyph.fbp == d.fbp &&
-                        (unsigned)(g_gs_vsyncs - glyph.vsync) <= 60u)
+                    if (glyph.fbp == d.fbp)
                         glyphs.push_back(glyph);
             }
+            gs_ui_text_background(pix, int(d.w), int(d.h), glyphs, ps2_settings().text_style);
             for (const UiGlyphP& glyph : glyphs)
                 for (int gy = 0; gy < glyph.h; ++gy)
                 {
@@ -8064,23 +10530,6 @@ namespace
                         dst = (uint32_t)((nr << 16) | (ng << 8) | nb);
                     }
                 }
-            // Teste S (letras): alternativa independente, opcional e restrita
-            // aos retangulos dos quatro sprites do atlas P/R ja compostos.
-            // Aplicar APOS a composicao evita misturar novamente as linhas
-            // do glifo como acontecia com o filtro vertical do teste O.
-            static const char* edgeaa_ui = std::getenv("PS2_GS_UI_EDGEAA");
-            if (edgeaa_ui != nullptr && edgeaa_ui[0] != '0' && !glyphs.empty())
-            {
-                const uint64_t start = prof_now();
-                const uint32_t changed = gs_aa_apply_s(pix, (int)d.w, (int)d.h,
-                    20.0f, 1.5f, 0.25f, &glyphs);
-                static unsigned reports_ui = 0;
-                if (reports_ui++ < 8u)
-                    std::fprintf(stderr,
-                        "  [GS AA S] letras=1 glifos=%zu alterados=%u tempo=%llu ms\n",
-                        glyphs.size(), changed,
-                        (unsigned long long)((prof_now() - start) / 1000000u));
-            }
             static unsigned reported_p = 0;
             if (!glyphs.empty() && reported_p++ < 10u)
                 std::fprintf(stderr,
@@ -8120,9 +10569,9 @@ namespace
             if (early)
                 ++g_present_profile.early_flip;
         }
-        g_prof_present_ns += prof_now() - prof_t0;
+        if (g_perf) g_prof_present_ns += prof_now() - prof_t0;
         static const bool legacy_pacing = std::getenv("PS2_GS_LEGACY_PACING") != nullptr;
-        pacing.did_publish(work_start, clk::now(), flip, legacy_pacing);
+        pacing.did_publish(t0, work_start, clk::now(), flip, legacy_pacing);
     }
 
     static void gs_save_bmp(const char* name, const std::vector<uint32_t>& pixels,
@@ -8236,7 +10685,7 @@ namespace
     // Assim o rasterizador roda em paralelo com o codigo do jogo e do VU1 em vez de em serie com ele.
     // Estado do GS (g_st, VRAM, cache de CLUT) so e tocado pela thread do GS; a fila e SPSC (um produtor, um consumidor).
     // ---------------------------------------------------------------------------------------------
-    struct GsCmd { uint64_t a, b; uint32_t kind, reg; };   // kind: 0 = registrador, 1 = qword de imagem, 2 = registrador privilegiado
+    struct GsCmd { uint64_t a, b; uint32_t kind, reg; };   // kind: 0 register, 1 image, 2 privileged register, 3 ring HUD snapshot
 
     constexpr uint32_t kGsQSize = 1u << 18;
     GsCmd g_gsq[kGsQSize];
@@ -8250,14 +10699,14 @@ namespace
 
     static const bool g_gsq_start_fast = [] {
         const char* value = std::getenv("PS2_GS_START_FAST");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     // Assim como write_head, esta marca pertence ao produtor da fila.
     static bool g_gsq_started = false;
 
     static const bool g_gsq_batch = [] {
         const char* value = std::getenv("PS2_GS_QUEUE_BATCH");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     // Reutiliza os cursores do produtor mesmo sem publicar em lotes.
     static const bool g_gsq_local_cursor = [] {
@@ -8378,6 +10827,7 @@ namespace
     // registrador privilegiado do GS (PMODE, DISPFB1/2, DISPLAY1/2...): diz qual area e exibida
     void gs_priv_apply(uint32_t phys, uint64_t value, unsigned csr_field)
     {
+        gs_vk_flush();
         uint64_t& reg = g_gs_priv[(phys - 0x12000000u) >> 3];
         if ((phys == 0x12000070u || phys == 0x12000090u) && gs_changed_fbp(value, reg))
         {
@@ -8409,16 +10859,249 @@ namespace
             g_half_vote[previous] = 0.0f;
             if (g_field_audit) g_field_evidence[previous] = {};
             if (g_field_raster) g_field_raster_state[previous] = {};
+            // Trocar DISPFB nao apaga a imagem na VRAM. O jogo pode alternar
+            // os mesmos buffers varias vezes sem enviar nenhum desenho.
+            // Preserve tambem seus glifos; gs_ui_on_sprite os descarta quando
+            // a limpeza opaca inicia o redesenho real daquele framebuffer.
         }
 
         reg = value;
     }
 
-    void gs_exec(const GsCmd& c)
+    // Captura nativa a partir de uma troca do DISPFB ativo. O formato
+    // v1 usa a ABI da mesma build, inclusive para o estado parcial da primitiva e da transferencia do GS.
+    struct GsReplayHeader
+    {
+        char magic[8] = {'R', 'O', 'J', 'G', 'S', '1', 'X', '\0'};
+        uint32_t version = 1;
+        uint32_t state_size = sizeof(GsState);
+        uint32_t command_size = sizeof(GsCmd);
+        uint32_t vram_size = sizeof(g_vram);
+        uint32_t command_count = 0;
+        uint32_t crt_int = 0, crt_ffmd = 0;
+        uint32_t reserved = 0;
+    };
+    static_assert(sizeof(GsReplayHeader) == 40 && sizeof(GsCmd) == 24);
+    constexpr size_t kGsReplayMaxCommands = 1u << 20;
+    constexpr unsigned kGsReplayMinTriangles = 256;
+    constexpr unsigned kGsReplayMaxFlips = 120;
+
+    struct GsReplayCapture
+    {
+        GsReplayHeader header;
+        GsState initial_state;
+        uint64_t initial_priv[0x100 / 8];
+        std::vector<uint32_t> initial_vram;
+        std::vector<GsCmd> commands;
+        unsigned flips = 0;
+    };
+
+    // So o executor dos comandos do GS toca neste objeto (worker ou EE).
+    static std::unique_ptr<GsReplayCapture> g_gs_replay_capture;
+
+    static void gs_save_replay(const GsReplayCapture& capture)
+    {
+        const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+        const std::string name = "gs_vulkan_1x_" + std::to_string(stamp) + ".bin";
+        const std::string pending = name + ".tmp";
+        FILE* file = std::fopen(pending.c_str(), "wb");
+        if (!file)
+        {
+            std::fprintf(stderr, "  [GS Vulkan 1x] nao foi possivel criar %s\n", pending.c_str());
+            return;
+        }
+
+        auto write = [file](const void* data, size_t bytes)
+        {
+            return std::fwrite(data, 1, bytes, file) == bytes;
+        };
+        const bool written = write(&capture.header, sizeof(capture.header)) &&
+            write(&capture.initial_state, sizeof(capture.initial_state)) &&
+            write(capture.initial_priv, sizeof(capture.initial_priv)) &&
+            write(capture.initial_vram.data(), sizeof(g_vram)) &&
+            write(capture.commands.data(), capture.commands.size() * sizeof(GsCmd)) &&
+            write(g_vram, sizeof(g_vram));
+        const bool closed = std::fclose(file) == 0;
+        if (!written || !closed || std::rename(pending.c_str(), name.c_str()) != 0)
+        {
+            std::remove(pending.c_str());
+            std::fprintf(stderr, "  [GS Vulkan 1x] falha ao gravar %s\n", name.c_str());
+            return;
+        }
+
+        std::fprintf(stderr, "  [GS Vulkan 1x] captura concluida: %s (%u comandos, %u triangulos, %u trocas)\n",
+            name.c_str(), (unsigned)capture.header.command_count, g_gs_replay_triangles, capture.flips);
+    }
+
+    inline void gs_apply_command(const GsCmd& c)
     {
         if (c.kind == 0) gs_core_write(c.reg, c.a);
         else if (c.kind == 1) gs_core_image(c.a, c.b);
+        else if (c.kind == 3) gs_ring_hud(c.a, c.b, c.reg);
         else gs_priv_apply(c.reg, c.a, (unsigned)c.b);
+    }
+
+    static void gs_exec_capture(const GsCmd& c)
+    {
+        const bool flip = c.kind == 2 && c.reg == gs_active_dispfb(g_gs_priv[0]) &&
+            gs_changed_fbp(c.a, g_gs_priv[(c.reg - 0x12000000u) >> 3]);
+
+        if (g_gs_replay_capture)
+        {
+            auto& capture = *g_gs_replay_capture;
+            if (capture.commands.size() == kGsReplayMaxCommands)
+            {
+                std::fprintf(stderr, "  [GS Vulkan 1x] limite da captura atingido. Pressione F9 para tentar novamente.\n");
+                g_gs_replay_capture.reset();
+                gs_apply_command(c);
+                return;
+            }
+
+            capture.commands.push_back(c);
+            gs_apply_command(c);
+            if (!flip)
+                return;
+
+            // O jogo tambem troca DISPFB entre intervalos que so escrevem
+            // registradores. Mantem a sequencia ate haver rasterizacao util.
+            ++capture.flips;
+            if (capture.header.crt_int != g_gs_crt_int || capture.header.crt_ffmd != g_gs_crt_ffmd)
+                std::fprintf(stderr, "  [GS Vulkan 1x] modo do CRT mudou. Pressione F9 em uma cena estavel.\n");
+            else if (g_gs_replay_triangles >= kGsReplayMinTriangles ||
+                (capture.flips == kGsReplayMaxFlips && g_gs_replay_triangles != 0))
+            {
+                capture.header.command_count = (uint32_t)capture.commands.size();
+                gs_save_replay(capture);
+            }
+            else if (capture.flips == kGsReplayMaxFlips)
+                std::fprintf(stderr, "  [GS Vulkan 1x] nenhum triangulo em %u trocas. Pressione F9 durante o efeito.\n",
+                    capture.flips);
+            else
+                return;
+
+            g_gs_replay_capture.reset();
+            return;
+        }
+
+        gs_apply_command(c);
+        if (flip && g_gs_replay_request.exchange(false))
+        {
+            try
+            {
+                auto capture = std::make_unique<GsReplayCapture>();
+                capture->commands.reserve(kGsReplayMaxCommands);
+                capture->initial_state = g_st;
+                std::memcpy(capture->initial_priv, g_gs_priv, sizeof(g_gs_priv));
+                capture->initial_vram.assign(g_vram, g_vram + sizeof(g_vram) / sizeof(g_vram[0]));
+                capture->header.crt_int = g_gs_crt_int;
+                capture->header.crt_ffmd = g_gs_crt_ffmd;
+                g_gs_replay_triangles = 0;
+                g_gs_replay_capture = std::move(capture);
+                std::fprintf(stderr, "  [GS Vulkan 1x] captura iniciada. Aguardando triangulos...\n");
+            }
+            catch (const std::bad_alloc&)
+            {
+                std::fprintf(stderr, "  [GS Vulkan 1x] memoria insuficiente para a captura\n");
+            }
+        }
+    }
+
+    inline void gs_exec(const GsCmd& c)
+    {
+        if (g_gs_replay_capture_enabled) gs_exec_capture(c);
+        else gs_apply_command(c);
+    }
+
+    // Roda a CPU em um processo separado, antes de iniciar EE, audio e janela.
+    // A medida cobre o lote de comandos, sem leitura do arquivo nem comparacao.
+    int gs_replay_cpu_1x(const char* path)
+    {
+        auto close = [](FILE* stream) { std::fclose(stream); };
+        std::unique_ptr<FILE, decltype(close)> file(std::fopen(path, "rb"), close);
+        auto read = [&](void* data, size_t bytes)
+        {
+            return file && std::fread(data, 1, bytes, file.get()) == bytes;
+        };
+        GsReplayHeader header;
+        const GsReplayHeader expected;
+        if (!read(&header, sizeof(header)) || std::memcmp(header.magic, expected.magic, 8) != 0 ||
+            header.version != expected.version || header.state_size != sizeof(GsState) ||
+            header.command_size != sizeof(GsCmd) || header.vram_size != sizeof(g_vram) ||
+            header.command_count == 0 || header.command_count > kGsReplayMaxCommands ||
+            header.crt_int > 1 || header.crt_ffmd > 1 || header.reserved != 0)
+        {
+            std::fprintf(stderr, "  [GS Vulkan 1x] cabecalho invalido ou captura de outra build: %s\n", path);
+            return 2;
+        }
+
+        std::vector<GsCmd> commands(header.command_count);
+        std::vector<uint32_t> reference(sizeof(g_vram) / sizeof(g_vram[0]));
+        if (!read(&g_st, sizeof(g_st)) || !read(g_gs_priv, sizeof(g_gs_priv)) ||
+            !read(g_vram, sizeof(g_vram)) || !read(commands.data(), commands.size() * sizeof(GsCmd)) ||
+            !read(reference.data(), sizeof(g_vram)) || std::fgetc(file.get()) != EOF ||
+            std::ferror(file.get()))
+        {
+            std::fprintf(stderr, "  [GS Vulkan 1x] tamanho inesperado da captura: %s\n", path);
+            return 2;
+        }
+        for (const auto& command : commands)
+        {
+            const bool valid = (command.kind == 0 && command.reg <= 0xFFu) ||
+                (command.kind == 1 && command.reg == 0) ||
+                (command.kind == 3 && command.reg <= 128u) ||
+                (command.kind == 2 && command.reg >= 0x12000000u &&
+                    command.reg < 0x12000100u && (command.reg & 7u) == 0);
+            if (!valid)
+            {
+                std::fprintf(stderr, "  [GS Vulkan 1x] comando invalido na captura\n");
+                return 2;
+            }
+        }
+
+        g_gs_crt_int = header.crt_int;
+        g_gs_crt_ffmd = header.crt_ffmd;
+        gs_init_tables();
+#ifdef _WIN32
+        if (gs_vk_requested()) g_vk_device.ready();
+#endif
+        const int repeat = std::clamp(std::getenv("PS2_GS_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2_GS_REPLAY_REPEAT")) : 1, 1, 60);
+        const GsState initialState = g_st;
+        uint64_t initialPriv[0x100 / 8]; std::memcpy(initialPriv, g_gs_priv, sizeof(initialPriv));
+        const std::vector<uint32_t> initialMemory(std::begin(g_vram), std::end(g_vram));
+        bool failed = false;
+        for (int iteration = 0; iteration < repeat; ++iteration)
+        {
+        if (iteration != 0) {
+            g_st = initialState;
+            std::memcpy(g_gs_priv, initialPriv, sizeof(initialPriv));
+            std::memcpy(g_vram, initialMemory.data(), sizeof(g_vram));
+            std::fill(std::begin(g_clut_prov), std::end(g_clut_prov), 0u);
+            g_ui_native_glyphs.clear();
+        }
+        const uint64_t start = prof_now();
+        for (const auto& command : commands)
+            gs_apply_command(command);
+        gs_vk_flush();
+        const double ms = (prof_now() - start) / 1e6;
+#ifdef _WIN32
+        std::fprintf(stderr, "  [Vulkan] lotes=%llu triangulos_GPU=%llu triangulos_CPU=%llu preparo_ms=%.3f\n",
+            (unsigned long long)g_vk_batches, (unsigned long long)g_vk_rendered, (unsigned long long)g_vk_cpu, g_vk_prepare_ns / 1e6);
+#endif
+
+        size_t differences = 0, first = 0;
+        for (size_t i = 0; i < reference.size(); ++i)
+        {
+            if (g_vram[i] != reference[i] && differences++ == 0)
+                first = i;
+        }
+        if (differences)
+            std::fprintf(stderr, "  [GS Vulkan 1x] primeira divergencia: VRAM+0x%06X: CPU=%08X esperado=%08X\n",
+                (unsigned)(first * sizeof(uint32_t)), (unsigned)g_vram[first], (unsigned)reference[first]);
+        std::fprintf(stderr, "  [GS Vulkan 1x] replay CPU: comandos=%u, tempo_ms=%.3f, palavras_VRAM_diferentes=%zu\n",
+            (unsigned)header.command_count, ms, differences);
+        failed |= differences != 0;
+        }
+        return failed ? 1 : 0;
     }
 
     void gs_worker_main()
@@ -8570,6 +11253,7 @@ namespace
         gs_q_flush_batch();
         while (!gs_q_idle())
             std::this_thread::yield();
+        gs_vk_flush();
     }
 
     uint32_t dma_addr(uint32_t a); // implementada na secao DMA, mais abaixo.
@@ -8680,7 +11364,7 @@ namespace
         g_gs.reg[reg]++;
 
         if (g_gs_async) gs_q_push(0, reg, data, 0);
-        else gs_core_write(reg, data);
+        else gs_exec({ data, 0, 0, reg });
 
         if (reg == 0x00)
             g_gs.prim[data & 7]++;
@@ -8739,7 +11423,7 @@ namespace
                 const uint64_t start = sampled ? prof_now() : 0;
 
                 if (g_gs_async) gs_q_push(1, 0, lo, hi);
-                else gs_core_image(lo, hi);
+                else gs_exec({ lo, hi, 1, 0 });
 
                 if (sampled)
                 {
@@ -8866,11 +11550,11 @@ namespace
     };
     static const bool g_vif1_direct_qword = [] {
         const char* value = std::getenv("PS2_VIF1_DIRECT_QWORD");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     static const bool g_vif1_direct_run = [] {
         const char* value = std::getenv("PS2_VIF1_DIRECT_RUN");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     static uint64_t g_vif1_direct_runs = 0;
     static uint64_t g_vif1_direct_fast_qwords = 0;
@@ -8878,7 +11562,7 @@ namespace
     const bool g_dma_probe = std::getenv("PS2_DMA_PROBE") != nullptr;
     const bool g_vif1_tag_nop_fast = [] {
         const char* value = std::getenv("PS2_VIF1_TAG_NOP_FAST");
-        return value && std::strcmp(value, "1") == 0;
+        return !value || std::strcmp(value, "1") == 0;
     }();
     uint64_t g_vif1_tag_nop_pairs = 0;
 
@@ -9304,7 +11988,7 @@ namespace
 
                     if (wl0_fix)
                     {
-                        // Não cria uma transferencia UNPACK nem consome as
+                        // NÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o cria uma transferencia UNPACK nem consome as
                         // proximas palavras como payload; o proximo word()
                         // podera interpretar corretamente o VIFcode seguinte.
                         return;
@@ -9754,7 +12438,7 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
         // Carrega o FIELD visto pelo EE junto com a escrita para o GS assincrono.
         const unsigned csr_field = g_field_audit ? g_gs_field : 0u;
         if (g_gs_async) gs_q_push(2, phys, value, csr_field);
-        else gs_priv_apply(phys, value, csr_field);
+        else gs_exec({ value, csr_field, 2, phys });
 
         return;
     }
@@ -9795,9 +12479,9 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
 
                 if (ch == 0)
                 {
-                    const uint64_t pt0 = prof_now();
+                    const uint64_t pt0 = g_perf ? prof_now() : 0;
                     dma_walk(c, 0, (uint32_t)value);   // VIF0: micro codigo e dados do VU0, sem GS
-                    g_prof_dma_ns += prof_now() - pt0;
+                    if (g_perf) g_prof_dma_ns += prof_now() - pt0;
                     break;
                 }
 
@@ -9806,10 +12490,10 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
                 g_trace_degen = 0;
                 unsigned long draws_before = g_trace_draws;
                 uint64_t unsupported_before = g_st.unsupported;
-                const uint64_t pt0 = prof_now();
+                const uint64_t pt0 = g_perf ? prof_now() : 0;
                 dma_walk(c, ch, (uint32_t)value);
                 gs_q_flush_batch();
-                const uint64_t elapsed = prof_now() - pt0;
+                const uint64_t elapsed = g_perf ? prof_now() - pt0 : 0;
                 g_prof_dma_ns += elapsed;
                 if (g_perf_cadence)
                 {
@@ -9822,6 +12506,23 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
             break;
         default: break;
     }
+}
+
+void ps2_ring_hud(Ctx& c, uint32_t object)
+{
+    const uint32_t address = ee_phys(object);
+    if (!c.mem || !address || address > 0x02000000u - 0xBA0u) return;
+    // BtlStat::SetVal / DspCircle: current HP, MP, SP alternate with maxima.
+    // No guest memory writes and no additional guest function calls.
+    const uint64_t values = uint64_t(mrd<uint16_t>(c, address+0xB66u)) |
+        (uint64_t(mrd<uint16_t>(c,address+0xB6Au)) << 16) |
+        (uint64_t(mrd<uint16_t>(c,address+0xB6Eu)) << 32);
+    const uint64_t position = uint64_t(mrd<uint16_t>(c,address+0xB62u)) |
+        (uint64_t(mrd<uint16_t>(c,address+0xB64u)) << 16);
+    const uint32_t alpha = (mrd<uint8_t>(c,address+0xB60u) & 16u)
+        ? std::min(128u,unsigned(mrd<uint8_t>(c,address+0xB78u))) : 0u;
+    if (g_gs_async) gs_q_push(3,alpha,values,position);
+    else { std::lock_guard<std::mutex> lock(g_gs_mu); gs_exec(GsCmd{values,position,3,alpha}); }
 }
 
 // Imprime o ranking pelo tempo de interpretacao, com o tempo do GIF em coluna propria.
@@ -10029,15 +12730,15 @@ static void gs_prof_report()
         {
             if (last_wall != 0)
             {
-                std::fprintf(stderr, "  [prof GS] tri_early_z=%u tri_ms=%.3f sprite_ms=%.3f tri_texture_specialize=%u tri_effects_fast=%u\n",
+                std::fprintf(stderr, "  [prof GS] tri_early_z=%u tri_ms=%.3f sprite_ms=%.3f tri_texture_specialize=%u tri_effects_fast=%u tri_rgba_sse2=%u tri_row_fast=%u\n",
                     (unsigned)g_gs_tri_early_z, (tri - last_tri) / 1e6,
-                    (sprite - last_sprite) / 1e6, (unsigned)g_gs_tri_texture_specialize, (unsigned)g_gs_tri_effects_fast);
+                    (sprite - last_sprite) / 1e6, (unsigned)g_gs_tri_texture_specialize, (unsigned)g_gs_tri_effects_fast, (unsigned)g_gs_tri_rgba_sse2, (unsigned)g_gs_tri_row_fast);
                 std::fprintf(stderr,
-                    "  [prof janela] publicados=%u pacing=%u display_invalido=%u fieldlock=%u publicados_sem_nova_troca=%u campos_alinhados=%u adiantados_por_troca=%u fila_adiados=%u fila_espera_ms=%.3f\n",
+                    "  [prof janela] publicados=%u pacing=%u display_invalido=%u fieldlock=%u publicados_sem_nova_troca=%u campos_alinhados=%u adiantados_por_troca=%u fila_adiados=%u fila_espera_ms=%.3f sem_troca_ignorados=%u\n",
                     presented - last_presented, g_present_profile.pacing, g_present_profile.invalid,
                     g_present_profile.fieldlock, g_present_profile.same_flip, g_present_profile.aligned,
                     g_present_profile.early_flip, g_present_profile.queue_skips,
-                    g_present_profile.queue_wait_ns / 1e6);
+                    g_present_profile.queue_wait_ns / 1e6, g_present_profile.unchanged);
                 std::fprintf(stderr,
                     "  [prof campo raster] ativo=%u campos=%u vertices_sprite=%llu vertices_tri=%llu bloqueios_fase_mista=%u bloqueios_OFY_desconhecido=%u trem_ativo=%u campos_trem=%u recuperados_ofy_zero=%u\n",
                     (unsigned)g_field_raster, g_present_profile.raster_fields,
@@ -10047,15 +12748,18 @@ static void gs_prof_report()
                     (unsigned)(g_field_raster && g_field_raster_train), g_present_profile.raster_train,
                     g_present_profile.raster_train_zero);
             }
-            static uint64_t last_fast_pixels = 0, last_generic_pixels = 0;
+            static uint64_t last_fast_pixels = 0, last_generic_pixels = 0, last_z16_pixels = 0;
             const uint64_t fast_pixels = g_prof_sprite_fast_pixels.load(std::memory_order_relaxed);
             const uint64_t generic_pixels = g_prof_sprite_generic_pixels.load(std::memory_order_relaxed);
+            const uint64_t z16_pixels = g_prof_sprite_z16_pixels.load(std::memory_order_relaxed);
             if (last_wall != 0)
-                std::fprintf(stderr, "  [prof sprites] colunas=%u pixels_fast=%llu pixels_generico=%llu generico_linhas=%u wide_fast=%u\n",
+                std::fprintf(stderr, "  [prof sprites] colunas=%u pixels_fast=%llu pixels_generico=%llu generico_linhas=%u wide_fast=%u z16_early=%u pixels_z16=%llu\n",
                     (unsigned)g_sprite_columns, (unsigned long long)(fast_pixels - last_fast_pixels),
-                    (unsigned long long)(generic_pixels - last_generic_pixels), (unsigned)g_sprite_generic_rows, (unsigned)g_sprite_wide_fast);
+                    (unsigned long long)(generic_pixels - last_generic_pixels), (unsigned)g_sprite_generic_rows,
+                    (unsigned)g_sprite_wide_fast, (unsigned)g_sprite_z16_early, (unsigned long long)(z16_pixels - last_z16_pixels));
             last_fast_pixels = fast_pixels;
             last_generic_pixels = generic_pixels;
+            last_z16_pixels = z16_pixels;
             g_present_profile = {};
             if (g_field_train_diag && g_field_train_sample.raster.unknown != 0)
             {
@@ -10119,9 +12823,9 @@ static void gs_prof_report()
             last_dma_delivered = g_timer0_dma_delivered;
             static uint64_t last_recovered = 0;
             if (g_timer0_elapsed)
-                std::fprintf(stderr, "  [prof timer0 relogio] ticks_recuperados=%llu\n",
-                    (unsigned long long)(g_timer0_sys_ticks_recovered - last_recovered));
-            last_recovered = g_timer0_sys_ticks_recovered;
+                std::fprintf(stderr, "  [prof timer0 relogio] ticks_reexecutados=%llu\n",
+                    (unsigned long long)(g_timer0_ticks_replayed - last_recovered));
+            last_recovered = g_timer0_ticks_replayed;
         }
 
         if (g_timer0_trace_stages)
@@ -10252,7 +12956,8 @@ void ps2_gs_vsync()
         }
     }
 
-    static const bool g_perf_on = g_perf;
+    static const bool g_perf_on = g_perf || g_giflog || g_field_train_diag ||
+        g_timer0_trace_stages || g_field_clock_trace || g_move_callback_trace;
 
     if (g_perf_on && g_gs_vsyncs % 120u == 0)
     {
@@ -10658,17 +13363,8 @@ static void um_arith_aot(Ctx& c, int dest, int fd, int fs, int ft, int to_acc, b
     um_arith_aot<op, src>(c, dest, fd, fs, ft, to_acc, optimize)
 #endif
 
-// O include e gerado pelo proprio runtime com microcodigo carregado pelo jogo.
-#if __has_include("ps2_vu1_aot_0350.inc")
-#include "ps2_vu1_aot_0350.inc"
-#endif
-#if __has_include("ps2_vu1_aot_0078.inc")
-#include "ps2_vu1_aot_0078.inc"
-#endif
-
-#if __has_include("ps2_vu1_aot_0658.inc")
-#include "ps2_vu1_aot_0658.inc"
-#endif
+// Rotinas VU1 integradas pelo recompilador, sem includes externos.
+/* SH_EMBEDDED_VU1_PROGRAMS */
 
 #if defined(PS2_VU1_AOT_SPECIALIZE)
 #undef um_arith
@@ -10698,21 +13394,9 @@ static VuAotSelection vu_aot_match(const VuUnit& u, int target)
         return {};
 
     static const VuAotProgram* const programs[] = {
-#if __has_include("ps2_vu1_aot_0350.inc")
         &vu_aot_0350,
-#else
-        nullptr,
-#endif
-#if __has_include("ps2_vu1_aot_0078.inc")
         &vu_aot_0078,
-#else
-        nullptr,
-#endif
-#if __has_include("ps2_vu1_aot_0658.inc")
         &vu_aot_0658,
-#else
-        nullptr,
-#endif
     };
     const VuAotProgram* program = programs[target];
     if (program == nullptr)
@@ -11477,11 +14161,11 @@ void vu0_run(Ctx& c, uint32_t byte_addr)
     if (g_vu0_dirty) { g_vu0_flags = um_scan_flag_readers(g_vu0_micro, 512); g_vu0_dirty = false; }
 
     g_um_flags = g_vu0_flags;
-    const uint64_t pt0 = prof_now();
+    const uint64_t pt0 = g_perf ? prof_now() : 0;
     VuUnit u = { &c, g_vu0_micro, g_vu0_data, 0x1FFu, 0xFFu, false, g_vu0_pc };
     vu_run(u, byte_addr);
     g_vu0_pc = u.pc;
-    g_prof_vu_ns += prof_now() - pt0;
+    if (g_perf) g_prof_vu_ns += prof_now() - pt0;
 }
 
 void vu1_run(uint32_t byte_addr)
@@ -11514,12 +14198,12 @@ void vu1_run(uint32_t byte_addr)
         }
     }
 
-    const uint64_t pt0 = prof_now();
+    const uint64_t pt0 = g_perf ? prof_now() : 0;
     const uint64_t kick_before = g_prof_kick_ns;
     VuUnit u = { &g_vu1_regs, g_vu1_micro, g_vu1_data, 0x7FFu, 0x3FFu, true, g_vu1_pc };
     const unsigned pairs = vu_run(u, byte_addr);
     g_vu1_pc = u.pc;
-    const uint64_t elapsed = prof_now() - pt0;
+    const uint64_t elapsed = g_perf ? prof_now() - pt0 : 0;
     g_prof_vu_ns += elapsed;
     if (g_perf_vif1)
     {
@@ -11639,29 +14323,6 @@ static void irq_debug_print()
 
 // Chama os handlers da causa com uma copia do contexto e uma pilha propria; o contexto da thread
 // interrompida nao e alterado.
-// SysTool::GetTimer le o contador +0x18 desse CTimer passivo.
-static void timer0_restore_sys_ticks(Ctx& c, uint32_t extra)
-{
-    constexpr uint32_t sys_timer_gp_offset = 0xFFFF85D0u;
-    const uint32_t gp_slot = ee_phys((uint32_t)c.r[28].lo + sys_timer_gp_offset);
-    if (!c.mem || gp_slot > (32u << 20) - 4u)
-        return;
-
-    const uint32_t timer = ee_phys(mrd<uint32_t>(c, gp_slot));
-    if (timer == 0 || timer > (32u << 20) - 0x1Cu)
-        return;
-
-    // O relogio e passivo (tipo 0), usa Timer 0 (fonte 2) e respeita pausa.
-    if (mrd<uint8_t>(c, timer + 4u) != 0 ||
-        mrd<uint8_t>(c, timer + 5u) != 2 ||
-        (mrd<uint8_t>(c, timer + 8u) & 9u) != 9u)
-        return;
-
-    const uint32_t ticks = mrd<uint32_t>(c, timer + 0x18u);
-    mwr<uint32_t>(c, timer + 0x18u, ticks + extra);
-    g_timer0_sys_ticks_recovered += extra;
-}
-
 static void irq_deliver_cause(Ctx& c, uint32_t cause, uint32_t timer_events = 1)
 {
     const Timer0StageScope timer0_stage(cause == 2 ? Timer0EeStage::Vblank : Timer0EeStage::Timer0);
@@ -11727,14 +14388,19 @@ static void irq_deliver_cause(Ctx& c, uint32_t cause, uint32_t timer_events = 1)
         if (list[i].cause != cause)
             continue;
 
-        Ctx irq = c;
-        irq.r[29].lo = 0x01FF0000u - 0x10u;   // pilha propria da interrupcao (topo da RAM)
-        irq.r[4].lo = cause;
-        irq.r[5].lo = list[i].arg;
-        irq.r[6].lo = 0;
-        if (cause == 9 && list[i].fn == 0x0022E470u && timer_events > 1)
-            timer0_restore_sys_ticks(irq, timer_events - 1);
-        ps2_call(irq, list[i].fn);
+        // TimerWatcher0 atualiza os temporizadores de 1 ms e seu divisor de 17
+        // ticks. Cada periodo pendente precisa percorrer o mesmo caminho.
+        const uint32_t deliveries = cause == 9 && list[i].fn == 0x0022E470u ? timer_events : 1u;
+        g_timer0_ticks_replayed += deliveries - 1;
+        for (uint32_t tick = 0; tick < deliveries; ++tick)
+        {
+            Ctx irq = c;
+            irq.r[29].lo = 0x01FF0000u - 0x10u;
+            irq.r[4].lo = cause;
+            irq.r[5].lo = list[i].arg;
+            irq.r[6].lo = 0;
+            ps2_call(irq, list[i].fn);
+        }
     }
 }
 
@@ -11850,6 +14516,459 @@ void ps2_mtc0(Ctx&, int, uint32_t) {}
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <mmsystem.h>
+#include <mfplay.h>
+
+static std::filesystem::path ps2_windows_executable_path()
+{
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, &path[0], DWORD(path.size()));
+    if (!length || length >= path.size())
+        return {};
+    path.resize(length);
+    return std::filesystem::path(path);
+}
+
+const roj::Settings& ps2_settings()
+{
+    static const auto settings = roj::read_settings(
+        ps2_windows_executable_path().parent_path() / L"RingOfJudgment.ini");
+    return settings;
+}
+
+static bool ps2_windows_replace_file(const std::filesystem::path& source, const std::filesystem::path& target)
+{
+    return MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+static double ps2_presentation_aspect()
+{
+    if (const char* value = std::getenv("PS2_ASPECT"))
+    {
+        if (std::strcmp(value,"4:3") == 0) return 4.0/3.0;
+        if (std::strcmp(value,"16:9") == 0) return 16.0/9.0;
+        if (std::strcmp(value,"21:9") == 0) return 21.0/9.0;
+        if (std::strcmp(value,"stretch") == 0) return 0;
+    }
+    return roj::aspect_ratio(ps2_settings().aspect);
+}
+
+static std::wstring g_display_device;
+static DEVMODEW g_display_mode{};
+static bool g_display_exclusive = false, g_display_applied = false;
+
+static void ps2_restore_display()
+{
+    if (!g_display_applied) return;
+    g_display_applied = false;
+    ChangeDisplaySettingsExW(g_display_device.c_str(),nullptr,nullptr,0,nullptr);
+}
+
+static void ps2_activate_display(HWND window, bool active)
+{
+    if (!g_display_exclusive) return;
+    if (!active)
+        ps2_restore_display();
+    else if (!g_display_applied)
+    {
+        g_display_applied = ChangeDisplaySettingsExW(g_display_device.c_str(),&g_display_mode,
+            nullptr,CDS_FULLSCREEN,nullptr) == DISP_CHANGE_SUCCESSFUL;
+        MONITORINFO monitor{sizeof monitor};
+        GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&monitor);
+        const RECT rect = monitor.rcMonitor;
+        SetWindowPos(window,HWND_TOP,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,
+            SWP_NOACTIVATE);
+    }
+}
+
+static HWND ps2_create_game_window(HINSTANCE instance)
+{
+    SetProcessDPIAware();
+    const auto& settings = ps2_settings();
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const HMONITOR monitor = MonitorFromPoint(cursor,MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof info;
+    GetMonitorInfoW(monitor,reinterpret_cast<MONITORINFO*>(&info));
+    g_display_device = info.szDevice;
+    if (settings.window_mode == 1)
+    {
+        g_display_mode.dmSize = sizeof g_display_mode;
+        g_display_mode.dmPelsWidth = settings.width;
+        g_display_mode.dmPelsHeight = settings.height;
+        g_display_mode.dmBitsPerPel = 32;
+        g_display_mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+        const LONG result = ChangeDisplaySettingsExW(info.szDevice,&g_display_mode,
+            nullptr,CDS_FULLSCREEN,nullptr);
+        g_display_applied = g_display_exclusive = result == DISP_CHANGE_SUCCESSFUL;
+        if (!g_display_exclusive)
+            std::fprintf(stderr,"  [janela] modo %dx%d indisponivel (%ld); usando tela cheia sem bordas\n",
+                settings.width,settings.height,result);
+        GetMonitorInfoW(monitor,reinterpret_cast<MONITORINFO*>(&info));
+    }
+    const bool fullscreen = settings.window_mode == 1 || settings.window_mode == 3;
+    const DWORD style = settings.window_mode == 0 ? WS_OVERLAPPEDWINDOW : WS_POPUP;
+    const RECT area = fullscreen ? info.rcMonitor : info.rcWork;
+    RECT size{0,0,settings.width,settings.height};
+    if (settings.window_mode == 0) AdjustWindowRect(&size,style,FALSE);
+    const int width = fullscreen ? area.right-area.left : std::min(size.right-size.left,area.right-area.left);
+    const int height = fullscreen ? area.bottom-area.top : std::min(size.bottom-size.top,area.bottom-area.top);
+    const int x = area.left + ((area.right-area.left)-width)/2;
+    const int y = area.top + ((area.bottom-area.top)-height)/2;
+    HWND window = CreateWindowExW(0,L"Ps2GameWindow",L"Ring of Judgment",style | WS_VISIBLE,
+        x,y,width,height,nullptr,nullptr,instance,nullptr);
+    if (!window) ps2_restore_display();
+    return window;
+}
+
+namespace
+{
+    struct RssdWaveApi
+    {
+        decltype(&waveOutOpen) open = nullptr;
+        decltype(&waveOutPrepareHeader) prepare = nullptr;
+        decltype(&waveOutWrite) write = nullptr;
+        decltype(&waveOutPause) pause = nullptr;
+        decltype(&waveOutRestart) restart = nullptr;
+        decltype(&waveOutReset) reset = nullptr;
+        decltype(&waveOutUnprepareHeader) unprepare = nullptr;
+        decltype(&waveOutClose) close = nullptr;
+
+        explicit RssdWaveApi(HMODULE module)
+        {
+            if (!module)
+                return;
+#define RSSD_WAVE_LOAD(member, name) member = reinterpret_cast<decltype(member)>(GetProcAddress(module, #name))
+            RSSD_WAVE_LOAD(open, waveOutOpen);
+            RSSD_WAVE_LOAD(prepare, waveOutPrepareHeader);
+            RSSD_WAVE_LOAD(write, waveOutWrite);
+            RSSD_WAVE_LOAD(pause, waveOutPause);
+            RSSD_WAVE_LOAD(restart, waveOutRestart);
+            RSSD_WAVE_LOAD(reset, waveOutReset);
+            RSSD_WAVE_LOAD(unprepare, waveOutUnprepareHeader);
+            RSSD_WAVE_LOAD(close, waveOutClose);
+#undef RSSD_WAVE_LOAD
+        }
+
+        bool ready() const
+        {
+            return open && prepare && write && pause && restart && reset && unprepare && close;
+        }
+    };
+
+    HMODULE rssd_live_module()
+    {
+        wchar_t path[MAX_PATH];
+        const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+        const wchar_t suffix[] = L"\\winmm.dll";
+        if (!length || length + sizeof suffix / sizeof *suffix > MAX_PATH)
+            return nullptr;
+        std::memcpy(path + length, suffix, sizeof suffix);
+        return LoadLibraryW(path);
+    }
+
+    void rssd_load_recorded_effects(LiveEffects& effects)
+    {
+        // Busca os WAVs na pasta do executavel, independente do diretorio atual.
+        std::wstring path(32768,L'\0');
+        const DWORD len = GetModuleFileNameW(nullptr,&path[0],DWORD(path.size()));
+        if (!len || len>=path.size())
+            return;
+        path.resize(len);
+        const auto separator = path.find_last_of(L"\\/");
+        if (separator==std::wstring::npos)
+            return;
+        path.resize(separator+1);
+        struct Asset { unsigned id; double gain; const wchar_t* file; const char* label; };
+        // Os quatro sons compartilham o ganho para manter o equilibrio da previa.
+        constexpr double menu_gain = 0.26;
+        constexpr Asset assets[] = {
+            {0x21,0.65,L"Audio\\Sound Effects\\estilhaco_anel.wav","estilhaco externo"},
+            {0x09,menu_gain,L"Audio\\Sound Effects\\menu_abrir.wav","menu abrir"},
+            {0x01,menu_gain,L"Audio\\Sound Effects\\menu_cursor.wav","menu cursor"},
+            {0x02,menu_gain,L"Audio\\Sound Effects\\menu_confirmar.wav","menu confirmar"},
+            {0x03,menu_gain,L"Audio\\Sound Effects\\menu_voltar.wav","menu voltar"},
+        };
+
+        for (const auto& asset : assets)
+        {
+            const std::wstring full_path = path + asset.file;
+            const HANDLE file = CreateFileW(full_path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,
+                                            OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+            if (file==INVALID_HANDLE_VALUE)
+                continue;
+            LARGE_INTEGER length{};
+            LiveBytes bytes;
+            DWORD received = 0;
+            bool ok = GetFileSizeEx(file,&length) && length.QuadPart>=44 && length.QuadPart<=262144;
+            if (ok)
+            {
+                bytes.resize(size_t(length.QuadPart));
+                ok = ReadFile(file,bytes.data(),DWORD(bytes.size()),&received,nullptr) && received==bytes.size();
+            }
+            CloseHandle(file);
+            if (ok && effects.load_effect_wav(asset.id,asset.gain,bytes))
+            {
+                if (asset.id==0x21)
+                    std::fprintf(stderr,"  [audio RSSD ao vivo] estilhaco externo carregado\n");
+                else
+                    std::fprintf(stderr,"  [audio RSSD ao vivo] %s: WAV carregado\n",asset.label);
+            }
+            else
+                std::fprintf(stderr,"  [audio RSSD ao vivo] %s invalido; usando banco RSSD\n",asset.label);
+        }
+    }
+
+    class LivePlayer
+    {
+        // Um worker mantem o decoder e o dispositivo fora do caminho do EE.
+        // Tres blocos de cerca de 17 ms limitam a latencia dos efeitos.
+        static constexpr unsigned BlockFrames = 384;
+        static constexpr unsigned BlockCount = 3;
+        std::mutex mutex;
+        std::condition_variable wake;
+        struct Command
+        {
+            enum Kind { Play, Stop, Effect, StopEffect } kind;
+            LiveBytes sequence;
+            std::shared_ptr<const LiveBytes> bank;
+            bool whole_bank = false;
+            EffectRequest effect{};
+            unsigned id = 0;
+
+            explicit Command(Kind k) : kind(k) {}
+        };
+        std::deque<Command> queue;
+        bool closing = false;
+        bool device_failed = false;
+        std::unique_ptr<LiveSong> song;
+        LiveEffects effects;
+        bool effect_logged = false;
+        std::string song_name;
+        std::thread thread;
+
+        bool update(bool wait)
+        {
+            std::deque<Command> commands;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                if (wait)
+                    wake.wait(lock,[&]{ return closing || !queue.empty(); });
+                if (closing)
+                    return false;
+                commands.swap(queue);
+            }
+            for (auto& c : commands)
+            {
+                if (c.kind == Command::Effect)
+                {
+                    const unsigned layers = effects.play(c.effect);
+                    if (c.effect.trace_id)
+                        std::fprintf(stderr,"  [RSSD FX] t=%lldms n=%llu id=%u resultado=%s camadas=%u\n",
+                            rssd_fx_ms(),static_cast<unsigned long long>(c.effect.trace_id),
+                            c.effect.id,layers?"mixado":"sem-camada-compativel",layers);
+                    if (layers && !effect_logged)
+                    {
+                        // Confirma o primeiro disparo sem poluir o log do jogo.
+                        effect_logged = true;
+                        std::fprintf(stderr,"  [audio RSSD ao vivo] efeito %u: ativo\n",c.effect.id);
+                    }
+                }
+                else if (c.kind == Command::StopEffect)
+                    effects.stop(c.id,c.whole_bank);
+                else
+                {
+                    if (song)
+                    {
+                        std::fprintf(stderr,"  [audio RSSD ao vivo] %s: fim\n",song_name.c_str());
+                        song.reset();
+                    }
+                    if (c.kind == Command::Play)
+                    {
+                        auto next = std::make_unique<LiveSong>();
+                        if (next->load(c.sequence,*c.bank))
+                        {
+                            song = std::move(next);
+                            const auto name = c.sequence.begin()+0x2c;
+                            song_name.assign(name,std::find(name,name+16,uint8_t(0)));
+                            std::fprintf(stderr,"  [audio RSSD ao vivo] %s: inicio\n",song_name.c_str());
+                        }
+                        else
+                            std::fprintf(stderr,"  [audio RSSD ao vivo] falha ao interpretar SMD/SWD\n");
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool playback(const RssdWaveApi& api)
+        {
+            WAVEFORMATEX format = {};
+            format.wFormatTag = WAVE_FORMAT_PCM;
+            format.nChannels = 2;
+            format.nSamplesPerSec = LiveRate;
+            format.wBitsPerSample = 16;
+            format.nBlockAlign = 4;
+            format.nAvgBytesPerSec = LiveRate * format.nBlockAlign;
+            HANDLE event = CreateEventW(nullptr,FALSE,FALSE,nullptr);
+            if (!event)
+                return false;
+            HWAVEOUT dev = nullptr;
+            if (api.open(&dev,WAVE_MAPPER,&format,reinterpret_cast<DWORD_PTR>(event),0,CALLBACK_EVENT) != MMSYSERR_NOERROR)
+            {
+                CloseHandle(event);
+                return false;
+            }
+            struct Buffers { WAVEHDR heads[BlockCount] = {}; int16_t pcm[BlockCount][BlockFrames*2]; };
+            auto buffers = std::make_unique<Buffers>();
+            auto& heads = buffers->heads;
+            auto write = [&](unsigned i)
+            {
+                auto& pcm = buffers->pcm[i];
+                if (song)
+                    song->render(pcm,BlockFrames);
+                else
+                    std::fill_n(pcm,BlockFrames*2,int16_t(0));
+                const auto& settings = ps2_settings();
+                const double master = roj::volume_gain(settings.master_volume);
+                const double music = master * roj::volume_gain(settings.music_volume);
+                if (music != 1.0)
+                    for (auto& sample : pcm)
+                        sample = int16_t(std::lround(sample * music));
+                effects.render(pcm,BlockFrames,master * roj::volume_gain(settings.effects_volume));
+                return api.write(dev,&heads[i],sizeof(WAVEHDR)) == MMSYSERR_NOERROR;
+            };
+
+            bool ok = api.pause(dev) == MMSYSERR_NOERROR;
+            for (unsigned i = 0; ok && i < BlockCount; ++i)
+            {
+                heads[i].lpData = reinterpret_cast<char*>(buffers->pcm[i]);
+                heads[i].dwBufferLength = sizeof buffers->pcm[i];
+                ok = api.prepare(dev,&heads[i],sizeof(WAVEHDR)) == MMSYSERR_NOERROR && write(i);
+            }
+
+            ok = ok && api.restart(dev) == MMSYSERR_NOERROR;
+            unsigned next = 0;
+            while (ok && update(false))
+            {
+                WaitForSingleObject(event,10);
+                for (unsigned count=0; count<BlockCount && ok && (heads[next].dwFlags & WHDR_DONE); ++count)
+                {
+                    ok = update(false) && write(next);
+                    next = (next+1)%BlockCount;
+                }
+            }
+
+            bool clean = api.reset(dev) == MMSYSERR_NOERROR;
+            for (auto& h : heads)
+                if ((h.dwFlags & WHDR_PREPARED) && api.unprepare(dev,&h,sizeof h) != MMSYSERR_NOERROR)
+                    clean = false;
+            if (api.close(dev) != MMSYSERR_NOERROR)
+            {
+                // Um dispositivo que nao fechou ainda pode referenciar os buffers.
+                buffers.release();
+                return false;
+            }
+            CloseHandle(event);
+            return ok && clean;
+        }
+
+        void run()
+        {
+            rssd_load_recorded_effects(effects);
+            const RssdWaveApi api(rssd_live_module());
+            if (!api.ready() || (update(true) && !playback(api)))
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                device_failed = true;
+                queue.clear();
+                std::fprintf(stderr,"  [audio RSSD ao vivo] falha no dispositivo de audio\n");
+            }
+        }
+
+        void post(Command command)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (device_failed || (command.kind == Command::Effect && queue.size() >= 64))
+                {
+                    if (command.effect.trace_id)
+                        std::fprintf(stderr,"  [RSSD FX] t=%lldms n=%llu id=%u resultado=%s\n",
+                            rssd_fx_ms(),static_cast<unsigned long long>(command.effect.trace_id),
+                            command.effect.id,device_failed?"dispositivo-indisponivel":"fila-cheia");
+                    return;
+                }
+                queue.push_back(std::move(command));
+            }
+            wake.notify_one();
+        }
+
+    public:
+        LivePlayer() : thread(&LivePlayer::run,this) {}
+        ~LivePlayer()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                closing = true;
+            }
+            wake.notify_one();
+            thread.join();
+        }
+
+        void play(LiveBytes sequence, std::shared_ptr<const LiveBytes> bank)
+        {
+            Command c(Command::Play);
+            c.sequence=std::move(sequence);
+            c.bank=std::move(bank);
+            post(std::move(c));
+        }
+
+        void stop() { post(Command(Command::Stop)); }
+
+        void effect(EffectRequest request)
+        {
+            Command c(Command::Effect);
+            c.effect=std::move(request);
+            post(std::move(c));
+        }
+
+        void stop_effect(unsigned id, bool whole_bank)
+        {
+            Command c(Command::StopEffect);
+            c.id=id;
+            c.whole_bank=whole_bank;
+            post(std::move(c));
+        }
+    };
+
+    LivePlayer& rssd_live_player()
+    {
+        static LivePlayer player;
+        return player;
+    }
+
+    void rssd_live_play(LiveBytes sequence, std::shared_ptr<const LiveBytes> bank)
+    {
+        rssd_live_player().play(std::move(sequence),std::move(bank));
+    }
+
+    void rssd_live_stop()
+    {
+        rssd_live_player().stop();
+    }
+
+    void rssd_live_effect(EffectRequest request)
+    {
+        rssd_live_player().effect(std::move(request));
+    }
+
+    void rssd_live_effect_stop(unsigned id, bool whole_bank)
+    {
+        rssd_live_player().stop_effect(id,whole_bank);
+    }
+}
+
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -11860,14 +14979,195 @@ namespace
     HWND g_hwnd = nullptr;
     volatile bool g_redraw = false;
 
+    struct FmvRequest
+    {
+        std::filesystem::path file;
+        uint32_t owner = 0;
+        uint32_t end_callback = 0;
+    };
+    std::mutex g_fmv_mutex;
+    FmvRequest g_fmv_pending;
+    uint32_t g_fmv_cancel_owner = 0;
+
+    class FmvEvents final : public IMFPMediaPlayerCallback
+    {
+        std::atomic<ULONG> references{1};
+    public:
+        enum State { Opening, Playing, Finished, Failed };
+        std::atomic<State> state{Opening};
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override
+        {
+            if (!out) return E_POINTER;
+            *out = nullptr;
+            if (iid != __uuidof(IUnknown) && iid != __uuidof(IMFPMediaPlayerCallback))
+                return E_NOINTERFACE;
+            *out = static_cast<IMFPMediaPlayerCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            const ULONG remaining = --references;
+            if (!remaining) delete this;
+            return remaining;
+        }
+        void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* event) override
+        {
+            if (FAILED(event->hrEvent) || event->eEventType == MFP_EVENT_TYPE_ERROR)
+                state.store(Failed, std::memory_order_release);
+            else if (event->eEventType == MFP_EVENT_TYPE_PLAYBACK_ENDED)
+                state.store(Finished, std::memory_order_release);
+            else if (event->eEventType == MFP_EVENT_TYPE_PLAY)
+            {
+                State expected = Opening;
+                state.compare_exchange_strong(expected, Playing);
+            }
+        }
+    };
+
+    class WindowMovie
+    {
+        IMFPMediaPlayer* player = nullptr;
+        HWND surface = nullptr;
+        FmvEvents* events = nullptr;
+        FmvRequest current;
+        uint64_t opened = 0;
+        bool reported = false, start_down = false;
+
+        void layout(HWND parent)
+        {
+            RECT bounds{};
+            GetClientRect(parent,&bounds);
+            const auto view = roj::fit_viewport(bounds.right,bounds.bottom,ps2_presentation_aspect());
+            HDC dc = GetDC(parent);
+            FillRect(dc,&bounds,reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            ReleaseDC(parent,dc);
+            SetWindowPos(surface,HWND_TOP,view.x,view.y,view.width,view.height,SWP_NOACTIVATE);
+            player->SetAspectRatioMode(0);
+            player->UpdateVideo();
+        }
+
+        void close(bool completed)
+        {
+            if (player)
+            {
+                player->Shutdown();
+                player->Release();
+                player = nullptr;
+            }
+            if (events)
+            {
+                events->Release();
+                events = nullptr;
+            }
+            if (surface)
+            {
+                HWND parent = GetParent(surface);
+                DestroyWindow(surface);
+                surface = nullptr;
+                InvalidateRect(parent, nullptr, FALSE);
+            }
+            const uint32_t callback = current.end_callback;
+            current = {};
+            g_redraw = true;
+            if (completed && callback)
+                ps2_defer_call(1, callback, 0);
+        }
+
+        void open(HWND hwnd, FmvRequest request)
+        {
+            current = std::move(request);
+            opened = hw_now_ns();
+            reported = false;
+            start_down = g_fmv_start_pressed.load(std::memory_order_relaxed);
+            static const HMODULE module = LoadLibraryExW(L"mfplay.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            using Create = decltype(&MFPCreateMediaPlayer);
+            static const Create create = module
+                ? reinterpret_cast<Create>(GetProcAddress(module, "MFPCreateMediaPlayer")) : nullptr;
+            RECT bounds{};
+            GetClientRect(hwnd, &bounds);
+            surface = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
+                0, 0, bounds.right, bounds.bottom, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            events = new FmvEvents;
+            const HRESULT hr = create && surface ? create(current.file.c_str(), TRUE,
+                MFP_OPTION_FREE_THREADED_CALLBACK, events, surface, &player) : E_NOINTERFACE;
+            if (FAILED(hr) || !player)
+            {
+                std::fprintf(stderr, "  [FMV] falha ao abrir %ls (0x%08lX)\n",
+                    current.file.filename().c_str(), (unsigned long)hr);
+                close(true);
+            }
+            else
+                layout(hwnd);
+        }
+
+    public:
+        bool update(HWND hwnd)
+        {
+            FmvRequest request;
+            uint32_t cancelled = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_fmv_mutex);
+                request = std::move(g_fmv_pending);
+                g_fmv_pending = {};
+                cancelled = std::exchange(g_fmv_cancel_owner, 0);
+            }
+            if (current.owner && (current.owner == cancelled || request.owner))
+                close(false);
+            if (request.owner)
+                open(hwnd, std::move(request));
+            if (!player)
+                return false;
+
+            const auto state = events->state.load(std::memory_order_acquire);
+            const bool start = g_fmv_start_pressed.load(std::memory_order_relaxed);
+            const bool skip = state == FmvEvents::Playing && start && !start_down;
+            start_down = start;
+            if (!reported && state == FmvEvents::Playing)
+            {
+                reported = true;
+                player->SetVolume(float(roj::volume_gain(ps2_settings().master_volume)));
+                std::fprintf(stderr, "  [FMV] reproduzindo %ls\n", current.file.filename().c_str());
+            }
+            if (skip || state == FmvEvents::Finished || state == FmvEvents::Failed ||
+                (state == FmvEvents::Opening && hw_now_ns() - opened > 15000000000ull))
+            {
+                const char* reason = skip ? "interrompido pelo controle" :
+                    state == FmvEvents::Finished ? "fim" : "falha do decodificador";
+                std::fprintf(stderr, "  [FMV] %s: %ls\n", reason, current.file.filename().c_str());
+                close(true);
+                return false;
+            }
+
+            if (g_redraw)
+            {
+                g_redraw = false;
+                layout(hwnd);
+            }
+            return true;
+        }
+    };
+
+
     LRESULT CALLBACK ps2_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
         switch (m)
         {
             case WM_CLOSE:
             case WM_DESTROY:
+                ps2_restore_display();
                 std::fflush(stderr);
                 std::_Exit(0);
+
+            case WM_ACTIVATEAPP:
+                ps2_activate_display(h,w != 0);
+                return 0;
+
+            case WM_SIZE:
+                g_redraw = true;
+                return 0;
 
             case WM_ERASEBKGND:
                 return 1;
@@ -11898,11 +15198,7 @@ namespace
         wc.lpszClassName = "Ps2GameWindow";
         RegisterClassA(&wc);
 
-        RECT r = { 0, 0, 640, 448 };
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-
-        HWND hw = CreateWindowExA(0, "Ps2GameWindow", "Shadow Hearts", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+        HWND hw = ps2_create_game_window(wc.hInstance);
 
         if (hw == nullptr)
         {
@@ -11911,6 +15207,8 @@ namespace
         }
 
         g_hwnd = hw;
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        WindowMovie movie;
 
         unsigned seen = 0;
         WindowFrameContent frame_content;
@@ -11933,6 +15231,12 @@ namespace
                 DispatchMessageA(&msg);
             }
 
+            if (movie.update(hw))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+
             const std::chrono::steady_clock::time_point tnow = std::chrono::steady_clock::now();
 
             if (tnow - last_title >= std::chrono::seconds(1))
@@ -11947,7 +15251,7 @@ namespace
 
             {
                 static bool f10_last = false;
-                const bool f10 = ps2_key_down(0x79);   // VK_F10: grava gs_shot_N.bmp (640x448, sem escala)
+                const bool f10 = ps2_key_down(0x79) && !roj::input_uses_key(ps2_settings().input, 0x79);
 
                 if (f10 && !f10_last && !pix.empty())
                 {
@@ -11961,12 +15265,12 @@ namespace
             }
 
             static bool f11_last = false;
-            const bool f11 = ps2_key_down(0x7A); // VK_F11
+            const bool f11 = ps2_key_down(0x7A) && !roj::input_uses_key(ps2_settings().input, 0x7A);
             if (f11 && !f11_last)
                 g_font_capture_request.store(true, std::memory_order_relaxed);
             f11_last = f11;
 
-            const bool f12 = g_perf_gs && ps2_key_down(0x7B); // VK_F12
+            const bool f12 = ps2_key_down(0x7B) && !roj::input_uses_key(ps2_settings().input, 0x7B);
             if (f12 && !f12_last)
             {
                 const uint64_t now = prof_now();
@@ -11992,7 +15296,7 @@ namespace
             {
                 std::lock_guard<std::mutex> lk(g_win_mu);
                 const unsigned seq = g_win_seq.load();
-                pix = g_win_pix;
+                pix.swap(g_win_pix);
                 w = g_win_w;
                 h = g_win_h;
                 if (g_perf_gs) g_win_coalesced.fetch_add(seq - seen - 1u, std::memory_order_relaxed);
@@ -12029,20 +15333,8 @@ namespace
                     SetBrushOrgEx(dc, 0, 0, nullptr);
                 }
 
-                // O PS2 mostra 4:3 (PS2_ASPECT=16:9 ou "stretch" mudam). O resto da janela fica preto.
-                static const char* asp = std::getenv("PS2_ASPECT");
-                double aspect = 4.0 / 3.0;
-
-                if (asp != nullptr)
-                    aspect = std::strcmp(asp, "16:9") == 0 ? 16.0 / 9.0 : (std::strcmp(asp, "stretch") == 0 ? 0.0 : aspect);
-
-                int dx = 0, dy = 0, dw = (int)cr.right, dh = (int)cr.bottom;
-
-                if (aspect > 0.0 && dw > 0 && dh > 0)
-                {
-                    if ((double)dw / (double)dh > aspect) { dw = (int)((double)dh * aspect); dx = ((int)cr.right - dw) / 2; }
-                    else { dh = (int)((double)dw / aspect); dy = ((int)cr.bottom - dh) / 2; }
-                }
+                const auto view = roj::fit_viewport(cr.right,cr.bottom,ps2_presentation_aspect());
+                const int dx = view.x, dy = view.y, dw = view.width, dh = view.height;
 
                 // So as barras (areas fora da imagem) sao pintadas de preto; pintar a janela toda antes de cada quadro piscava.
                 if (dx > 0)
@@ -12062,7 +15354,7 @@ namespace
                 ReleaseDC(hw, dc);
                 // Conta imagens novas aceitas pelo GDI. Redesenhos de uma
                 // imagem antiga e a cadencia do compositor sao outra medida.
-                if (g_perf_gs)
+                if (g_perf_gs || last_mark_ns != 0)
                 {
                     const bool changed = drawn > 0 && frame_content.record(pix, w, h);
                     if (fresh && drawn > 0)
@@ -12084,6 +15376,39 @@ namespace
     }
 }
 
+bool ps2_fmv_play(const char* path, uint32_t owner, uint32_t end_callback)
+{
+    if (!g_gswin || !owner || std::getenv("PS2_FMV_FRAMES"))
+        return false;
+    std::string name(path);
+    const auto separator = name.find_last_of("\\/");
+    if (separator != std::string::npos)
+        name.erase(0, separator + 1);
+    for (char& ch : name) ch = char(std::toupper(uint8_t(ch)));
+    if (name.size() != 12 || name.compare(0, 6, "MOVIE_") != 0 ||
+        !std::isdigit(uint8_t(name[6])) || !std::isdigit(uint8_t(name[7])) || name.substr(8) != ".PSS")
+        return false;
+
+    auto file = g_game_directory / "Videos" / (name.substr(0, 8) + ".mp4");
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(file, error))
+    {
+        std::fprintf(stderr, "  [FMV] arquivo ausente: %s\n", name.c_str());
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_fmv_mutex);
+    g_fmv_pending = {std::move(file), owner, end_callback};
+    return true;
+}
+
+void ps2_fmv_cancel(uint32_t owner)
+{
+    std::lock_guard<std::mutex> lock(g_fmv_mutex);
+    if (g_fmv_pending.owner == owner)
+        g_fmv_pending = {};
+    g_fmv_cancel_owner = owner;
+}
+
 void ps2_window_start()
 {
     if (g_gswin)
@@ -12093,6 +15418,7 @@ void ps2_window_start()
 // Excecoes que o signal() do C nao pega (estouro de pilha, divisao inteira por zero, instrucao ilegal...).
 static LONG WINAPI ps2_exception_filter(EXCEPTION_POINTERS* ep)
 {
+    ps2_restore_display();
     std::fprintf(stderr, "\n  [CRASH] excecao do Windows 0x%08lX no endereco %p\n",
         (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
 
@@ -12201,6 +15527,8 @@ bool ps2_key_down(int vk)
 // PS2_NOXINPUT=1 desliga.
 bool ps2_xinput_state(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* sticks)
 {
+    if (g_hwnd != nullptr && GetForegroundWindow() != g_hwnd)
+        return false;
     struct XState { uint32_t packet; uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; };   // XINPUT_STATE
     typedef uint32_t (__stdcall *GetStateFn)(uint32_t, XState*);
 
@@ -12269,6 +15597,13 @@ bool ps2_xinput_state(uint16_t* buttons, uint8_t* lt, uint8_t* rt, int16_t* stic
     return true;
 }
 #else
+const roj::Settings& ps2_settings()
+{
+    static const auto settings = roj::read_settings("RingOfJudgment.ini");
+    return settings;
+}
+bool ps2_fmv_play(const char*, uint32_t, uint32_t) { return false; }
+void ps2_fmv_cancel(uint32_t) {}
 void ps2_window_start() {}
 bool ps2_key_down(int) { return false; }
 bool ps2_xinput_state(uint16_t*, uint8_t*, uint8_t*, int16_t*) { return false; }
@@ -12825,7 +16160,7 @@ static void irq_wait_tick()
         private readonly IReadOnlyDictionary<uint, string>? _names;
         private readonly Dictionary<string, int> _byMnemonic = new();
         private readonly JumpTableResolver? _jumpTables;
-        private readonly Dictionary<uint, JumpTableResolver.Table> _tables = new();
+        private readonly Dictionary<uint, (uint TableAddress, uint[] Targets)> _tables = new();
         private readonly IReadOnlyDictionary<uint, string>? _directCalls;
         private readonly bool _comments;
         private readonly bool _includeHeader;
@@ -12868,19 +16203,24 @@ static void irq_wait_tick()
             }
 
             // JR em registrador que nao e $ra: tenta resolver como jump table.
-            if (_jumpTables != null)
+            for (int i = 0; i < count; i++)
             {
-                for (int i = 0; i < count; i++)
-                {
-                    if (code[i].Mnemonic != "JR" || code[i].Rs == 31)
-                        continue;
+                if (code[i].Mnemonic != "JR" || code[i].Rs == 31)
+                    continue;
 
-                    if (_jumpTables.TryResolve(code, i, start, end, out JumpTableResolver.Table? table, out _) &&
-                        table != null)
-                    {
-                        _tables[start + (uint)(i * 4)] = table;
-                    }
+                uint jump = start + (uint)(i * 4);
+                if (_jumpTables != null &&
+                    _jumpTables.TryResolve(code, i, start, end, out JumpTableResolver.Table? table, out _) &&
+                    table != null)
+                {
+                    _tables[jump] = (table.TableAddress, table.Targets.Distinct().ToArray());
+                    continue;
                 }
+
+                // FParticleSet no SLUS-20347 guarda o endereco da entrada
+                // na pilha via SQ/LQ. O resolvedor normal perde esse rastreio.
+                if (start == 0x0041AB80u && code[i].Rs == 4)
+                    ResolveParticleTable(image, start, end, jump);
             }
 
             HashSet<uint> labels = CollectLabels(
@@ -12899,6 +16239,12 @@ static void irq_wait_tick()
             _sb.AppendLine($"void {FunctionName(function)}(Ctx& c)");
             _sb.AppendLine("{");
             _sb.AppendLine($"{I1}PS2_TRACE_ENTER(0x{start:X8}u);");
+            if (start == 0x0047A230u)
+                _sb.AppendLine($"{I1}ps2_battle_effect_clock(c);");
+            // Marca o pedido de batalha e as operacoes de BGM na captura RSSD.
+            if (start is 0x00413AE0u or 0x004176A0u or 0x00417970u or 0x00417E70u)
+                _sb.AppendLine($"{I1}if (g_rssd_audio_trace) rssd_trace_bgm(c, 0x{start:X8}u);");
+
             // AddTime de CFieldModel, quando chamado por CField::Refresh.
             if (start == 0x00320A10u)
                 _sb.AppendLine($"{I1}if (g_field_clock_trace && (uint32_t)c.r[31].lo == 0x0031F3A8u) field_clock_record(c.f[12]);");
@@ -12962,6 +16308,42 @@ static void irq_wait_tick()
             _sb.AppendLine("}");
 
             return new Result(_sb.ToString(), count, _unsupported, _byMnemonic, _dispatched);
+        }
+
+        private void ResolveParticleTable(ElfImage image, uint start, uint end, uint jump)
+        {
+            const uint tableAddress = 0x004CB980u;
+            const int entryCount = 41;
+
+            // Confirma o par LUI/ADDIU que materializa o endereco da tabela.
+            // A carga final no $a0 e seguida pelo JR observado no log.
+            bool loadsTableBase = false;
+            for (uint pc = Math.Max(start, jump - 48u); pc + 4 < jump; pc += 4)
+            {
+                if (image.ReadUInt32(pc) == 0x3C05004Du &&
+                    image.ReadUInt32(pc + 4) is 0x24A4B980u or 0x20A4B980u)
+                {
+                    loadsTableBase = true;
+                    break;
+                }
+            }
+            if (!loadsTableBase || image.ReadUInt32(jump - 4) != 0x8C440000u)
+                return;
+
+            // Le a tabela do ELF para emitir todos os casos locais, incluindo
+            // os que nao sao destinos de branches diretos na funcao.
+            HashSet<uint> targets = new();
+            for (int i = 0; i < entryCount; i++)
+            {
+                uint target = image.ReadUInt32(tableAddress + (uint)(4 * i));
+                if (target < start || target >= end || (target & 3u) != 0)
+                    return;
+
+                targets.Add(target);
+            }
+
+            if (targets.Contains(0x0041B3C4u))
+                _tables[jump] = (tableAddress, targets.OrderBy(target => target).ToArray());
         }
 
         private void Simple(MipsInstruction instruction, uint address, string indent)
@@ -13066,12 +16448,12 @@ static void irq_wait_tick()
                     Delay(delay, address, I2);
                     _sb.AppendLine($"{I2}return;");
                 }
-                else if (_tables.TryGetValue(address, out JumpTableResolver.Table? table))
+                else if (_tables.TryGetValue(address, out var table))
                 {
                     // switch: o destino e lido antes do delay slot.
                     _sb.AppendLine($"{I2}uint32_t dest = (uint32_t){Lo(instruction.Rs)};");
                     Delay(delay, address, I2);
-                    Comment(I2, $"jump table em 0x{table.TableAddress:X8}, {table.Targets.Count} destinos");
+                    Comment(I2, $"jump table em 0x{table.TableAddress:X8}, {table.Targets.Length} destinos");
                     _sb.AppendLine($"{I2}switch (dest)");
                     _sb.AppendLine($"{I2}{{");
 

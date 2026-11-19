@@ -1,5 +1,15 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <ItemGroup>
+    <EmbeddedResource Include="RuntimeAssets\Vu1\ps2_vu1_aot_0078.inc" LogicalName="SH.ELF.Vu1.0078" />
+    <EmbeddedResource Include="RuntimeAssets\Vu1\ps2_vu1_aot_0350.inc" LogicalName="SH.ELF.Vu1.0350" />
+    <EmbeddedResource Include="RuntimeAssets\Vu1\ps2_vu1_aot_0658.inc" LogicalName="SH.ELF.Vu1.0658" />
+    <EmbeddedResource Include="RuntimeAssets\Vulkan\device.h" LogicalName="SH.ELF.Vulkan.device" />
+    <EmbeddedResource Include="RuntimeAssets\Vulkan\batch.inc" LogicalName="SH.ELF.Vulkan.batch" />
+    <EmbeddedResource Include="RuntimeAssets\ring_hud.inc" LogicalName="SH.ELF.Vulkan.ringhud" />
+    <EmbeddedResource Include="RuntimeAssets\Vulkan\raster.spv" LogicalName="SH.ELF.Vulkan.shader" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

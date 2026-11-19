@@ -3,6 +3,14 @@
   <ItemGroup>
     <ProjectReference Include="..\SH.ISO\SH.ISO.csproj" />
     <ProjectReference Include="..\SH.ELF\SH.ELF.csproj" />
+    <EmbeddedResource Include="Ferramentas\Preparar-Videos.ps1" LogicalName="SH.Core.Preparar-Videos.ps1" />
+    <EmbeddedResource Include="RuntimeAssets\roj_settings.h" LogicalName="SH.Core.roj_settings.h" />
+    <EmbeddedResource Include="RuntimeAssets\roj_input.h" LogicalName="SH.Core.roj_input.h" />
+    <EmbeddedResource Include="RuntimeAssets\launcher_input.h" LogicalName="SH.Core.launcher_input.h" />
+    <EmbeddedResource Include="RuntimeAssets\LEIA-ME.txt" LogicalName="SH.Core.LEIA-ME.txt" />
+    <EmbeddedResource Include="RuntimeAssets\launcher.cpp" LogicalName="SH.Core.launcher.cpp" />
+    <EmbeddedResource Include="RuntimeAssets\Compilar-Launcher.ps1" LogicalName="SH.Core.Compilar-Launcher.ps1" />
+    <EmbeddedResource Include="RuntimeAssets\Compilar-Jogo.ps1" LogicalName="SH.Core.Compilar-Jogo.ps1" />
   </ItemGroup>
 
   <PropertyGroup>

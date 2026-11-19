@@ -82,31 +82,23 @@ public static class Hle
                     c.r[2].lo = std::strlen(text);
                 """,
 
-            // FMV (temporario): o IPU ainda nao e emulado, entao o sceMpeg do SDK gira para sempre
-            // procurando start code. Start__8MpegPlayFPc(this, caminho) vira "filme que acaba sozinho":
-            //   - devolve 1 (sucesso, como o original);
-            //   - zera this+428 (como o original) e nao cria o StreamRead (this+32448 fica nulo);
-            //   - agenda o callback de fim (this+32464, ex.: VioWarn::MovieCBEnd) para daqui a
-            //     PS2_FMV_FRAMES vsyncs (padrao 30), pois o chamador zera a flag de fim logo apos o retorno.
-            // Quem espera o fim (VioWarn, state 1) segue quando o callback roda. Remover ao emular o IPU.
+            // O fim da reproducao nativa chama o callback do jogo.
             ["Start__8MpegPlayFPc"] = """
                     static unsigned shown = 0;
                     uint32_t self = (uint32_t)c.r[4].lo;
                     char path[160];
                     ps2_cstr(c, (uint32_t)c.r[5].lo, path, sizeof(path));
-                    const char* e = std::getenv("PS2_FMV_FRAMES");
-                    uint32_t frames = e ? (uint32_t)std::strtoul(e, nullptr, 0) : 30u;
-                    uint32_t endCb = mrd<uint32_t>(c, self + 32464u);
-
+                    const uint32_t endCb = mrd<uint32_t>(c, self + 32464u);
                     mwr<uint32_t>(c, self + 428u, 0u);
 
-                    if (endCb != 0)
-                        ps2_defer_call(frames, endCb, 0u);
-
-                    if (shown < 20)
+                    if (!ps2_fmv_play(path, self, endCb))
                     {
-                        shown++;
-                        std::fprintf(stderr, "  [FMV pulado] Start__8MpegPlay(\"%s\") fim=0x%08X em %u vsyncs\n", path, endCb, frames);
+                        const char* delay = std::getenv("PS2_FMV_FRAMES");
+                        const uint32_t frames = delay ? (uint32_t)std::strtoul(delay, nullptr, 0) : 2u;
+                        if (endCb != 0)
+                            ps2_defer_call(frames, endCb, 0u);
+                        if (shown++ < 20)
+                            std::fprintf(stderr, "  [FMV pulado] %s (fim em %u vsyncs)\n", path, frames);
                     }
 
                     c.r[2].lo = 1;
@@ -126,6 +118,7 @@ public static class Hle
                     if (self == 0)
                         return;
 
+                    ps2_fmv_cancel(self);
                     uint32_t delCb = mrd<uint32_t>(c, self + 32468u);
 
                     // Libera o que o myDelete original libera, sem o DIntr/EIntr, sem o
@@ -168,7 +161,7 @@ public static class Hle
                     if (shown < 20)
                     {
                         shown++;
-                        std::fprintf(stderr, "  [FMV pulado] myDelete__8MpegPlay(0x%08X) delete=0x%08X em 2 vsyncs\n", self, delCb);
+                        std::fprintf(stderr, "  [FMV] myDelete__8MpegPlay(0x%08X) delete=0x%08X em 2 vsyncs\n", self, delCb);
                     }
                 """,
 

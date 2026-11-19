@@ -1,0 +1,42 @@
+Ring of Judgment
+
+Inicie RingOfJudgmentLauncher.exe para configurar e abrir o jogo.
+As preferencias ficam em RingOfJudgment.ini, ao lado dos executaveis.
+Em Estilo das letras, escolha Borda preta ou Faixa escura continua.
+A escolha e aplicada na proxima execucao do jogo.
+O seletor Idioma/Language muda o launcher entre Portugues e English.
+A troca de idioma e imediata e fica salva nas preferencias.
+O botao Controles abre o mapeamento dos botoes e dos dois analogicos.
+Selecione uma acao, clique em Alterar tecla e pressione a tecla desejada.
+Para controles Xbox/XInput e compativeis, escolha a entrada na lista ou
+clique em Detectar botao; solte os botoes antes de apertar a nova entrada.
+Limpar tecla remove a associacao do teclado. Nenhum desativa a entrada do controle.
+Restaurar padroes recupera o esquema original. Clique em Salvar para guardar
+o mapeamento no INI; Cancelar descarta as edicoes da janela de controles.
+Reinicie o jogo para usar o novo mapeamento.
+Em Renderizador, escolha Vulkan (GPU) ou CPU (compatibilidade).
+Vulkan acelera os lotes de triangulos compativeis na placa de video.
+O jogo usa CPU para desenhos que exigem o caminho de compatibilidade
+e continua funcionando se Vulkan estiver indisponivel no driver.
+Reinicie o jogo depois de trocar o renderizador. 60 FPS e um limite,
+nao uma garantia de desempenho em todas as cenas.
+O shader Vulkan ja acompanha o executavel; nao precisa de arquivo SPV externo.
+Para recompilar os C++ gerados, use Ferramentas/Compilar-Jogo.ps1.
+
+Estrutura de arquivos:
+  Data/Shadow Hearts (USA).iso
+  Saves/Slot1/                  progresso salvo pelo jogo
+  Videos/MOVIE_00.mp4 ...        videos externos preparados
+  Audio/Sound Effects/          efeitos externos confirmados
+
+Efeitos externos usados atualmente:
+  estilhaco_anel.wav
+  menu_abrir.wav
+  menu_cursor.wav
+  menu_confirmar.wav
+  menu_voltar.wav
+
+Mantenha ps2_image.bin junto do executavel do jogo.
+O catalogo de efeitos extraidos nao precisa acompanhar este pacote.
+As musicas e os demais efeitos continuam sendo lidos da ISO.
+Gerar novamente o C++ preserva os saves e os arquivos de midia existentes.

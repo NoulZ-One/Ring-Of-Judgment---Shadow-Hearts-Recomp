@@ -46,6 +46,30 @@ internal static class EmitDemo
         List<ElfSymbol> functions = Unique(allFunctions);
 
         Directory.CreateDirectory(directory);
+        foreach (string folder in new[] { "Data", "Saves", "Videos", Path.Combine("Audio", "Sound Effects") })
+            Directory.CreateDirectory(Path.Combine(directory, folder));
+
+        // Os recursos acompanham o executavel do recompilador em qualquer pasta.
+        (string Resource, string File)[] assets =
+        [
+            ("Preparar-Videos.ps1", Path.Combine("Ferramentas", "Preparar-Videos.ps1")),
+            ("roj_settings.h", "roj_settings.h"),
+            ("roj_input.h", "roj_input.h"),
+            ("launcher_input.h", Path.Combine("Launcher", "launcher_input.h")),
+            ("LEIA-ME.txt", "LEIA-ME.txt"),
+            ("launcher.cpp", Path.Combine("Launcher", "launcher.cpp")),
+            ("Compilar-Launcher.ps1", Path.Combine("Launcher", "Compilar-Launcher.ps1")),
+            ("Compilar-Jogo.ps1", Path.Combine("Ferramentas", "Compilar-Jogo.ps1"))
+        ];
+        foreach ((string resource, string file) in assets)
+        {
+            string target = Path.Combine(directory, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            using Stream input = typeof(EmitDemo).Assembly.GetManifestResourceStream($"SH.Core.{resource}")
+                ?? throw new InvalidOperationException($"Recurso ausente: {resource}");
+            using FileStream output = File.Create(target);
+            input.CopyTo(output);
+        }
 
         // Nome em C++ de cada funcao: o corpo recompilado, ou o hle_* quando o
         // runtime a substitui (registro em HleRegistry.cs).
@@ -201,7 +225,7 @@ internal static class EmitDemo
         Console.WriteLine($"Instrucoes sem suporte (viram parada em tempo de execucao): {unsupported}");
         Console.WriteLine($"JR indireto resolvido em tempo de execucao: {dispatched}");
         Console.WriteLine($"Arquivos em: {directory}");
-        Console.WriteLine("Para compilar (exemplo): g++ -std=c++17 -O0 -c *.cpp  (um .o por arquivo; inclua ps2_hle.cpp)");
+        Console.WriteLine("Para compilar o jogo: execute Ferramentas/Compilar-Jogo.ps1 na pasta gerada (g++ com headers Vulkan).");
         Console.WriteLine("Teste rapido: compile tudo e linke com ps2_selftest.cpp (exige o memclr).");
         Console.WriteLine("Primeira execucao: compile com ps2_main.cpp (no lugar do selftest) e rode com ps2_image.bin na pasta.");
     }

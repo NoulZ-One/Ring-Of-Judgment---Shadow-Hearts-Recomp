@@ -1,0 +1,127 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+struct Triangle {
+ vec4 coeff0; vec4 coeff1;
+ vec4 ca; vec4 cb; vec4 cc;
+ vec4 ta; vec4 tb; vec4 tc; vec4 z;
+ uvec4 tex; ivec4 bounds; uvec4 state; uvec4 alpha; uvec4 blend;
+ uvec4 wrap; ivec4 region; uvec4 span;
+};
+layout(std430,binding=0) restrict buffer Memory { uint memory[]; };
+layout(std430,binding=1) readonly restrict buffer Triangles { Triangle tris[]; };
+layout(std430,binding=2) readonly restrict buffer Textures { uint textures[]; };
+layout(std430,binding=3) readonly restrict buffer Work { uint work[]; };
+layout(push_constant) uniform Parameters { uint spanOffset; uint colorTable; uint depthTable; uint unused; } p;
+uint colorAddress(uint bp,uint bw,uint x,uint y) {
+ return ((((bp>>5)+(y>>5)*bw+(x>>6))<<11)+((bp&31)<<6)+work[p.colorTable+(y&31)*64+(x&63)])&0xfffff;
+}
+uint depthAddress(uint bp,uint bw,uint x,uint y) {
+ return ((((bp>>5)+(y>>6)*bw+(x>>6))<<12)+((bp&31)<<7)+work[p.depthTable+(y&63)*64+(x&63)])&0x1fffff;
+}
+int wrapTex(int v,int size,uint mode,int low,int high) {
+ if(mode==0)return v&(size-1);
+ if(mode==1)return clamp(v,0,size-1);
+ if(mode==2)return clamp(v,low,high);
+ return (v&low)|high;
+}
+uint fetch(Triangle t,int x,int y) {
+ x=wrapTex(x,int(t.tex.y),t.wrap.x,t.region.x,t.region.y);
+ y=wrapTex(y,int(t.tex.z),t.wrap.y,t.region.z,t.region.w);
+ return textures[t.tex.x+uint(y)*t.tex.y+uint(x)];
+}
+uint sampleTex(Triangle t,float u,float v) {
+ if((t.tex.w&2)==0)return fetch(t,int(floor(u)),int(floor(v)));
+ precise float fu=u-0.5, fv=v-0.5;
+ int x=int(floor(fu)),y=int(floor(fv));
+ int wu=int((fu-float(x))*256.0),wv=int((fv-float(y))*256.0);
+ if(wu<4&&wv<4)return fetch(t,x,y);
+ uint a=fetch(t,x,y),b=fetch(t,x+1,y),c=fetch(t,x,y+1),d=fetch(t,x+1,y+1),r=0;
+ for(uint sh=0;sh<32;sh+=8) {
+  int top=int((a>>sh)&255)*(256-wu)+int((b>>sh)&255)*wu;
+  int bot=int((c>>sh)&255)*(256-wu)+int((d>>sh)&255)*wu;
+  r|=uint(((top*(256-wv)+bot*wv)>>16)&255)<<sh;
+ }
+ return r;
+}
+bool alphaPass(uvec4 test,int a) {
+ if(test.x==0)return true;
+ int ref=int(test.z);
+ switch(test.y) {
+ case 0:return false;case 2:return a<ref;case 3:return a<=ref;
+ case 4:return a==ref;case 5:return a>=ref;case 6:return a>ref;case 7:return a!=ref;
+ default:return true;
+ }
+}
+int selectChannel(uint sel,int source,int dest){return sel==0?source:(sel==1?dest:0);}
+void writeDepth(uint address,uint value) {
+ uint shift=(address&1)*16,mask=65535u<<shift,index=address>>1;
+ uint old=atomicAdd(memory[index],0);
+ for(;;){uint prior=atomicCompSwap(memory[index],old,(old&~mask)|((value&65535)<<shift));if(prior==old)break;old=prior;}
+}
+void main() {
+ uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;
+ if(x>=640||y>=224)return;
+ uint tile=gl_WorkGroupID.y*80+gl_WorkGroupID.x;
+ uint start=work[tile*2],count=work[tile*2+1];
+ bool dirty=false; uint destination=0,address=0;
+ for(uint n=0;n<count;++n) {
+  Triangle t=tris[work[start+n]];
+  if(int(y)<t.bounds.z||int(y)>t.bounds.w)continue;
+  uint s=p.spanOffset+(t.span.x+y-uint(t.bounds.z))*8;
+  if(int(x)<int(work[s])||int(x)>int(work[s+1]))continue;
+  precise float py=float(y)+0.5,px=float(x)+0.5;
+  precise float k0=t.coeff0.z+t.coeff0.w*py;
+  precise float k1=t.coeff1.x+t.coeff1.y*py;
+  precise float w0=k0+t.coeff0.x*px,w1=k1+t.coeff0.y*px,w2=1.0-w0-w1;
+  precise float zf=(t.z.x*w0+t.z.y*w1)+t.z.z*w2;
+  bool flatShade=(t.tex.w&128)!=0;
+  precise float delta=float(int(x)-int(work[s]));
+  if(flatShade)zf=uintBitsToFloat(work[s+4])+t.z.w*delta;
+  uint z=zf<=0.0?0:(zf>=4294967040.0?0xffffff00u:uint(zf));
+  bool zactive=(t.state.w&1)!=0,zmasked=(t.state.w&2)!=0;
+  uint ztest=(t.state.w>>2)&3,za=0;
+  if(zactive) {
+   if(ztest==0)continue;
+   za=depthAddress(t.state.z,t.state.y,x,y);
+   uint resident=(atomicAdd(memory[za>>1],0)>>((za&1)*16))&65535;
+   if(ztest>=2&&((z&65535)<resident||(ztest==3&&(z&65535)==resident)))continue;
+  }
+  precise vec4 interpolated=(t.ca*w0+t.cb*w1)+t.cc*w2;
+  ivec4 rgba=ivec4(clamp(interpolated,vec4(0),vec4(255)));
+  if(flatShade)rgba=ivec4(clamp(t.cc,vec4(0),vec4(255)));
+  if((t.tex.w&1)!=0) {
+   precise vec3 uvq=(t.ta.xyz*w0+t.tb.xyz*w1)+t.tc.xyz*w2;
+   precise float q=(t.tex.w&4)!=0?(uvq.z!=0.0?1.0/uvq.z:1.0):1.0;
+   if((t.tex.w&4)!=0&&uvq.z!=0.0)q=fma(q,fma(-uvq.z,q,1.0),q);
+   precise float u=uvq.x*q,v=uvq.y*q;
+   if(flatShade){u=uintBitsToFloat(work[s+2])+t.coeff1.z*delta;v=uintBitsToFloat(work[s+3])+t.coeff1.w*delta;}
+   uint texel=sampleTex(t,u,v);
+   ivec4 tex=ivec4(texel&255,(texel>>8)&255,(texel>>16)&255,texel>>24);
+   bool tcc=(t.tex.w&8)!=0;
+   uint tfx=(t.tex.w>>4)&3;
+   if(tfx==0){rgba.rgb=min(ivec3(255),(tex.rgb*rgba.rgb)>>7);if(tcc)rgba.a=min(255,(tex.a*rgba.a)>>7);}
+   else if(tfx==1){rgba.rgb=tex.rgb;if(tcc)rgba.a=tex.a;}
+   else{rgba.rgb=min(ivec3(255),((tex.rgb*rgba.rgb)>>7)+rgba.a);if(tcc)rgba.a=tfx==2?min(255,tex.a+rgba.a):tex.a;}
+  }
+  bool rgbOnly=false,fb=true,zw=true;
+  if(!alphaPass(t.alpha,rgba.a)){
+   switch(t.alpha.w){case 0:continue;case 1:zw=false;break;case 2:fb=false;break;default:zw=false;rgbOnly=true;break;}
+  }
+  if(zactive&&zw&&!zmasked)writeDepth(za,z);
+  if(!fb)continue;
+  if(!dirty){address=colorAddress(t.state.x,t.state.y,x,y);destination=memory[address];dirty=true;}
+  if((t.state.w&16)!=0){
+   ivec4 dst=ivec4(destination&255,(destination>>8)&255,(destination>>16)&255,destination>>24);
+   uint bits=t.blend.x,A=bits&3,B=(bits>>2)&3,C=(bits>>4)&3,D=(bits>>6)&3;
+   int factor=C==0?rgba.a:(C==1?dst.a:int(t.blend.y));
+   for(int ch=0;ch<3;ch++){
+    int color=(((selectChannel(A,rgba[ch],dst[ch])-selectChannel(B,rgba[ch],dst[ch]))*factor)>>7)+selectChannel(D,rgba[ch],dst[ch]);
+    rgba[ch]=(t.state.w&32)!=0?clamp(color,0,255):(color&255);
+   }
+  }
+  uint result=uint(rgba.r)|(uint(rgba.g)<<8)|(uint(rgba.b)<<16)|(uint(rgba.a)<<24);
+  if(rgbOnly)result=(result&0xffffff)|(destination&0xff000000);
+  destination=(destination&t.blend.z)|(result&~t.blend.z);
+ }
+ if(dirty)memory[address]=destination;
+}
