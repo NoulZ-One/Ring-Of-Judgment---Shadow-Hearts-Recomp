@@ -123,7 +123,7 @@ Muitas coisas foram corrigidas e inseridas.
 - Os vídeos do jogo apresentavam uma quebra de som horrível. foi feito mudanças para o recompilador carregar os vídeos de forma externa;
 - Função de Salvar e Carregar o Save (apenas slot 1 por enquanto);
 
- ## V5.1
+ ## V5.1 Patch
   - Resultado da tela da batalha corrigido
   - Escala de resolução interna aprimorada até 720p (somente em VULKAN). isso fixa o pixelado dos personagens e inimigos.
   - Desempenho do recompilador levemente melhorado (ainda precisa de mais otimização)
@@ -253,7 +253,7 @@ Many fixes and additions have been implemented:
     - Button mapping
 - The in-game videos suffered from terrible audio glitches. Changes were made to the recompiler so that the videos are loaded externally.
 - Save and Load functionality (slot 1 only for now);
- ## V5.1 
+ ## V5.1 Patch
 - Battle screen result fixed 
 - Improved internal resolution scaling up to 720p (VULKAN only). This fixes the pixelation of characters and enemies. 
 - Slightly improved recompiler performance (still needs more optimization) 
