@@ -271,7 +271,8 @@ Many fixes and additions have been implemented:
 **Adjusting the game's music tracks to keep them exactly as they are is going to be a massive undertaking. I’ve been using "Brain Hopper"—the game’s battle theme—as an example, and the amount of work it’s requiring is truly immense.**
 
 ## As issues arise, they will be listed below.
-- Immediate crash of the recompiler during the "Up There!?" dialogue
+- Broken sound effects (ranging from battle sound effects to those for exploration) – will require a significant amount of time to fix;
+- Review the game’s music with the utmost care;
 
 
 ## Note: The recompiler is not yet complete. To reiterate: once the recompiler is finished, a build will be released. For now, please simply follow the development logs.
