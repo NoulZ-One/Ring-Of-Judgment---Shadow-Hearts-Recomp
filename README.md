@@ -122,16 +122,22 @@ Muitas coisas foram corrigidas e inseridas.
    - Mapeamento de botões 
 - Os vídeos do jogo apresentavam uma quebra de som horrível. foi feito mudanças para o recompilador carregar os vídeos de forma externa;
 - Função de Salvar e Carregar o Save (apenas slot 1 por enquanto);
+  V5.1
+  - Resultado da tela da batalha corrigido
+  - Escala de resolução interna aprimorada até 720p (somente em VULKAN). isso fixa o pixelado dos personagens e inimigos.
+  - Desempenho do recompilador levemente melhorado (ainda precisa de mais otimização)
+  - Analógico esquerdo melhorado (Antes as diagonais faziam o personagem caminhar, interrompendo a corrida)
+  - Slot 2 do memory card agora está habilitado. É possível salvar nele também.
+  - Alguns pixelados das letras das batalhas foram arrumados (possivelmente apenas das batalhas comuns. batalhas contra boss ainda será investigado);
+ 
+  ## Próximo patch possivelmente demore a sair. Correções de Áudio e efeitos sonoros irão dar trabalho. É possível que eu passe os Efeitos Sonoros e as Músicas de forma externa como os vídeos. Assim evita problemas com chiados ou áudios estourados.
 
 
 ## Para os próximos patch's do recompilador irei focar em:
 - No desempenho geral do jogo (sempre será necessário validar o desempenho).
 - Conferir o Áudio do jogo (essa parte vai dar bastante trabalho....);
-- Ajustar a tela de resultados da batalha - não mostra a quantidade de XP e gold ganho (estou procrastinando pra arrumar isso);
 - Fixar o serrilhado das letras na batalha e alguns pontos que passou batido;
-- Fixar o pixelado dos personagens;
 - Corrigir e Adicionar corretamente os efeitos sonoros do jogo;
-- As diagonais do controle XBOX fazem o personagem caminhar, o que é estranho. porém segurando o botão B (ou bolinha como era no PS2) o personagem corre nas diagonais. próximo patch (V6 provavelmente) isso será arrumado.
 
 **As músicas do jogo e os efeitos sonoros vão dar um enorme trabalho para ajustar e deixar como são. peguei como exemplo a Brain Hopper -  tema de batalha do jogo - e o trabalho que está dando para ajustar é extremamente grande.**
 
@@ -246,15 +252,23 @@ Many fixes and additions have been implemented:
     - Button mapping
 - The in-game videos suffered from terrible audio glitches. Changes were made to the recompiler so that the videos are loaded externally.
 - Save and Load functionality (slot 1 only for now);
+    V5.1 
+- Battle screen result fixed 
+- Improved internal resolution scaling up to 720p (VULKAN only). This fixes the pixelation of characters and enemies. 
+- Slightly improved recompiler performance (still needs more optimization) 
+- Improved left analog stick (Previously the diagonals made the character walk, interrupting the run) 
+- Memory card slot 2 is now enabled. You can save to it too.
+- Fixed pixelation issues with text during battles (likely limited to standard encounters; boss battles are still under investigation).
+
+## Next patch may take some time to come out. Audio corrections and sound effects will take work. It is possible for me to broadcast the Sound Effects and Music externally like videos. This avoids problems with hissing or bursting audio.
 
 ## For upcoming patches to the recompiler, I will focus on:
 - Regarding overall game performance (performance will always need to be validated):
 - Check the game audio (this part is going to be quite a lot of work...);
 - Adjust the battle results screen—it currently doesn't show the amount of XP and gold earned (I’ve been putting off fixing this);
 - Fix the jagged edges (aliasing) on ​​the text during battle, as well as a few other things that were overlooked;
-- Fix the pixelation of the characters;
 - Correct and properly add the game's sound effects;
-- On an Xbox controller, using the diagonal directions on the D-pad/stick causes the character to walk, which feels odd; however, holding the B button (or the 'circle' button, as it was on the PS2) allows the character to run while moving diagonally. This will be addressed in the next patch (likely V6).
+
 
 **Adjusting the game's music tracks to keep them exactly as they are is going to be a massive undertaking. I’ve been using "Brain Hopper"—the game’s battle theme—as an example, and the amount of work it’s requiring is truly immense.**
 
