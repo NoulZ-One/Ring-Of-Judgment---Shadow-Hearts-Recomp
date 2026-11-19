@@ -21,11 +21,19 @@ e continua funcionando se Vulkan estiver indisponivel no driver.
 Reinicie o jogo depois de trocar o renderizador. 60 FPS e um limite,
 nao uma garantia de desempenho em todas as cenas.
 O shader Vulkan ja acompanha o executavel; nao precisa de arquivo SPV externo.
+Em Resolucao interna (Vulkan), escolha Original (640x224), 2x (1280x448)
+ou 720p (1280x720). Reinicie o jogo para aplicar. Resolucao interna maior
+melhora o desenho 3D e pode reduzir o desempenho. A resolucao externa
+controla separadamente a janela. Sem Vulkan, o jogo usa a resolucao Original.
+Os dois cartoes de memoria ficam em Saves/Slot1 e Saves/Slot2, independentes.
+O analogico Xbox usa zona morta radial e conversao do limite circular para
+o limite do PS2, mantendo inclinacao parcial para andar e total para correr.
 Para recompilar os C++ gerados, use Ferramentas/Compilar-Jogo.ps1.
 
 Estrutura de arquivos:
   Data/Shadow Hearts (USA).iso
   Saves/Slot1/                  progresso salvo pelo jogo
+  Saves/Slot2/                  segundo cartao, independente do Slot1
   Videos/MOVIE_00.mp4 ...        videos externos preparados
   Audio/Sound Effects/          efeitos externos confirmados
 

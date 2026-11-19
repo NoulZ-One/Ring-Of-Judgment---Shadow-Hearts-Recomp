@@ -17,6 +17,7 @@ $sources = @('ps2_runtime.cpp','ps2_hle.cpp','ps2_main.cpp','ps2_table.cpp','ps2
     ForEach-Object { Get-Item -LiteralPath (Join-Path $gameDirectory $_) }
 $sources += @(Get-ChildItem -LiteralPath $gameDirectory -Filter 'ps2_functions_*.cpp')
 $headerTime = (Get-Item -LiteralPath (Join-Path $gameDirectory 'roj_settings.h'),
+    (Join-Path $gameDirectory 'roj_input.h'),
     (Join-Path $gameDirectory 'ps2rt.h'), (Join-Path $gameDirectory 'ps2_functions.h') |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
 $objects = @()

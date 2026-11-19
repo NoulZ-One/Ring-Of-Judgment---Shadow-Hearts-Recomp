@@ -11,10 +11,20 @@
 #include <vulkan/vulkan.h>
 #include <stdexcept>
 #include <chrono>
+#include <mutex>
 namespace rojvk {
 struct Range { uint32_t offset,size; };
+struct HighTarget {
+ uint32_t width=0,height=0,frame=0; bool reset=false;
+ std::vector<uint32_t>* output=nullptr;
+ uint32_t x0=0,y0=0,x1=0,y1=0; // Guest pixel bounds; zero x1 means full frame.
+};
+constexpr uint32_t HighMaxPixels=1280*720;
+constexpr uint32_t HighColorWord=1048576+4*640*224;
+constexpr uint32_t HighMemoryBytes=(HighColorWord+4*HighMaxPixels)*4;
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void* mapped{}; VkDeviceSize size{}; bool coherent{}; };
 class Device {
+ std::mutex renderMutex;
  HMODULE library{};
  VkInstance instance{}; VkPhysicalDevice physical{}; VkDevice device{}; VkQueue queue{};
  VkDescriptorSetLayout layout{}; VkDescriptorPool descriptors{}; VkDescriptorSet set{};
@@ -113,7 +123,7 @@ class Device {
   ROJ_VK_DEVICE(vkCreateFence) ROJ_VK_DEVICE(vkDestroyFence) ROJ_VK_DEVICE(vkResetFences) ROJ_VK_DEVICE(vkQueueSubmit) ROJ_VK_DEVICE(vkWaitForFences) ROJ_VK_DEVICE(vkDeviceWaitIdle)
 #undef ROJ_VK_DEVICE
   vkGetDeviceQueue(device,family,0,&queue);
-  createBuffer(buffers[0],4u*1024*1024);createBuffer(buffers[1],4096u*272);createBuffer(buffers[2],16u*1024*1024);createBuffer(buffers[3],32u*1024*1024);
+  createBuffer(buffers[0],HighMemoryBytes);createBuffer(buffers[1],4096u*272);createBuffer(buffers[2],16u*1024*1024);createBuffer(buffers[3],32u*1024*1024);
   for(unsigned i=0;i<4;i++)createBuffer(gpuBuffers[i],buffers[i].size,true);
   VkDescriptorSetLayoutBinding bindings[4]{};for(uint32_t i=0;i<4;i++)bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
   VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};li.bindingCount=4;li.pBindings=bindings;check(vkCreateDescriptorSetLayout(device,&li,nullptr,&layout),"vkCreateDescriptorSetLayout");
@@ -136,7 +146,8 @@ public:
   return available;
  }
  bool render(uint32_t* vram,const void* triangles,size_t triangleBytes,const std::vector<uint32_t>& texture,const std::vector<uint32_t>& work,const uint32_t* push,
-             const std::vector<Range>& reads,const std::vector<Range>& writes) {
+             const std::vector<Range>& reads,const std::vector<Range>& writes,const HighTarget* high=nullptr) {
+  std::lock_guard<std::mutex> lock(renderMutex);
   if(!ready())return false;
   try {
    const bool profile=std::getenv("PS2_GS_VK_PROFILE")!=nullptr;
@@ -154,7 +165,11 @@ public:
     if(uint64_t(range.offset)+range.size>4u*1024*1024||(range.offset&3)||(range.size&3)||!range.size)throw std::runtime_error("faixa de escrita Vulkan invalida");
     downloads.push_back({range.offset,range.offset,range.size});downloadBytes+=range.size;
    }
-   std::memcpy(buffers[1].mapped,triangles,triangleBytes);
+   const uint32_t highOffset=high?(HighColorWord+high->frame*HighMaxPixels)*4:0;
+   const uint32_t highBytes=high?high->width*high->height*4:0;
+   if(high&&(high->width!=1280||(high->height!=448&&high->height!=720)||high->frame>1))throw std::runtime_error("resolucao interna invalida");
+   if(high&&high->output){downloads.push_back({highOffset,highOffset,highBytes});downloadBytes+=highBytes;}
+   if(triangleBytes)std::memcpy(buffers[1].mapped,triangles,triangleBytes);
    if(!texture.empty())std::memcpy(buffers[2].mapped,texture.data(),texture.size()*4);
    std::memcpy(buffers[3].mapped,work.data(),work.size()*4);
    const auto copyTime=clock();
@@ -167,7 +182,22 @@ public:
    for(unsigned i=1;i<4;i++)if(sizes[i]){VkBufferCopy copy{0,0,sizes[i]};vkCmdCopyBuffer(command,buffers[i].buffer,gpuBuffers[i].buffer,1,&copy);}
    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};before.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;before.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
    vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,nullptr,0,nullptr);
-   vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,1,&set,0,nullptr);vkCmdPushConstants(command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,push);vkCmdDispatch(command,80,28,1);
+   vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,1,&set,0,nullptr);
+   uint32_t parameters[4];std::memcpy(parameters,push,sizeof(parameters));
+   const auto dispatch=[&](uint32_t mode,uint32_t width,uint32_t height){
+    if(high&&high->x1&&(mode==1||mode==2)){
+     width=(high->x1*high->width+639)/640-high->x0*high->width/640;
+     height=(high->y1*high->height+223)/224-high->y0*high->height/224;
+    }
+    parameters[3]=high?(high->width|(high->height<<12)|(high->frame<<24)|(uint32_t(high->reset)<<25)|(mode<<28)):0;
+    vkCmdPushConstants(command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,parameters);
+    vkCmdDispatch(command,(width+7)/8,(height+7)/8,1);
+   };
+   const auto computeBarrier=[&]{VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&b,0,nullptr,0,nullptr);};
+   if(high){dispatch(high->reset?3:2,high->width,high->height);computeBarrier();
+    if(triangleBytes){dispatch(1,high->width,high->height);computeBarrier();}}
+   if(triangleBytes)dispatch(high?4:0,640,224);
    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};after.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;after.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&after,0,nullptr,0,nullptr);
    if(!downloads.empty())vkCmdCopyBuffer(command,gpuBuffers[0].buffer,buffers[0].buffer,uint32_t(downloads.size()),downloads.data());
    VkMemoryBarrier finish{VK_STRUCTURE_TYPE_MEMORY_BARRIER};finish.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;finish.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&finish,0,nullptr,0,nullptr);
@@ -176,6 +206,7 @@ public:
    const auto waitTime=clock();
    if(!buffers[0].coherent){VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=buffers[0].memory;r.size=VK_WHOLE_SIZE;check(vkInvalidateMappedMemoryRanges(device,1,&r),"vkInvalidateMappedMemoryRanges");}
    for(const auto& range:writes)std::memcpy(reinterpret_cast<uint8_t*>(vram)+range.offset,static_cast<uint8_t*>(buffers[0].mapped)+range.offset,range.size);
+   if(high&&high->output){high->output->resize(highBytes/4);std::memcpy(high->output->data(),static_cast<uint8_t*>(buffers[0].mapped)+highOffset,highBytes);}
    if(profile)std::fprintf(stderr,"  [Vulkan PERF] uploadCPU=%.3f GPU_sync=%.3f downloadCPU=%.3f tris=%zu texels=%zu work=%zu uploadBytes=%zu downloadBytes=%zu regions=%zu/%zu\n",std::chrono::duration<double,std::milli>(copyTime-beginTime).count(),std::chrono::duration<double,std::milli>(waitTime-copyTime).count(),std::chrono::duration<double,std::milli>(clock()-waitTime).count(),triangleBytes/272,texture.size(),work.size(),uploadBytes,downloadBytes,uploads.size(),downloads.size());
    return true;
   }catch(const std::exception& e){available=false;std::fprintf(stderr,"  [Vulkan] falha: %s; lote refeito na CPU\n",e.what());return false;}

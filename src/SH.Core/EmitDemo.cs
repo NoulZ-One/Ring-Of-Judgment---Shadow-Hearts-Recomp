@@ -46,7 +46,7 @@ internal static class EmitDemo
         List<ElfSymbol> functions = Unique(allFunctions);
 
         Directory.CreateDirectory(directory);
-        foreach (string folder in new[] { "Data", "Saves", "Videos", Path.Combine("Audio", "Sound Effects") })
+        foreach (string folder in new[] { "Data", "Saves", Path.Combine("Saves", "Slot2"), "Videos", Path.Combine("Audio", "Sound Effects") })
             Directory.CreateDirectory(Path.Combine(directory, folder));
 
         // Os recursos acompanham o executavel do recompilador em qualquer pasta.

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
 
 namespace roj
 {
@@ -39,8 +40,9 @@ namespace roj
     {
         return key != 0 && std::find(bindings.keyboard.begin(), bindings.keyboard.end(), key) != bindings.keyboard.end();
     }
-    // All sources expose 0..255 pressure. The dead zones match the former
-    // fixed mapping; negative XInput values are widened before negation.
+    // XInput has a circular gate, while this game's PS2 running threshold
+    // expects the square stick range. Use radial dead zones and expand the
+    // circle onto that square, preserving partial tilt for walking.
     inline int gamepad_source_value(int source, uint16_t buttons, uint8_t lt, uint8_t rt, const int16_t* sticks)
     {
         constexpr uint16_t masks[] = {
@@ -61,7 +63,11 @@ namespace roj
         if ((positive && value <= 0) || (!positive && value >= 0)) return 0;
         const int magnitude = value < 0 ? -value : value;
         const int dead = base == 0 ? 7849 : 8689;
-        return magnitude <= dead ? 0 : std::clamp((magnitude - dead) * 255 / (32767 - dead), 0, 255);
+        const double radius = std::hypot(double(sticks[base]), double(sticks[base+1]));
+        if (radius <= dead) return 0;
+        const int peak = std::max(std::abs(int(sticks[base])), std::abs(int(sticks[base+1])));
+        const double tilt = std::clamp((radius-dead)/(32767.0-dead),0.0,1.0);
+        return std::clamp(int(std::lround(255.0*tilt*magnitude/peak)),0,255);
     }
     struct MappedInput
     {

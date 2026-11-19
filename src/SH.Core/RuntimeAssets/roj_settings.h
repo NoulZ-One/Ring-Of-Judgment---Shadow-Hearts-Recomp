@@ -19,6 +19,7 @@ namespace roj
         int aspect = 0;
         int fps = 60;
         int renderer = 1; // 0: CPU; 1: Vulkan, com fallback automatico
+        int internal_resolution = 0; // Vulkan: 0=640x224, 1=1280x448, 2=1280x720
         int master_volume = 100;
         int music_volume = 100;
         int effects_volume = 100;
@@ -36,6 +37,7 @@ namespace roj
         value.aspect = std::clamp(value.aspect, 0, 2);
         value.fps = value.fps == 30 ? 30 : 60;
         value.renderer = std::clamp(value.renderer, 0, 1);
+        value.internal_resolution = std::clamp(value.internal_resolution, 0, 2);
         value.master_volume = std::clamp(value.master_volume, 0, 100);
         value.music_volume = std::clamp(value.music_volume, 0, 100);
         value.effects_volume = std::clamp(value.effects_volume, 0, 100);
@@ -66,6 +68,7 @@ namespace roj
             else if (key == "aspect") result.aspect = value;
             else if (key == "fps") result.fps = value;
             else if (key == "renderer") result.renderer = value;
+            else if (key == "internal_resolution") result.internal_resolution = value;
             else if (key == "master_volume") result.master_volume = value;
             else if (key == "music_volume") result.music_volume = value;
             else if (key == "effects_volume") result.effects_volume = value;
@@ -87,7 +90,8 @@ namespace roj
         normalize(value);
         output << "width=" << value.width << "\nheight=" << value.height
                << "\nwindow_mode=" << value.window_mode << "\naspect=" << value.aspect
-               << "\nfps=" << value.fps << "\nrenderer=" << value.renderer << "\nmaster_volume=" << value.master_volume
+               << "\nfps=" << value.fps << "\nrenderer=" << value.renderer
+               << "\ninternal_resolution=" << value.internal_resolution << "\nmaster_volume=" << value.master_volume
                << "\nmusic_volume=" << value.music_volume << "\neffects_volume=" << value.effects_volume
                << "\ntext_aa=" << int(value.text_aa) << "\ntext_style=" << value.text_style
                << "\nlauncher_language=" << value.launcher_language << '\n';

@@ -12,6 +12,11 @@ layout(std430,binding=1) readonly restrict buffer Triangles { Triangle tris[]; }
 layout(std430,binding=2) readonly restrict buffer Textures { uint textures[]; };
 layout(std430,binding=3) readonly restrict buffer Work { uint work[]; };
 layout(push_constant) uniform Parameters { uint spanOffset; uint colorTable; uint depthTable; uint unused; } p;
+// Separate storage: guest VRAM stays exactly 4 MiB. No scaled address can
+// overlap a guest framebuffer, texture, CLUT or Z page.
+const uint nativePixels=640*224,maxPixels=1280*720;
+const uint cacheColor=1048576,cacheDepth=cacheColor+2*nativePixels;
+const uint highColor=cacheDepth+2*nativePixels,highDepth=highColor+2*maxPixels;
 uint colorAddress(uint bp,uint bw,uint x,uint y) {
  return ((((bp>>5)+(y>>5)*bw+(x>>6))<<11)+((bp&31)<<6)+work[p.colorTable+(y&31)*64+(x&63)])&0xfffff;
 }
@@ -60,30 +65,56 @@ void writeDepth(uint address,uint value) {
 }
 void main() {
  uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;
- if(x>=640||y>=224)return;
- uint tile=gl_WorkGroupID.y*80+gl_WorkGroupID.x;
+ uint mode=p.unused>>28,hw=p.unused&4095,hh=(p.unused>>12)&4095;
+ if(mode==1||mode==2){
+  uint rect=p.depthTable+4096;
+  x+=work[rect]*hw/640;y+=work[rect+1]*hh/224;
+  if(x>=(work[rect+2]*hw+639)/640||y>=(work[rect+3]*hh+223)/224)return;
+ }
+ uint frame=(p.unused>>24)&1,fbp=frame*2240;
+ bool hires=mode==1;
+ if(mode==2||mode==3) {
+  if(x>=hw||y>=hh)return;
+  uint nx=uint((float(x)+0.5)*640.0/float(hw)),ny=uint((float(y)+0.5)*224.0/float(hh));
+  uint ni=ny*640+nx,hi=frame*maxPixels+y*hw+x;
+  uint native=memory[colorAddress(fbp,10,nx,ny)];
+  uint za=depthAddress(4480,10,nx,ny),depth=(memory[za>>1]>>((za&1)*16))&65535;
+  if(mode==3||(memory[cacheColor+frame*nativePixels+ni]&0xffffff)!=(native&0xffffff))
+   memory[highColor+hi]=native;
+  else memory[highColor+hi]=(memory[highColor+hi]&0xffffff)|(native&0xff000000);
+  if(mode==3||memory[cacheDepth+frame*nativePixels+ni]!=depth)memory[highDepth+hi]=depth;
+  return;
+ }
+ if(x>=(hires?hw:640)||y>=(hires?hh:224))return;
+ precise float py=hires?(float(y)+0.5)*224.0/float(hh):float(y)+0.5;
+ precise float px=hires?(float(x)+0.5)*640.0/float(hw):float(x)+0.5;
+ uint tile=hires?(uint(py)/8)*80+uint(px)/8:gl_WorkGroupID.y*80+gl_WorkGroupID.x;
  uint start=work[tile*2],count=work[tile*2+1];
  bool dirty=false; uint destination=0,address=0;
  for(uint n=0;n<count;++n) {
   Triangle t=tris[work[start+n]];
-  if(int(y)<t.bounds.z||int(y)>t.bounds.w)continue;
-  uint s=p.spanOffset+(t.span.x+y-uint(t.bounds.z))*8;
-  if(int(x)<int(work[s])||int(x)>int(work[s+1]))continue;
-  precise float py=float(y)+0.5,px=float(x)+0.5;
+  if(hires) {if(px<float(t.bounds.x)||px>=float(t.bounds.y+1)||py<float(t.bounds.z)||py>=float(t.bounds.w+1))continue;}
+  else if(int(y)<t.bounds.z||int(y)>t.bounds.w)continue;
+  uint s=p.spanOffset+(t.span.x+(hires?uint(py):y)-uint(t.bounds.z))*8;
+  if(!hires&&(int(x)<int(work[s])||int(x)>int(work[s+1])))continue;
   precise float k0=t.coeff0.z+t.coeff0.w*py;
   precise float k1=t.coeff1.x+t.coeff1.y*py;
   precise float w0=k0+t.coeff0.x*px,w1=k1+t.coeff0.y*px,w2=1.0-w0-w1;
+  if(hires) {
+   if(w0<0||w1<0||w2<0)continue;
+   if((w0==0&&t.ta.w==0)||(w1==0&&t.tb.w==0)||(w2==0&&t.tc.w==0))continue;
+  }
   precise float zf=(t.z.x*w0+t.z.y*w1)+t.z.z*w2;
   bool flatShade=(t.tex.w&128)!=0;
   precise float delta=float(int(x)-int(work[s]));
-  if(flatShade)zf=uintBitsToFloat(work[s+4])+t.z.w*delta;
+  if(flatShade&&!hires)zf=uintBitsToFloat(work[s+4])+t.z.w*delta;
   uint z=zf<=0.0?0:(zf>=4294967040.0?0xffffff00u:uint(zf));
   bool zactive=(t.state.w&1)!=0,zmasked=(t.state.w&2)!=0;
   uint ztest=(t.state.w>>2)&3,za=0;
   if(zactive) {
    if(ztest==0)continue;
-   za=depthAddress(t.state.z,t.state.y,x,y);
-   uint resident=(atomicAdd(memory[za>>1],0)>>((za&1)*16))&65535;
+   za=hires?highDepth+frame*maxPixels+y*hw+x:depthAddress(t.state.z,t.state.y,x,y);
+   uint resident=hires?memory[za]:(atomicAdd(memory[za>>1],0)>>((za&1)*16))&65535;
    if(ztest>=2&&((z&65535)<resident||(ztest==3&&(z&65535)==resident)))continue;
   }
   precise vec4 interpolated=(t.ca*w0+t.cb*w1)+t.cc*w2;
@@ -94,7 +125,7 @@ void main() {
    precise float q=(t.tex.w&4)!=0?(uvq.z!=0.0?1.0/uvq.z:1.0):1.0;
    if((t.tex.w&4)!=0&&uvq.z!=0.0)q=fma(q,fma(-uvq.z,q,1.0),q);
    precise float u=uvq.x*q,v=uvq.y*q;
-   if(flatShade){u=uintBitsToFloat(work[s+2])+t.coeff1.z*delta;v=uintBitsToFloat(work[s+3])+t.coeff1.w*delta;}
+   if(flatShade&&!hires){u=uintBitsToFloat(work[s+2])+t.coeff1.z*delta;v=uintBitsToFloat(work[s+3])+t.coeff1.w*delta;}
    uint texel=sampleTex(t,u,v);
    ivec4 tex=ivec4(texel&255,(texel>>8)&255,(texel>>16)&255,texel>>24);
    bool tcc=(t.tex.w&8)!=0;
@@ -107,9 +138,9 @@ void main() {
   if(!alphaPass(t.alpha,rgba.a)){
    switch(t.alpha.w){case 0:continue;case 1:zw=false;break;case 2:fb=false;break;default:zw=false;rgbOnly=true;break;}
   }
-  if(zactive&&zw&&!zmasked)writeDepth(za,z);
+  if(zactive&&zw&&!zmasked){if(hires)memory[za]=z&65535;else writeDepth(za,z);}
   if(!fb)continue;
-  if(!dirty){address=colorAddress(t.state.x,t.state.y,x,y);destination=memory[address];dirty=true;}
+  if(!dirty){address=hires?highColor+frame*maxPixels+y*hw+x:colorAddress(t.state.x,t.state.y,x,y);destination=memory[address];dirty=true;}
   if((t.state.w&16)!=0){
    ivec4 dst=ivec4(destination&255,(destination>>8)&255,(destination>>16)&255,destination>>24);
    uint bits=t.blend.x,A=bits&3,B=(bits>>2)&3,C=(bits>>4)&3,D=(bits>>6)&3;
@@ -124,4 +155,15 @@ void main() {
   destination=(destination&t.blend.z)|(result&~t.blend.z);
  }
  if(dirty)memory[address]=destination;
+ if(mode==4) {
+  uint rect=p.depthTable+4096;
+  // Only acknowledge native pixels whose high-resolution counterparts
+  // were synchronized. CPU UI elsewhere must stay dirty until resolve.
+  if((p.unused&(1u<<25))==0 &&
+     (x<work[rect]||x>=work[rect+2]||y<work[rect+1]||y>=work[rect+3]))return;
+  uint ni=frame*nativePixels+y*640+x;
+  memory[cacheColor+ni]=memory[colorAddress(fbp,10,x,y)];
+  uint za=depthAddress(4480,10,x,y);
+  memory[cacheDepth+ni]=(atomicAdd(memory[za>>1],0)>>((za&1)*16))&65535;
+ }
 }

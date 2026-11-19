@@ -811,7 +811,6 @@ static inline void ee_madd(Ctx& c, int rd, int rs, int rt)
 
 // Pontos de entrada do runtime (a implementar).
 void ps2_call(Ctx& c, uint32_t target);
-void ps2_ring_hud(Ctx& c, uint32_t object);
 void ps2_tailcall(Ctx& c, uint32_t target);
 void ps2_syscall(Ctx& c);
 void ps2_break(Ctx& c, uint32_t address);
@@ -902,8 +901,7 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
         device.AppendLine("\n};").AppendLine(ReadVulkan("device"));
         return RuntimeSourceTemplate.Replace("/* SH_EMBEDDED_VU1_PROGRAMS */", programs.ToString())
             .Replace("/* SH_EMBEDDED_VULKAN_DEVICE */", device.ToString())
-            .Replace("/* SH_EMBEDDED_VULKAN_BATCH */", ReadVulkan("batch"))
-            .Replace("/* SH_EMBEDDED_RING_HUD */", ReadVulkan("ringhud"));
+            .Replace("/* SH_EMBEDDED_VULKAN_BATCH */", ReadVulkan("batch"));
     }
 
     private const string RuntimeSourceTemplate = """
@@ -2133,7 +2131,6 @@ static void dump_trace()
     std::abort();
 }
 
-void ps2_ring_hud(Ctx& c, uint32_t object);
 
 void ps2_call(Ctx& c, uint32_t target)
 {
@@ -2145,12 +2142,7 @@ void ps2_call(Ctx& c, uint32_t target)
         die();
     }
 
-    // BtlStat::Draw is dispatched by the original battle poller. Snapshot its
-    // own values after drawing, so the extra numbers follow the same actor,
-    // position, visibility and fade as the three gauges.
-    const uint32_t ring_stats = target == 0x002AD950u ? uint32_t(c.r[4].lo) : 0u;
     e->fn(c);
-    if (ring_stats) ps2_ring_hud(c, ring_stats);
 }
 
 // JR indireto: o destino precisa ser o inicio de uma funcao (tail call).
@@ -2164,9 +2156,7 @@ void ps2_tailcall(Ctx& c, uint32_t target)
         die();
     }
 
-    const uint32_t ring_stats = target == 0x002AD950u ? uint32_t(c.r[4].lo) : 0u;
     e->fn(c);
-    if (ring_stats) ps2_ring_hud(c, ring_stats);
 }
 
 // ---- hardware: por enquanto so registra os primeiros acessos ----
@@ -5345,8 +5335,9 @@ namespace
         std::vector<DirectoryEntry> listing;
         size_t listed = 0;
         bool first_info = true;
+        unsigned card_port = 0;
 
-        static fs::path root() { return g_game_directory / "Saves" / "Slot1"; }
+        fs::path root() const { return g_game_directory / "Saves" / (card_port == 0 ? "Slot1" : "Slot2"); }
 
         // Use apenas RAM do EE, incluindo seus aliases, para os buffers do RPC.
         static uint8_t* ram(Ctx& c, uint32_t addr, uint32_t count)
@@ -5430,7 +5421,7 @@ namespace
             return !*pattern;
         }
 
-        static uint32_t free_clusters()
+        uint32_t free_clusters() const
         {
             uint64_t used = 0;
             for (const auto& entry : fs::recursive_directory_iterator(root()))
@@ -5503,10 +5494,10 @@ namespace
                 if (item.second.path == path && ((flags | item.second.flags) & Write))
                     return Denied;
 
-            uint32_t fd = 0;
-            while (fd < 16 && handles.count(fd))
+            uint32_t fd = card_port * 16;
+            while (fd < (card_port + 1) * 16 && handles.count(fd))
                 ++fd;
-            if (fd == 16)
+            if (fd == (card_port + 1) * 16)
                 return -7;
 
             File file;
@@ -5674,6 +5665,7 @@ namespace
         }
 
     public:
+        explicit MemoryCard(unsigned port = 0) : card_port(port) {}
         void init()
         {
             current.clear();
@@ -5691,9 +5683,9 @@ namespace
 
             const auto field = [&](uint32_t offset) { return mrd<uint32_t>(c, send + offset); };
             const bool file_rpc = (cmd >= 3 && cmd <= 6) || cmd == 10;
-            const bool port_present = file_rpc || (field(descriptor ? 4 : 0) == 0 && field(descriptor ? 8 : 4) == 0);
+            const bool port_present = file_rpc || (field(descriptor ? 4 : 0) == card_port && field(descriptor ? 8 : 4) == 0);
             const auto status = fs::symlink_status(root());
-            // A pasta Slot1 e o marcador de formato. Um cartao ja existente nunca e apagado aqui.
+            // Cada pasta SlotN e o marcador de formato daquele cartao.
             if (fs::is_symlink(fs::symlink_status(root().parent_path())) ||
                 (fs::exists(status) && !fs::is_directory(status)))
                 return Denied;
@@ -5773,14 +5765,14 @@ namespace
 
     void mcserv_service(Ctx& c, uint32_t cmd, uint32_t send, uint32_t ssize, uint32_t recv, uint32_t rsize)
     {
-        static MemoryCard card;
+        static MemoryCard cards[2]{MemoryCard(0),MemoryCard(1)};
         static std::set<uint32_t> seen;
         if (!recv || rsize < 4)
             return;
         rpc_zero_recv(c, recv, rsize);
         if (cmd == 0xFE)
         {
-            card.init();
+            for (auto& card : cards) card.init();
             if (rsize >= 12)
             {
                 mwr<uint32_t>(c, recv + 4, 0x20Au);
@@ -5792,7 +5784,14 @@ namespace
         int result = -5;
         try
         {
-            result = card.command(c, cmd, send, ssize);
+            const bool descriptor = cmd == 1 || (cmd >= 3 && cmd <= 6) || cmd == 10 || cmd == 16;
+            const bool file_rpc = (cmd >= 3 && cmd <= 6) || cmd == 10;
+            const uint32_t physical = ee_phys(send);
+            if (c.mem && physical && uint64_t(physical) + ssize <= 0x02000000u &&
+                ssize == (descriptor ? 0x30u : 0x414u)) {
+                const unsigned port = file_rpc ? mrd<uint32_t>(c,send)/16u : mrd<uint32_t>(c,send+(descriptor?4:0));
+                result = port < 2 ? cards[port].command(c,cmd,send,ssize) : -10;
+            }
         }
         catch (const fs::filesystem_error& e)
         {
@@ -6769,6 +6768,7 @@ namespace
 
     GsState g_st;
     void gs_vk_flush();
+    void gs_vk_hi_reset(uint32_t fbp);
     void gs_vk_palette_barrier(uint32_t bp);
 
     // Registradores privilegiados (para saber qual area esta sendo exibida)
@@ -8295,39 +8295,53 @@ namespace
     static void gs_ui_filter(UiGlyphP& glyph)
     {
         const auto source = glyph.rgba;
+        unsigned peak = 0;
+        for (uint32_t pixel : source) peak = std::max(peak, pixel >> 24);
+        if (!peak) return;
+        const unsigned threshold = (peak + 1) / 2;
+        const auto sample = [&](int x, int y) -> uint32_t {
+            return x < 0 || y < 0 || x >= glyph.w || y >= glyph.h
+                ? 0u : source[size_t(y) * glyph.w + x];
+        };
+        const auto inside = [&](uint32_t pixel) { return (pixel >> 24) >= threshold; };
         for (int y = 0; y < glyph.h; ++y)
             for (int x = 0; x < glyph.w; ++x)
             {
+                const uint32_t e = sample(x,y), b = sample(x,y-1), d = sample(x-1,y);
+                const uint32_t f = sample(x+1,y), h = sample(x,y+1);
+                const bool ib=inside(b), id=inside(d), iff=inside(f), ih=inside(h);
+                if (ib == ih || id == iff) continue;
+                // Reconstrua quatro subpixels pela continuidade do contorno
+                // (regra Scale2x) e integre a cobertura. Ao contrario do blur
+                // em cruz, isso preserva hastes retas de um pixel e so trata
+                // os cantos das diagonais. O limiar acompanha o fade do texto.
+                const uint32_t subpixels[4] = {
+                    id == ib ? d : e, ib == iff ? f : e,
+                    id == ih ? d : e, ih == iff ? f : e
+                };
                 unsigned coverage = 0, red = 0, green = 0, blue = 0;
-                const auto add = [&](int sx, int sy, unsigned weight)
-                {
-                    if (sx < 0 || sx >= glyph.w || sy < 0 || sy >= glyph.h)
-                        return;
-                    const uint32_t texel = source[size_t(sy) * glyph.w + sx];
-                    const unsigned alpha = (texel >> 24) * weight;
+                for (uint32_t texel : subpixels) {
+                    const unsigned alpha = texel >> 24;
                     coverage += alpha;
                     red += (texel & 255u) * alpha;
                     green += ((texel >> 8) & 255u) * alpha;
                     blue += ((texel >> 16) & 255u) * alpha;
-                };
-                add(x, y, 12);
-                add(x-1, y, 1);
-                add(x+1, y, 1);
-                add(x, y-1, 1);
-                add(x, y+1, 1);
-                // Filtra a cobertura junto com a cor para que texels
-                // transparentes do atlas nao escurecam os contornos.
-                if (coverage)
-                    glyph.rgba[size_t(y) * glyph.w + x] = (red / coverage) |
+                }
+                // Interpolacao premultiplicada: transparencia nao injeta preto
+                // nas letras claras e a sombra preta continua preta.
+                glyph.rgba[size_t(y) * glyph.w + x] = coverage ? (red / coverage) |
                         ((green / coverage) << 8) | ((blue / coverage) << 16) |
-                        (((coverage + 8) / 16) << 24);
+                        (((coverage + 2) / 4) << 24) : 0u;
             }
     }
 
-/* SH_EMBEDDED_RING_HUD */
 
     static void gs_ui_on_sprite(const PixCfg& pc, int x0, int y0, int x1, int y1)
     {
+        if (!pc.tme && !pc.abe && !pc.ate && !pc.fbmsk && !pc.fpsm && pc.fbw == 10 &&
+            x0 <= 0 && y0 <= 0 && x1 >= 640 && y1 >= 224 &&
+            pc.sx0 == 0 && pc.sy0 == 0 && pc.sx1 >= 639 && pc.sy1 >= 223)
+            gs_vk_hi_reset(pc.fbp);
         // A limpeza opaca deste framebuffer tambem descarta a sua camada de
         // interface. O outro framebuffer ainda pode estar na janela.
         if (!g_ui_native || pc.tme || pc.abe || pc.ate || pc.fbmsk || pc.fpsm ||
@@ -8540,11 +8554,28 @@ namespace
         const bool menu_font = pc.ti.psm == 0x14u &&
             ((font_palette == 5492u && pc.ti.w == 128 && pc.ti.h == 64) ||
              (font_palette == 5613u && pc.ti.w == 256 && pc.ti.h == 64));
-        const bool known_font = caption_font || system_font || menu_font;
+        // BtlStat2: nomes e valores do HUD, atlas 512x128 da captura de batalha.
+        // Usa Z ALWAYS com escrita, por isso era rejeitado pelo caminho nativo
+        // e perdia metade das linhas da fonte no framebuffer de 224 linhas.
+        const bool battle_font = pc.ti.psm == 0x14u && font_palette == 5708u &&
+            pc.ti.w == 512 && pc.ti.h == 128 && pc.ti.tbw == 8u;
+        const bool result_font = pc.ti.psm == 0x13u &&
+            ((font_palette == 5708u && pc.ti.w == 256 && pc.ti.h == 128 && pc.ti.tbw == 4u) ||
+             (font_palette == 5732u && pc.ti.w == 128 && pc.ti.h == 32 && pc.ti.tbw == 2u));
+        const bool result_gold_label = pc.ti.psm == 0x14u && font_palette == 5582u &&
+            pc.ti.w == 1024 && pc.ti.h == 128 && pc.ti.tbw == 10u &&
+            a.u == 172.0f && a.v == 40.0f && b.u == 180.0f && b.v == 56.0f;
+        // Nome no topo e ajuda inferior: paleta 5532, CSA 4. A faixa de
+        // ajuda usa TBP 5588, abaixo do limite usado pelos outros atlas.
+        const bool battle_prompt_font = pc.ti.psm == 0x14u && font_palette == 5532u &&
+            pc.ti.csa16 == 64u && pc.ti.h == 32 &&
+            ((pc.ti.w == 256 && pc.ti.tbw == 4u) ||
+             (pc.ti.w == 1024 && pc.ti.tbw == 10u));
+        const bool known_font = caption_font || system_font || menu_font || battle_font || battle_prompt_font || result_font || result_gold_label;
         const bool writable_font_depth = known_font && pc.zactive && pc.ztst == 1u &&
-            pc.zbp >= 4480u && pc.zbp <= 15000u && pc.ti.tbp >= 5760u;
+            pc.zbp >= 4480u && pc.zbp <= 15000u && (pc.ti.tbp >= 5760u || battle_prompt_font);
         if (ui_native_enabled && g_gs_crt_int && g_gs_crt_ffmd &&
-            pc.tme && (!pc.ti.linear || known_font) && (pc.ti.psm == 0x14u || caption_font) &&
+            pc.tme && (!pc.ti.linear || known_font) && (pc.ti.psm == 0x14u || caption_font || result_font) &&
             pc.ti.tfx == 0u && pc.ti.tcc &&
             pc.fpsm == 0u && pc.fbmsk == 0u &&
             (pc.fbp == 0u || pc.fbp == 2240u) &&
@@ -9730,7 +9761,7 @@ namespace
     struct FontCapture
     {
         unsigned flip = 0, fbp = 0, psm = 0, magv = 0;
-        uint32_t w = 0, source_h = 0, h = 0;
+        uint32_t w = 0, source_h = 0, h = 0, final_w = 0, final_h = 0;
         bool spatial = false, native_ui = false;
         std::vector<uint32_t> source, reconstructed, final;
     };
@@ -10076,6 +10107,28 @@ namespace
         }
     };
 
+    static UiGlyphP gs_ui_scale_glyph(const UiGlyphP& source,unsigned width,unsigned height)
+    {
+        UiGlyphP result=source;
+        const double sx=width/640.0,sy=height/448.0;
+        result.x=int(std::lround(source.x*sx)); result.y=int(std::lround(source.y*sy));
+        result.w=int(std::lround((source.x+source.w)*sx))-result.x;
+        result.h=int(std::lround((source.y+source.h)*sy))-result.y;
+        result.clip_x0=int(std::lround(source.clip_x0*sx)); result.clip_x1=int(std::lround(source.clip_x1*sx));
+        result.clip_y0=int(std::lround(source.clip_y0*sy)); result.clip_y1=int(std::lround(source.clip_y1*sy));
+        result.rgba.assign(size_t(result.w)*result.h,0);
+        const auto sample=[&](int x,int y){return x<0||y<0||x>=source.w||y>=source.h?0u:source.rgba[size_t(y)*source.w+x];};
+        for(int y=0;y<result.h;++y)for(int x=0;x<result.w;++x){
+            const double u=(result.x+x+.5)/sx-source.x-.5,v=(result.y+y+.5)/sy-source.y-.5;
+            const int ix=int(std::floor(u)),iy=int(std::floor(v));
+            const unsigned fx=unsigned(std::lround((u-ix)*256)),fy=unsigned(std::lround((v-iy)*256));
+            const uint32_t top=gs_text_lerp(sample(ix,iy),sample(ix+1,iy),fx);
+            const uint32_t bottom=gs_text_lerp(sample(ix,iy+1),sample(ix+1,iy+1),fx);
+            result.rgba[size_t(y)*result.w+x]=gs_text_lerp(top,bottom,fy);
+        }
+        return result;
+    }
+
     void gs_present_frame()
     {
         using clk = PresentPacing::Clock;
@@ -10231,6 +10284,14 @@ namespace
                 scanout.read(capture.source.data() + (size_t)y * d.w, d, y, scanout_fast);
         }
 
+        // Em resolucao ampliada, a reconstrucao de 224 para 448 linhas seria
+        // calculada e descartada logo depois. So a execute para Original ou
+        // para as capturas F11, que precisam guardar as tres etapas.
+        std::vector<uint32_t> high_pixels;
+        unsigned high_width=d.w,high_height=d.h;
+        const bool high_ready=d.magv==2u && d.w==640u && d.h==448u && d.fbw==10u &&
+            !d.psm && !d.dbx && !d.dby && gs_vk_hi_resolve(d.fbp,high_pixels,high_width,high_height);
+        if (!high_ready || capture.w != 0) {
         if (spatial_active)
         {
             // Snapshot do MESMO framebuffer (FBP/DBX/DBY) na resolucao de origem.
@@ -10363,6 +10424,7 @@ namespace
             }
         }
 
+        }
         if (capture.w != 0)
             capture.reconstructed = pix;
 
@@ -10486,14 +10548,19 @@ namespace
             if (g_perf_gs) ++g_present_profile.aligned;
         }
 
-        // Suavize a cena antes de compor o texto nativo. Os glifos ja
-        // receberam seu proprio filtro de cobertura, preservando o contorno.
-        if (ps2_settings().text_aa)
-            gs_aa_apply_s(pix, int(d.w), int(d.h), 24.0f, 2.0f, 0.45f, nullptr);
+        // text_aa pertence somente aos glifos (gs_ui_filter). Filtrar aqui
+        // apagava detalhes de personagens e inimigos na cena inteira, mesmo
+        // quando o usuario queria suavizar apenas as letras. O filtro de cena
+        // continua disponivel explicitamente em PS2_GS_PRESENT_AA acima.
 
         // Teste P: compoe o TEXTO da propria imagem/FBP sobre o resultado
         // de 640x448. Nao faz weave e nao altera o FIELDLOCK do teste L.
         // O blend GS ALPHA=0x44 e (fonte-destino)*alfa/128+destino.
+        unsigned present_width=d.w,present_height=d.h;
+        if(high_ready){
+            for(uint32_t& pixel:high_pixels)pixel=((pixel&255u)<<16)|(pixel&0xFF00u)|((pixel>>16)&255u);
+            pix.swap(high_pixels);present_width=high_width;present_height=high_height;
+        }
         static const bool ui_native_present = g_ui_native;
         if (ui_native_present && d.magv == 2u && d.w == 640u && d.h == 448u &&
             d.dbx == 0u && d.dby == 0u)
@@ -10505,20 +10572,22 @@ namespace
                     if (glyph.fbp == d.fbp)
                         glyphs.push_back(glyph);
             }
-            gs_ui_text_background(pix, int(d.w), int(d.h), glyphs, ps2_settings().text_style);
+            if(present_width!=d.w||present_height!=d.h)
+                for(auto& glyph:glyphs)glyph=gs_ui_scale_glyph(glyph,present_width,present_height);
+            gs_ui_text_background(pix, int(present_width), int(present_height), glyphs, ps2_settings().text_style);
             for (const UiGlyphP& glyph : glyphs)
                 for (int gy = 0; gy < glyph.h; ++gy)
                 {
                     const int dy = glyph.y + gy;
-                    if (dy < 0 || dy >= (int)d.h) continue;
+                    if (dy < 0 || dy >= (int)present_height) continue;
                     for (int gx = 0; gx < glyph.w; ++gx)
                     {
                         const int dx = glyph.x + gx;
-                        if (dx < 0 || dx >= (int)d.w) continue;
+                        if (dx < 0 || dx >= (int)present_width) continue;
                         const uint32_t tex = glyph.rgba[(size_t)gy * glyph.w + gx];
                         const int alpha = (int)((tex >> 24) & 255u);
                         if (alpha == 0) continue;
-                        uint32_t& dst = pix[(size_t)dy * d.w + dx];
+                        uint32_t& dst = pix[(size_t)dy * present_width + dx];
                         const int sr = (int)(tex & 255u), sg = (int)((tex >> 8) & 255u);
                         const int sb = (int)((tex >> 16) & 255u);
                         const int dr = (int)((dst >> 16) & 255u);
@@ -10537,15 +10606,17 @@ namespace
                     d.fbp / 32u, glyphs.size());
         }
 
-        if (capture.w != 0)
+        if (capture.w != 0) {
             capture.final = pix;
+            capture.final_w=present_width;capture.final_h=present_height;
+        }
         {
             std::lock_guard<std::mutex> lk(g_win_mu);
             if (capture.w != 0)
                 g_font_capture = std::move(capture);
             g_win_pix.swap(pix);
-            g_win_w = d.w;
-            g_win_h = d.h;
+            g_win_w = present_width;
+            g_win_h = present_height;
             // Publica a sequencia junto com os pixels e as dimensoes.
             g_win_seq.fetch_add(1);
         }
@@ -10627,7 +10698,7 @@ namespace
         std::snprintf(name, sizeof name, "gs_fonte_%u_recon.bmp", id);
         gs_save_bmp(name, capture.reconstructed, capture.w, capture.h);
         std::snprintf(name, sizeof name, "gs_fonte_%u_final.bmp", id);
-        gs_save_bmp(name, capture.final, capture.w, capture.h);
+        gs_save_bmp(name, capture.final, capture.final_w?capture.final_w:capture.w, capture.final_h?capture.final_h:capture.h);
     }
 
     // Grava o quadro exibido em PPM (PS2_GSDUMP=<segundos entre dumps>).
@@ -10937,7 +11008,7 @@ namespace
     {
         if (c.kind == 0) gs_core_write(c.reg, c.a);
         else if (c.kind == 1) gs_core_image(c.a, c.b);
-        else if (c.kind == 3) gs_ring_hud(c.a, c.b, c.reg);
+        else if (c.kind == 3) { /* Legacy synthetic ring HUD: ignored after native VU fix. */ }
         else gs_priv_apply(c.reg, c.a, (unsigned)c.b);
     }
 
@@ -12508,23 +12579,6 @@ void ps2_dma_write(Ctx& c, uint32_t phys, uint64_t value)
     }
 }
 
-void ps2_ring_hud(Ctx& c, uint32_t object)
-{
-    const uint32_t address = ee_phys(object);
-    if (!c.mem || !address || address > 0x02000000u - 0xBA0u) return;
-    // BtlStat::SetVal / DspCircle: current HP, MP, SP alternate with maxima.
-    // No guest memory writes and no additional guest function calls.
-    const uint64_t values = uint64_t(mrd<uint16_t>(c, address+0xB66u)) |
-        (uint64_t(mrd<uint16_t>(c,address+0xB6Au)) << 16) |
-        (uint64_t(mrd<uint16_t>(c,address+0xB6Eu)) << 32);
-    const uint64_t position = uint64_t(mrd<uint16_t>(c,address+0xB62u)) |
-        (uint64_t(mrd<uint16_t>(c,address+0xB64u)) << 16);
-    const uint32_t alpha = (mrd<uint8_t>(c,address+0xB60u) & 16u)
-        ? std::min(128u,unsigned(mrd<uint8_t>(c,address+0xB78u))) : 0u;
-    if (g_gs_async) gs_q_push(3,alpha,values,position);
-    else { std::lock_guard<std::mutex> lock(g_gs_mu); gs_exec(GsCmd{values,position,3,alpha}); }
-}
-
 // Imprime o ranking pelo tempo de interpretacao, com o tempo do GIF em coluna propria.
 static void vif1_prof_report(double seconds)
 {
@@ -13120,11 +13174,13 @@ static void um_flags(Ctx& c, const double* r, int dest)
         else if (a != 0.0 && a < 1.1754943508222875e-38) { unf |= m; zero |= m; }
         else if (a == 0.0) zero |= m;
 
-        if (std::signbit(v) && a != 0.0) sign |= m;
+        if (std::signbit(v)) sign |= m;
     }
 
-    const uint32_t mac = (sign << 12) | (zero << 8) | (unf << 4) | ovf;
-    const uint32_t st = ((mac & 0x0F00u) ? 1u : 0u) | ((mac & 0xF000u) ? 2u : 0u) | ((mac & 0x00F0u) ? 4u : 0u) | ((mac & 0x000Fu) ? 8u : 0u);
+    // MAC: Z[3:0], S[7:4], U[11:8], O[15:12]; lane x=3 ... w=0.
+    // FMAND reads these bit positions directly (including the UI sprite clipper).
+    const uint32_t mac = zero | (sign << 4) | (unf << 8) | (ovf << 12);
+    const uint32_t st = ((mac & 0x000Fu) ? 1u : 0u) | ((mac & 0x00F0u) ? 2u : 0u) | ((mac & 0x0F00u) ? 4u : 0u) | ((mac & 0xF000u) ? 8u : 0u);
     c.vi[17] = mac;
     c.vi[16] = (c.vi[16] & 0xFF0u) | st | (st << 6);
 }

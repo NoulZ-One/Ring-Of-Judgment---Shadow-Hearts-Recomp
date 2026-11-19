@@ -29,8 +29,9 @@ pois transferir alguns triangulos pequenos pode custar mais que desenha-los.
 Os buffers de trabalho ficam na memoria da GPU. Transferencias e fences
 sincronizam os resultados com a VRAM do runtime antes de desenhos por CPU,
 uploads, leituras dependentes e apresentacao. Os sprites e fontes continuam
-no caminho existente. A resolucao interna do GS e a reconstrucao espacial
-continuam iguais; as resolucoes do launcher controlam a saida externa.
+no caminho existente. A VRAM do GS continua no formato original; a resolucao
+interna ampliada usa buffers separados. O seletor de resolucao externa do
+launcher continua controlando o tamanho da janela ou da tela cheia.
 A apresentacao da janela continua no caminho GDI existente; Vulkan executa
 o desenho dos lotes selecionados, antes da composicao e apresentacao.
 
@@ -58,6 +59,42 @@ e dos estados salvos das primitivas, depois mantem CPU para a sessao.
 
 Nao ha geracao de quadros nem alteracao da velocidade da logica do jogo.
 O limite de 60 FPS nao garante 60 FPS em todas as cenas.
+
+## Resolucao interna
+
+`internal_resolution` no INI seleciona Original (0: GS 640x224 com a
+reconstrucao existente), 2x (1: 1280x448) ou 720p (2: 1280x720). O padrao
+para configuracoes antigas continua Original. E preciso reiniciar o jogo.
+`PS2_GS_INTERNAL_RESOLUTION=0/1/2` permite comparar os modos em diagnostico.
+
+Os vertices e os texels sao reamostrados em cada pixel da imagem ampliada;
+nao e apenas um aumento da imagem pronta. Cor e Z16 ficam em regioes
+separadas do buffer Vulkan, fora das 4 MiB originais. O desenho nativo
+continua sendo executado para preservar leituras de framebuffer, efeitos,
+transferencias e a logica do jogo. A imagem ampliada usa uma regra de
+arestas compartilhadas para evitar blend duplicado entre dois triangulos.
+
+Antes de cada lote e da apresentacao, o shader sincroniza as mudancas
+feitas pela CPU. Snapshots da imagem nativa distinguem essas mudancas dos
+detalhes novos rasterizados na GPU. A limpeza do framebuffer invalida o
+buffer correspondente, incluindo quando a cor de fundo nao mudou.
+Os glifos originais e o HUD sao compostos nas coordenadas da nova imagem,
+com interpolacao de cobertura premultiplicada; o estilo de contorno/faixa
+permanece independente. A captura F11 registra as dimensoes finais corretas.
+
+Os modos ampliados exigem Vulkan. Estados de desenho fora do caminho
+compativel continuam usando o resultado nativo da CPU na regiao afetada;
+na ausencia/falha de Vulkan, a apresentacao volta ao caminho Original.
+O custo inclui rasterizacao nativa e ampliada, sincronizacao e leitura da
+imagem maior. A taxa de quadros deve ser medida em gameplay.
+
+`tests/internal-resolution.cpp`, compilado como fixture isolada do runtime,
+exige uma GPU Vulkan real. Execute com PS2_GS_THREAD=0,
+PS2_GS_RENDERER=vulkan e PS2_GS_INTERNAL_RESOLUTION=1 e depois 2. Verifica
+geometria subpixel, gradientes, textura em perspectiva, oclusao por Z,
+transparencias em arestas compartilhadas, persistencia entre lotes,
+sobreposicoes da CPU, limpeza e os dois framebuffers. A VRAM nativa deve
+continuar identica, nas 4 MiB, ao desenho de referencia na CPU.
 
 ## Atualizacao do shader
 

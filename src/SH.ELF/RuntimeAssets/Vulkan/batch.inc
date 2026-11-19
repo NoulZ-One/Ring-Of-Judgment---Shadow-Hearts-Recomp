@@ -19,6 +19,15 @@ std::vector<uint32_t> g_vk_bins[80*28];
 bool g_vk_written[16384]{};
 bool g_vk_read[16384]{};
 bool g_vk_replaying=false;
+bool g_vk_high_reset[2]{true,true};
+bool g_vk_high_compatible=true;
+static bool gs_vk_requested();
+static bool gs_vk_high_dimensions(unsigned& width,unsigned& height) {
+ int mode=ps2_settings().internal_resolution;
+ if(const char* value=std::getenv("PS2_GS_INTERNAL_RESOLUTION"))mode=std::clamp(std::atoi(value),0,2);
+ if(!mode||!gs_vk_requested())return false;
+ width=1280;height=mode==1?448:720;return true;
+}
 uint64_t g_vk_batches=0,g_vk_rendered=0,g_vk_cpu=0;
 uint64_t g_vk_prepare_ns=0;
 uint64_t g_vk_estimated_ns=0;
@@ -61,7 +70,20 @@ void gs_vk_flush() {
   const char* value=std::getenv("PS2_GS_VK_MIN_WORK_US");
   return uint64_t(value?std::clamp(std::atoi(value),0,100000):4000)*1000;
  }();
- const bool useGPU=validate||std::getenv("PS2_GS_VK_SINGLE")||g_vk_estimated_ns>=minimumWork;
+ unsigned highWidth=0,highHeight=0;
+ const bool highActive=gs_vk_high_dimensions(highWidth,highHeight)&&g_vk_high_compatible;
+ rojvk::HighTarget high{highWidth,highHeight,g_vk_triangles.front().state[0]==0?0u:1u,false,nullptr};
+ if(highActive){
+  high.reset=g_vk_high_reset[high.frame];
+  if(!std::getenv("PS2_GS_HI_FULL_FRAME")){
+   int x0=639,y0=223,x1=0,y1=0;
+   for(const auto& triangle:g_vk_triangles){x0=std::min(x0,triangle.bounds[0]);x1=std::max(x1,triangle.bounds[1]+1);y0=std::min(y0,triangle.bounds[2]);y1=std::max(y1,triangle.bounds[3]+1);}
+   high.x0=unsigned(x0);high.y0=unsigned(y0);high.x1=unsigned(x1);high.y1=unsigned(y1);
+  }
+  for(unsigned i=high.frame*2240;i<(high.frame+1)*2240;++i)g_vk_read[i]=true;
+  for(unsigned i=4480;i<4480+1280;++i)g_vk_read[i]=true;
+ }
+ const bool useGPU=highActive||validate||std::getenv("PS2_GS_VK_SINGLE")||g_vk_estimated_ns>=minimumWork;
  std::vector<uint32_t> work;
  uint32_t push[4]{};
  if(useGPU){
@@ -83,13 +105,15 @@ void gs_vk_flush() {
  for(unsigned y=0;y<32;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_ct32[y][x]);
  push[2]=uint32_t(work.size());
  for(unsigned y=0;y<64;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_z16s[y][x]);
+ if(highActive){const uint32_t bounds[]{high.x0,high.y0,high.x1?high.x1:640u,high.y1?high.y1:224u};work.insert(work.end(),std::begin(bounds),std::end(bounds));}
  }
  const auto ranges=[](const bool* blocks){
   std::vector<rojvk::Range> result;
   for(unsigned i=0;i<16384;){if(!blocks[i]){++i;continue;}const unsigned first=i;while(i<16384&&blocks[i])++i;result.push_back({first*256,(i-first)*256});}
   return result;
  };
- const bool ok=useGPU&&g_vk_device.render(g_vram,g_vk_triangles.data(),g_vk_triangles.size()*sizeof(VkTriangle),g_vk_texels,work,push,ranges(g_vk_read),ranges(g_vk_written));
+ const bool ok=useGPU&&g_vk_device.render(g_vram,g_vk_triangles.data(),g_vk_triangles.size()*sizeof(VkTriangle),g_vk_texels,work,push,ranges(g_vk_read),ranges(g_vk_written),highActive?&high:nullptr);
+ if(ok&&highActive)g_vk_high_reset[high.frame]=false;
  if(ok){++g_vk_batches;g_vk_rendered+=g_vk_triangles.size();}
  std::vector<uint32_t> gpu;
  if(validate&&ok){gpu.assign(std::begin(g_vram),std::end(g_vram));std::memcpy(g_vram,initial.data(),sizeof(g_vram));}
@@ -110,8 +134,29 @@ void gs_vk_flush() {
  g_vk_triangles.clear();g_vk_fallback.clear();g_vk_textures.clear();g_vk_texels.clear();g_vk_spans.clear();
  g_vk_estimated_ns=0;
  g_vk_texture_size=0;
+ g_vk_high_compatible=true;
  for(auto& bin:g_vk_bins)bin.clear();std::fill(std::begin(g_vk_written),std::end(g_vk_written),false);
  std::fill(std::begin(g_vk_read),std::end(g_vk_read),false);
+}
+void gs_vk_hi_reset(uint32_t fbp) {
+ if(fbp==0||fbp==2240)g_vk_high_reset[fbp==0?0:1]=true;
+}
+static bool gs_vk_hi_resolve(uint32_t fbp,std::vector<uint32_t>& pixels,unsigned& width,unsigned& height) {
+ if((fbp!=0&&fbp!=2240)||!gs_vk_high_dimensions(width,height)||!g_vk_device.ready())return false;
+ gs_vk_flush();
+ std::vector<uint32_t> work;
+ for(unsigned y=0;y<32;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_ct32[y][x]);
+ const unsigned depthTable=unsigned(work.size());
+ for(unsigned y=0;y<64;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_z16s[y][x]);
+ const uint32_t bounds[]{0,0,640,224};work.insert(work.end(),std::begin(bounds),std::end(bounds));
+ uint32_t push[4]{0,0,depthTable,0};
+ rojvk::HighTarget target{width,height,fbp==0?0u:1u,g_vk_high_reset[fbp==0?0:1],&pixels};
+ const std::vector<rojvk::Range> reads{{fbp*256,2240*256},{4480*256,1280*256}};
+ if(!g_vk_device.render(g_vram,nullptr,0,{},work,push,reads,{},&target))return false;
+ g_vk_high_reset[target.frame]=false;
+ static unsigned reports=0;
+ if(reports++<2)std::fprintf(stderr,"  [GS resolucao interna] Vulkan %ux%u, VRAM original preservada\n",width,height);
+ return true;
 }
 void gs_vk_palette_barrier(uint32_t bp) {
  if(g_vk_replaying||g_vk_triangles.empty())return;
@@ -210,6 +255,11 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
  }
  triangle.tex[0]=textureOffset;triangle.tex[1]=pc.ti.w;triangle.tex[2]=pc.ti.h;
  triangle.tex[3]=(pc.tme?1u:0u)|(pc.ti.linear?2u:0u)|(perspective?4u:0u)|(pc.ti.tcc?8u:0u)|(pc.ti.tfx<<4)|(flat?128u:0u);
+ for(unsigned i=0;i<3;++i){
+  const auto& p=*vertices[(i+1)%3];const auto& q=*vertices[(i+2)%3];
+  const float dx=(q.x-p.x)*(area>0?1:-1),dy=(q.y-p.y)*(area>0?1:-1);
+  triangle.uvq[i*4+3]=(dy>0||(dy==0&&dx<0))?1.0f:0.0f;
+ }
  int32_t bounds[]{minx,maxx,miny,maxy};std::memcpy(triangle.bounds,bounds,sizeof(bounds));
  uint32_t state[]{pc.fbp,pc.fbw,pc.zbp,(pc.zactive?1u:0u)|(pc.zmsk?2u:0u)|(pc.ztst<<2)|(pc.abe?16u:0u)|(pc.clamp?32u:0u)};std::memcpy(triangle.state,state,sizeof(state));
  uint32_t alpha[]{unsigned(pc.ate),pc.atst,unsigned(pc.aref),pc.afail};std::memcpy(triangle.alpha,alpha,sizeof(alpha));
@@ -230,6 +280,7 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
   g_vk_spans.insert(g_vk_spans.end(),3,0u);
  }
  const unsigned index=unsigned(g_vk_triangles.size());g_vk_triangles.push_back(triangle);
+ if(pc.zactive&&pc.zbp!=4480)g_vk_high_compatible=false;
  VkFallback saved{};saved.ci=ci;saved.a=a;saved.b=b;saved.c=c;saved.state=g_st;std::memcpy(saved.provenance,g_clut_prov,sizeof(saved.provenance));g_vk_fallback.push_back(std::move(saved));
  for(int ty=miny/8;ty<=maxy/8;ty++)for(int tx=minx/8;tx<=maxx/8;tx++)g_vk_bins[ty*80+tx].push_back(index);
  for(int y=miny&~7;y<=maxy;y+=8)for(int x=minx&~7;x<=maxx;x+=8){
@@ -241,6 +292,8 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
 }
 #else
 void gs_vk_flush(){}
+void gs_vk_hi_reset(uint32_t){}
+static bool gs_vk_hi_resolve(uint32_t,std::vector<uint32_t>&,unsigned&,unsigned&){return false;}
 void gs_vk_palette_barrier(uint32_t){}
 static bool gs_vk_enqueue(int,const GsVertex&,const GsVertex&,const GsVertex&,const PixCfg&,int,int,int,int){return false;}
 #endif
