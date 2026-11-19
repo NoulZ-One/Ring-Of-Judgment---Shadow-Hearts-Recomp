@@ -34,7 +34,7 @@ O progresso atual é aproximadamente:
 
 ## **Aproximadamente 80%**
 
-> Essa porcentagem representa o avanço estrutural do projeto como um todo e não significa que 50% do jogo já esteja recompilado.
+> Essa porcentagem representa o avanço estrutural do projeto como um todo e não significa que 80% do jogo já esteja recompilado.
 > Conforme for avançando, a porcentagem será modificada.
 > Quando estiver concluído, será liberado uma build.
 
@@ -44,7 +44,7 @@ Current progress:
 
 ## **Approximately 50%**
  
-> This percentage represents the structural progress of the project as a whole and does not mean that 50% of the game has already been recompiled.
+> This percentage represents the structural progress of the project as a whole and does not mean that 80% of the game has already been recompiled.
 > As development progresses, the percentage will be adjusted.
 > Once completed, a build will be released.
 
@@ -73,16 +73,11 @@ Ainda requer testes para saber se é totalmente jogável do começo até o fim d
 ## Próximo passo / prioridade atual:
 
 **Corrigir defeitos visuais dos personagens e otimizações**
+**Corrigir Efeitos sonoros e as músicas**
 
-Marco alcançado: primeiras imagens do jogo!
-
-O projeto alcançou um importante marco técnico: as primeiras imagens reconhecíveis de Shadow Hearts foram geradas com sucesso!
-Ao executar o ps2_game.exe, o runtime produz arquivos no formato .PPM, contendo os primeiros resultados visuais do jogo, incluindo o logotipo da Aruze e a tela de título de Shadow Hearts.
-Esse avanço demonstra que partes importantes do pipeline gráfico do PlayStation 2, incluindo o processamento de comandos gráficos e a escrita na memória gráfica, já estão funcionando na implementação própria do projeto.
+É possível que próximo patch o recompilador utilize efeitos sonoros externos (como os vídeos atuais). assim previne problemas com efeitos sonoros estourados ou chiando.
 
 ## Estado atual
-
-Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresenta problemas, como duplicação de elementos, posicionamento incorreto, faixas pretas e áreas não renderizadas corretamente.
 
 ## V1 
 - Duplicação das imagens corrigida;
@@ -201,19 +196,12 @@ Further testing is required to determine whether the game is fully playable from
 
 ## Next step / Current Priority:
 
-**Fixing visual defects on characters and optimizations**
+**Fix visual defects on characters and implement optimizations**
+**Fix sound effects and music**
 
-Milestone reached: first in-game images!
-
-The project has hit a significant technical milestone: the first recognizable images from *Shadow Hearts* have been successfully generated!
-
-When running `ps2_game.exe`, the runtime produces files in .PPM format, containing the initial visual output from the game—including the Aruze logo and the *Shadow Hearts* title screen.
-
-This breakthrough demonstrates that key components of the PlayStation 2 graphics pipeline—such as the processing of graphics commands and writing to graphics memory—are already functional within the project’s custom implementation.
+It is possible that in the next patch, the recompiler will use external sound effects (similar to the current videos). This will help prevent issues with sound effects that are distorted or crackling.
 
 ## Current Status
-
-Although the initial images are recognizable, the rendering still presents issues, such as duplicated elements, incorrect positioning, black bars, and areas that are not rendered correctly.
 
 ## V1
 - Image duplication fixed;
@@ -284,7 +272,6 @@ Many fixes and additions have been implemented:
 
 ## About the code
 
-When running the solution (`dotnet run --project src\SH.Core`), an `OUT/` folder is generated, containing C++ (`.cpp`) files. The game executable must be compiled separately using msys64.
-Running `ps2_game.exe` produces logs that make it possible to analyze runtime behavior, identify issues, and investigate any crashes that may occur while the game is running.
+
 
 ---
