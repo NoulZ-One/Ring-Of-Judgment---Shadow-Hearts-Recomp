@@ -22,10 +22,9 @@ The project is being developed primarily in **C# / .NET** 10.
 
 # Vulkan
 
-> No Futuro, é certo a implementação de **Vulkan**, para que também seja possível jogar no linux.
+Já inserido.
 
-
-> In the future, the implementation of **Vulkan** is certain, which will also make it possible to play on Linux.
+Already inserted.
 
 ---
 
@@ -33,7 +32,7 @@ The project is being developed primarily in **C# / .NET** 10.
 
 O progresso atual é aproximadamente:
 
-## **~50%**
+## **Aproximadamente 80%**
 
 > Essa porcentagem representa o avanço estrutural do projeto como um todo e não significa que 50% do jogo já esteja recompilado.
 > Conforme for avançando, a porcentagem será modificada.
@@ -43,7 +42,7 @@ O progresso atual é aproximadamente:
 
 Current progress:
 
-## **~50%**
+## **Approximately 50%**
  
 > This percentage represents the structural progress of the project as a whole and does not mean that 50% of the game has already been recompiled.
 > As development progresses, the percentage will be adjusted.
@@ -64,67 +63,16 @@ Current progress:
 ---
 
 # Estado atual
+O recompilador atualmente está cerca de 80%. É possível iniciar um novo jogo, salvar (apenas no slot 1 por enquanto.) carregar um save existente. Ainda há coisas a serem feitas que serão listadas abaixo, entretanto, o recompilador demonstrou avanços significativos.
 
+Ainda requer testes para saber se é totalmente jogável do começo até o fim do jogo. Aos poucos vou atualizando o Readme com os avanços.
 
-> 1. Carregamento do executável ELF
-
-- O executável do jogo foi carregado no endereço 0x00200000.
-- A análise estática identificou 4.706 funções com símbolos.
-- O processo já consegue avançar da etapa de carregamento para a execução de código.
-
-> 2. Geração de código C++
-
-- Foram geradas 4.708 funções C++.
-- 62 funções receberam implementações alternativas via HLE (High-Level Emulation).
-- A geração não registrou falhas.
-
-> 3. Leitura da ISO e dos arquivos do jogo
-
-- A ISO americana foi reconhecida.
-- As operações de leitura do sistema de arquivos aparecem com resultado ok.
-- O runtime localizou e leu arquivos como MODELS.PKB, COMMON.PKB e TEXTURE.PKB.
-- Isso demonstra que a infraestrutura de leitura já está avançada, embora não prove que todos os recursos são interpretados corretamente.
-
-
-> 4. Execução de serviços e criação de threads
-
-Os logs registram atividade relacionada a:
-- Criação de threads e uso de semáforos.
-- Chamadas RPC.
-- Serviços FIO, RSSD e MCSERV.
-- Inicialização de componentes associados a controles e áudio.
-Isso mostra que o jogo já interage com diversas partes do ambiente de execução. Ainda não comprova que todos esses serviços tenham comportamento equivalente ao do PS2 original.
-
-> 5. Chegada às rotinas gráficas
-
-Foram observadas chamadas a funções como RenderPrim, RenderPmBlend, GsxSetRmVertex e rotinas relacionadas a DMA e ao processamento gráfico.
-Isso é um marco importante: o fluxo do jogo alcança código relacionado à renderização. Porém, ainda não há comprovação de que os comandos gráficos produzam uma imagem correta na tela.
-
-> 6. O jogo chegou em sua primeira gameplay
-
-O jogo apresentou a sua primeira gameplay. é possível passar da tela de título e chegar a primeira e segunda tela do trem (com sorte se não iniciar alguma batalha)
-
----
-
-
-| **Subsistema** | **Situação indicada pelos logs** |
-|---|---|
-| CPU e instruções MIPS/R5900 | O código é executado, mas há instruções que ainda precisam ser implementadas ou verificadas. |
-| Memória e execução | O executável é carregado e o runtime avança por diversas rotinas; não há validação completa de todos os acessos à memória e exceções. |
-| Sistema de arquivos | Leituras da ISO e de arquivos do jogo foram observadas com sucesso. |
-| Syscalls e serviços do PS2 | Diversos serviços são chamados; falta validar completamente os resultados e a semântica de cada implementação. |
-| DMA e processamento gráfico | Há atividade registrada, mas não está demonstrado que todo o fluxo de transferência e renderização esteja correto. |
-| Memory Card | Há chamadas como `sceMcGetSlotMax`, `sceMcOpen` e `sceMcClose`, mas não há comprovação de gravação e carregamento persistentes. |
-| Áudio e controles | Há sinais de inicialização e chamadas relacionadas, mas não há teste funcional comprovado. |
---
-
-**O JOGO EXIBIU SUAS PRIMEIRAS IMAGENS**
 
 ---
 
 ## Próximo passo / prioridade atual:
 
-**Corrigir e estabilizar a renderização do GS (Graphics Synthesizer)**
+**Corrigir defeitos visuais dos personagens e otimizações**
 
 Marco alcançado: primeiras imagens do jogo!
 
@@ -163,19 +111,40 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 - Foi Fixado o Slow-Motion do game (VIVA!!!!);
 - Suporte a controle adicionado! Agora é possível usar um controle de XBOX para jogar!
 
+## V5 Patch
+Muitas coisas foram corrigidas e inseridas.
+- Vulkan adicionado;
+- Letras do menu agora são legíveis;
+- Fundo escuro nos diálogos foi corrigido;
+- Launcher próprio para o jogo foi criado. Nele tem opções de: 
+   - Resolução externa até 4K; 
+   - Controle de volume dos efeitos sonoros e músicas. conta com uma opção de Volume geral; 
+   - Renderizador (CPU ou VULKAN);
+   - Estilo das letras (Faixa preta como no original e uma nova opção: Borda preta!); 
+   - Proporção de Imagem (no momento apenas 2 estão disponíveis. 4:3 e 16:9) estou vendo a possibilidade de por 21:9 também;
+   - Limite de quadros: 30 ou 60 FPS; 
+   - Opções de janela (Tela Cheia, Janela sem bordas e Tela cheia sem bordas);
+   - Mapeamento de botões 
+- Os vídeos do jogo apresentavam uma quebra de som horrível. foi feito mudanças para o recompilador carregar os vídeos de forma externa;
+- Função de Salvar e Carregar o Save (apenas slot 1 por enquanto);
+
 
 ## Para os próximos patch's do recompilador irei focar em:
-- No desempenho geral do jogo (rodar 60 FPS e eliminar os stutter).
-- Fixar o Serrilhado das letras (geral);
-- Adicionar o Áudio do jogo; (essa parte vai dar bastante trabalho....)
-- Fixar o pixelado dos personagens
+- No desempenho geral do jogo (sempre será necessário validar o desempenho).
+- Conferir o Áudio do jogo (essa parte vai dar bastante trabalho....);
+- Ajustar a tela de resultados da batalha - não mostra a quantidade de XP e gold ganho (estou procrastinando pra arrumar isso);
+- Fixar o serrilhado das letras na batalha e alguns pontos que passou batido;
+- Fixar o pixelado dos personagens;
+- Corrigir e Adicionar corretamente os efeitos sonoros do jogo;
+- As diagonais do controle XBOX fazem o personagem caminhar, o que é estranho. porém segurando o botão B (ou bolinha como era no PS2) o personagem corre nas diagonais. próximo patch (V6 provavelmente) isso será arrumado.
 
-**As músicas do jogo vão dar um enorme trabalho para ajustar e deixar como elas são. peguei como exemplo a Brain Hopper -  tema de batalha do jogo - e o trabalho que está dando é extremamente grande.**
+**As músicas do jogo e os efeitos sonoros vão dar um enorme trabalho para ajustar e deixar como são. peguei como exemplo a Brain Hopper -  tema de batalha do jogo - e o trabalho que está dando para ajustar é extremamente grande.**
 
 ## Conforme for aparecendo problemas, serão listados abaixo.
-- Crash imediato do recompilador no diálogo "Up There!?"   
+- Efeitos sonoros quebrados (desde os efeitos sonoros da batalha até os de exploração) - precisará de um bom tempo para arrumar;
+- Checar com máxima cautela as músicas do jogo;
 
-## Nota: O recompilador ainda não está pronto. Volto a Frisar bem: Quando o recompilador estiver pronto, uma BUILD será liberada. Por hora, apenas acompanhe os Logs de desenvolvimento.
+## Nota: O recompilador está quase pronto. Volto a Frisar bem: Quando o recompilador estiver pronto, uma BUILD será liberada. Por hora, apenas acompanhe os Logs de desenvolvimento.
 
 ## Nota 2: É possível que os próximos Logs demorem um pouco mais que o normal para serem exibidos ou atualizados. Só farei atualizações tanto no repositório, quanto nos logs, quando obtiver avanços significativos.
 
@@ -183,69 +152,46 @@ Embora as primeiras imagens sejam reconhecíveis, a renderização ainda apresen
 ---
 ## Sobre o código
 
-Ao executar a solução (`dotnet run --project src\SH.Core`), é gerada a pasta `OUT/`, contendo os arquivos C++ (`.cpp`). o executável do jogo precisa ser compilado a parte usando msys64.
-Ao executar o `ps2_game.exe`, são gerados logs que permitem analisar o comportamento do runtime, identificar problemas e investigar os próximos bloqueios durante a execução do jogo.
+
 
 ---
-## Primeiras imagens do jogo / First images of the game 
-<img width="640" height="448" alt="gs_002" src="https://github.com/user-attachments/assets/d78ebecf-8f64-42f5-bd33-7e08db4d28d0" />
-<img width="637" height="477" alt="image" src="https://github.com/user-attachments/assets/852a01c4-40df-4c61-ba82-9d4d26334291" />
-<img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/d78a7058-9e35-42e7-8bf4-acc9560e1e31" />
-<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/02e8002a-0ab9-4e6b-976d-b0b090dda5c1" />
-<img width="1510" height="812" alt="image" src="https://github.com/user-attachments/assets/16ec21c7-0f71-46fb-9e22-b5cb28723d29" />
+## imagens do jogo / Images of the game 
+
+<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/e4c1f944-1122-4e13-921c-0c235b1e2951" />
+<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/2deba2df-4c9b-4258-b7fd-376f37c1f4be" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/1a3825dd-aa24-41ce-9746-b01ef1c94249" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/a6f7f5fb-26b6-443c-82db-a76e16ea9349" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/0cc906bd-04cc-4605-b570-6f6c4daf202b" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/dba5b99e-2c67-47fe-a5ce-a223e462eba2" />
+<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/5d5abec8-41d9-4753-bc80-379e6fcd53ec" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/2e8aad64-3eed-4ca2-94e0-696f3ca2599c" />
+<img width="1919" height="1032" alt="image" src="https://github.com/user-attachments/assets/820812c7-8ece-4986-a01f-575e733f9c78" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/ac23a7fd-d1d6-4f7b-aaa6-5ae8d329d790" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/c2903bc7-154a-4b11-942b-1e3904edd6ce" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/39f41958-65bb-42ce-92c2-7d990bface10" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/23d6f532-8437-434a-8416-529ae02897f7" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/9f863b80-7566-434d-9015-3d14d3045f09" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/ee353b90-21b2-4226-a028-89d58d27fbce" />
+<img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/6b6d2a08-525c-4850-bf05-4fbf32cf486a" />
+
+
+
+
+
+
+
+
+
+
+
+
 
 ---
 # Current Status
 
-> 1. Loading of the ELF executable
+The recompiler is currently about 80% complete. It is possible to start a new game, save (currently only in slot 1), and load an existing save file. There are still tasks to be completed—listed below—but the recompiler has shown significant progress.
 
-- The game executable was loaded at address 0x00200000.
-- Static analysis identified 4,706 functions with symbols.
-- The process is now able to move past the loading stage and proceed to code execution.
-
-> 2. C++ code generation
-
-- 4,708 C++ functions were generated.
-- 62 functions received alternative implementations via HLE (High-Level Emulation).
-- The generation process encountered no failures.
-- There are still 11 instructions reported as unsupported at this stage (9 VCALLMSR, 1 VCALLMS e 1 PMULTH).
-
-> 3. Reading of the ISO and game files
-
-- The ISO USA has been recognized.
-- File system read operations are returning an "OK" result.
-- The runtime has located and read files such as MODELS.PKB, COMMON.PKB, and TEXTURE.PKB.
-- This demonstrates that the read infrastructure is already well-developed, though it does not prove that all assets are being interpreted correctly.
-
-> 4. Execution of services and creation of threads
-
-The logs record activity related to:
-- Thread creation and the use of semaphores.
-- RPC calls.
-- FIO, RSSD, and MCSERV services.
-- Initialization of components associated with controls and audio.
-This shows that the game already interacts with various parts of the execution environment. It does not yet prove that all these services behave in a way equivalent to the original PS2.
-
-> 5. Reaching the graphics routines
-
-Calls to functions such as RenderPrim, RenderPmBlend, and GsxSetRmVertex—along with routines related to DMA and graphics processing—have been observed.
-This is a significant milestone: the game’s execution flow is reaching code associated with rendering. However, there is no confirmation yet that these graphics commands actually produce a correct image on the screen.
-
-> 6. The game has reached its first playable state
-
-The game has unveiled its first gameplay. It is now possible to move past the title screen and reach the first and second screens of the train (provided a battle doesn't trigger).
-
----
-
-| **Subsystem** | **Status indicated by logs** |
-|---|---|
-| CPU and MIPS/R5900 instructions | Code is being executed, but some instructions still require implementation or verification. |
-| Memory and execution | The executable is loaded, and the runtime progresses through various routines; however, not all memory accesses and exceptions have been fully validated. |
-| File system | Successful read operations from the ISO and game files have been observed. |
-| PS2 Syscalls and services | Various services are being called; the results and the semantics of each implementation have yet to be fully validated. |
-| DMA and graphics processing | Activity has been recorded, but it has not been demonstrated that the entire transfer and rendering flow is correct. |
-| Memory Card | Calls such as `sceMcGetSlotMax`, `sceMcOpen`, and `sceMcClose` are present, but there is no confirmation of persistent saving or loading. |
-| Audio and controls | There are signs of initialization and related calls, but no proven functional testing. |
+Further testing is required to determine whether the game is fully playable from start to finish. I will gradually update the Readme as progress is made.
 
 ---
 
@@ -255,7 +201,7 @@ The game has unveiled its first gameplay. It is now possible to move past the ti
 
 ## Next step / Current Priority:
 
-**Fixing and stabilizing GS (Graphics Synthesizer) rendering**
+**Fixing visual defects on characters and optimizations**
 
 Milestone reached: first in-game images!
 
@@ -295,11 +241,32 @@ Although the initial images are recognizable, the rendering still presents issue
 - Fixed the game’s slow-motion functionality (HOORAY!!!!).
 - Controller support added! You can now use an Xbox controller to play!
 
+## V5 patch
+Many fixes and additions have been implemented:
+
+- Vulkan support added;
+- Menu text is now legible;
+- The dark background for dialogue boxes has been corrected;
+- A dedicated game launcher has been created, featuring the following options:
+    - External resolution settings up to 4K;
+    - Volume controls for sound effects and music, including a master volume option;
+    - Renderer selection (CPU or Vulkan);
+    - Text style (the original black bar style, plus a new "black outline" option);
+    - Aspect ratio (currently limited to 4:3 and 16:9);
+    - Frame rate limit: 30 or 60 FPS;
+    - Window modes (Full Screen, Borderless Window, and Borderless Full Screen).
+    - Button mapping
+- The in-game videos suffered from terrible audio glitches. Changes were made to the recompiler so that the videos are loaded externally.
+- Save and Load functionality (slot 1 only for now);
+
 ## For upcoming patches to the recompiler, I will focus on:
-- Overall game performance (targeting 60 FPS and eliminating stuttering).
-- Fixing jagged edges (aliasing) on ​​text throughout the game.
-- Adding in-game audio.
-- Fixing pixelation issues on character models.
+- Regarding overall game performance (performance will always need to be validated):
+- Check the game audio (this part is going to be quite a lot of work...);
+- Adjust the battle results screen—it currently doesn't show the amount of XP and gold earned (I’ve been putting off fixing this);
+- Fix the jagged edges (aliasing) on ​​the text during battle, as well as a few other things that were overlooked;
+- Fix the pixelation of the characters;
+- Correct and properly add the game's sound effects;
+- On an Xbox controller, using the diagonal directions on the D-pad/stick causes the character to walk, which feels odd; however, holding the B button (or the 'circle' button, as it was on the PS2) allows the character to run while moving diagonally. This will be addressed in the next patch (likely V6).
 
 **Adjusting the game's music tracks to keep them exactly as they are is going to be a massive undertaking. I’ve been using "Brain Hopper"—the game’s battle theme—as an example, and the amount of work it’s requiring is truly immense.**
 
