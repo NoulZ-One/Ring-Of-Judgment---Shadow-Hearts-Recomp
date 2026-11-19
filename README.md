@@ -63,7 +63,7 @@ Current progress:
 ---
 
 # Estado atual
-O recompilador atualmente está cerca de 80%. É possível iniciar um novo jogo, salvar (apenas no slot 1 por enquanto.) carregar um save existente. Ainda há coisas a serem feitas que serão listadas abaixo, entretanto, o recompilador demonstrou avanços significativos.
+O recompilador atualmente está cerca de 80%. É possível iniciar um novo jogo, salvar nos 2 slots, carregar um save existente. Ainda há coisas a serem feitas que serão listadas abaixo, entretanto, o recompilador demonstrou avanços significativos.
 
 Ainda requer testes para saber se é totalmente jogável do começo até o fim do jogo. Aos poucos vou atualizando o Readme com os avanços.
 
@@ -72,7 +72,7 @@ Ainda requer testes para saber se é totalmente jogável do começo até o fim d
 
 ## Próximo passo / prioridade atual:
 
-**Corrigir defeitos visuais dos personagens e otimizações**
+**otimizações**
 **Corrigir Efeitos sonoros e as músicas**
 
 É possível que próximo patch o recompilador utilize efeitos sonoros externos (como os vídeos atuais). assim previne problemas com efeitos sonoros estourados ou chiando.
@@ -144,7 +144,7 @@ Muitas coisas foram corrigidas e inseridas.
 
 ## Conforme for aparecendo problemas, serão listados abaixo.
 - Efeitos sonoros quebrados (desde os efeitos sonoros da batalha até os de exploração) - precisará de um bom tempo para arrumar;
-- Checar com máxima cautela as músicas do jogo;
+- Arrumar as músicas do jogo (algumas aparecem com algum apito estranho ou não batem com a original);
 
 ## Nota: O recompilador está quase pronto. Volto a Frisar bem: Quando o recompilador estiver pronto, uma BUILD será liberada. Por hora, apenas acompanhe os Logs de desenvolvimento.
 
@@ -266,7 +266,6 @@ Many fixes and additions have been implemented:
 ## For upcoming patches to the recompiler, I will focus on:
 - Regarding overall game performance (performance will always need to be validated):
 - Check the game audio (this part is going to be quite a lot of work...);
-- Adjust the battle results screen—it currently doesn't show the amount of XP and gold earned (I’ve been putting off fixing this);
 - Fix the jagged edges (aliasing) on ​​the text during battle, as well as a few other things that were overlooked;
 - Correct and properly add the game's sound effects;
 
@@ -275,7 +274,7 @@ Many fixes and additions have been implemented:
 
 ## As issues arise, they will be listed below.
 - Broken sound effects (ranging from battle sound effects to those for exploration) – will require a significant amount of time to fix;
-- Review the game’s music with the utmost care;
+- Fix the game's music (some tracks have a strange whistling sound or do not match the original versions);;
 
 
 ## Note: The recompiler is not yet complete. To reiterate: once the recompiler is finished, a build will be released. For now, please simply follow the development logs.
