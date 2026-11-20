@@ -176,6 +176,10 @@ Muitas coisas foram corrigidas e inseridas.
 <img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/ee353b90-21b2-4226-a028-89d58d27fbce" />
 <img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/6b6d2a08-525c-4850-bf05-4fbf32cf486a" />
 <img width="1919" height="1029" alt="image" src="https://github.com/user-attachments/assets/7dfde869-c6e3-4e6c-8789-89fe29d5959a" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/d338ce20-66ac-4cae-8033-74fdb48dc01e" />
+<img width="1919" height="1031" alt="image" src="https://github.com/user-attachments/assets/1b64928f-4024-482c-9a3b-6e5d6fb54e6b" />
+
+
 
 
 
