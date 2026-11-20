@@ -65,17 +65,19 @@ Current progress:
 # Estado atual
 O recompilador atualmente está cerca de 80%. É possível iniciar um novo jogo, salvar nos 2 slots, carregar um save existente. Ainda há coisas a serem feitas que serão listadas abaixo, entretanto, o recompilador demonstrou avanços significativos.
 
-Ainda requer testes para saber se é totalmente jogável do começo até o fim do jogo. Aos poucos vou atualizando o Readme com os avanços.
-
+O recompilador agora está em fase de testes, se estiver jogável do início ao fim será liberado. Conforme estou testando, vou corrigindo os problemas que for aparecendo.
+As músicas e efeitos sonoros são carregados de forma externa. é possível que algum efeito sonoro ainda esteja quebrado, pois são mais de 6 mil efeitos no banco do jogo. checar um por um é um trabalho árduo e demorado. então conforme vou testando, caso apareça algum efeito sonoro quebrado, será consertado e registrado em um patch como de costume. 
 
 ---
 
 ## Próximo passo / prioridade atual:
 
 **otimizações**
-**Corrigir Efeitos sonoros e as músicas**
 
-É possível que próximo patch o recompilador utilize efeitos sonoros externos (como os vídeos atuais). assim previne problemas com efeitos sonoros estourados ou chiando.
+**EM FASE DE TESTES**
+
+A partir do patch V5.2 será apenas correções no recompilador.
+
 
 ## Estado atual
 
@@ -130,9 +132,12 @@ Muitas coisas foram corrigidas e inseridas.
   - Analógico esquerdo melhorado (Antes as diagonais faziam o personagem caminhar, interrompendo a corrida)
   - Slot 2 do memory card agora está habilitado. É possível salvar nele também.
   - Alguns pixelados das letras das batalhas foram arrumados (possivelmente apenas das batalhas comuns. batalhas contra boss ainda será investigado);
- 
-  ## Próximo patch possivelmente demore a sair. Correções de Áudio e efeitos sonoros irão dar trabalho. É possível que eu passe os Efeitos Sonoros e as Músicas de forma externa como os vídeos. Assim evita problemas com chiados ou áudios estourados.
 
+## V5.2 Patch
+ - Agora o áudio do jogo é carregado de forma externa como os vídeos, assim evita que as Músicas e Efeitos Sonoros quebrados.
+ - Fix o Anel da loteria num ponto específico do jogo.
+ - O Menu ingame Crashava o Runtime
+ 
 
 ## Para os próximos patch's do recompilador irei focar em:
 - No desempenho geral do jogo (sempre será necessário validar o desempenho).
@@ -140,7 +145,6 @@ Muitas coisas foram corrigidas e inseridas.
 - Fixar o serrilhado das letras na batalha e alguns pontos que passou batido;
 - Corrigir e Adicionar corretamente os efeitos sonoros do jogo;
 
-**As músicas do jogo e os efeitos sonoros vão dar um enorme trabalho para ajustar e deixar como são. peguei como exemplo a Brain Hopper -  tema de batalha do jogo - e o trabalho que está dando para ajustar é extremamente grande.**
 
 ## Conforme for aparecendo problemas, serão listados abaixo.
 - Efeitos sonoros quebrados (desde os efeitos sonoros da batalha até os de exploração) - precisará de um bom tempo para arrumar;
@@ -199,7 +203,9 @@ Muitas coisas foram corrigidas e inseridas.
 
 The recompiler is currently about 80% complete. It is possible to start a new game, save (currently only in slot 1), and load an existing save file. There are still tasks to be completed—listed below—but the recompiler has shown significant progress.
 
-Further testing is required to determine whether the game is fully playable from start to finish. I will gradually update the Readme as progress is made.
+
+The recompiler is currently in the testing phase; if it proves playable from start to finish, it will be released. As I test it, I am fixing any issues that arise.
+Music and sound effects are loaded externally. It is possible that some sound effects may still be broken, given that there are over 6,000 effects in the game's library—checking them one by one is an arduous and time-consuming task. Therefore, as I continue testing, any broken sound effects I encounter will be fixed and included in a patch, as is standard practice.
 
 ---
 
@@ -210,9 +216,10 @@ Further testing is required to determine whether the game is fully playable from
 ## Next step / Current Priority:
 
 **Fix visual defects on characters and implement optimizations**
-**Fix sound effects and music**
 
-It is possible that in the next patch, the recompiler will use external sound effects (similar to the current videos). This will help prevent issues with sound effects that are distorted or crackling.
+**IN TESTING PHASE**
+
+Starting with patch V5.2, updates will consist solely of fixes for the recompiler.
 
 ## Current Status
 
@@ -259,6 +266,7 @@ Many fixes and additions have been implemented:
     - Button mapping
 - The in-game videos suffered from terrible audio glitches. Changes were made to the recompiler so that the videos are loaded externally.
 - Save and Load functionality (slot 1 only for now);
+ 
  ## V5.1 Patch
 - Battle screen result fixed 
 - Improved internal resolution scaling up to 720p (VULKAN only). This fixes the pixelation of characters and enemies. 
@@ -266,6 +274,11 @@ Many fixes and additions have been implemented:
 - Improved left analog stick (Previously the diagonals made the character walk, interrupting the run) 
 - Memory card slot 2 is now enabled. You can save to it too.
 - Fixed pixelation issues with text during battles (likely limited to standard encounters; boss battles are still under investigation).
+
+  ## V5.2 Patch
+- Game audio is now loaded externally, similar to how videos are handled; this prevents music and sound effects from breaking. 
+- Fixed an issue with the lottery ring at a specific point in the game. 
+- The in-game menu was causing a runtime crash.
 
 ## Next patch may take some time to come out. Audio corrections and sound effects will take work. It is possible for me to broadcast the Sound Effects and Music externally like videos. This avoids problems with hissing or bursting audio.
 
