@@ -65,6 +65,7 @@ internal static class EmitDemo
             ("update_effect_catalog.cjs", Path.Combine("Ferramentas", "Audio", "update_effect_catalog.cjs")),
             ("EFEITOS.md", Path.Combine("Ferramentas", "Audio", "EFEITOS.md")),
             ("roj_settings.h", "roj_settings.h"),
+            ("discord_presence.h", "discord_presence.h"),
             ("roj_input.h", "roj_input.h"),
             ("launcher_input.h", Path.Combine("Launcher", "launcher_input.h")),
             ("LEIA-ME.txt", "LEIA-ME.txt"),
@@ -358,6 +359,7 @@ internal static class EmitDemo
     {
         return
             "#include \"ps2_functions.h\"\n" +
+            "#include \"discord_presence.h\"\n" +
             "#include <cstdio>\n" +
             "#include <cstdlib>\n\n" +
             "static uint8_t ram[32u * 1024 * 1024];\n" +
@@ -376,6 +378,7 @@ internal static class EmitDemo
             "    std::fclose(f);\n" +
             $"    std::fprintf(stderr, \"imagem carregada: %zu bytes em 0x{loadAddress:X8}\\n\", n);\n\n" +
             "    ps2_iso_open_default(argc, argv);\n\n" +
+            "    roj::DiscordPresence discord;\n\n" +
             "    Ctx c{};\n" +
             "    c.mem = ram;\n" +
             "    c.spr = spr;\n" +
@@ -582,7 +585,6 @@ internal static class EmitDemo
         Dictionary<string, int> reasons = new();
         List<string> resolvedSamples = new();
         List<string> unresolvedSamples = new();
-        List<string> allUnresolved = new();   // todos os JR nao resolvidos, com 24 instrucoes antes: vai para jr_naoresolvidos.txt
 
         foreach (ElfSymbol function in Unique(allFunctions))
         {
@@ -627,16 +629,6 @@ internal static class EmitDemo
 
                 reasons[reason] = reasons.GetValueOrDefault(reason) + 1;
 
-                allUnresolved.Add($"0x{address:X8}  {function.Name} (funcao 0x{function.Address:X8}..0x{end:X8})  [{reason}]");
-
-                for (int k = Math.Max(0, i - 24); k <= Math.Min(count - 1, i + 2); k++)
-                {
-                    uint a = function.Address + (uint)(k * 4);
-                    allUnresolved.Add($"    0x{a:X8}  {code[k].Format(a)}{(k == i ? "      <-- JR" : "")}");
-                }
-
-                allUnresolved.Add("");
-
                 if (unresolvedSamples.Count < 14)
                 {
                     unresolvedSamples.Add(
@@ -672,7 +664,5 @@ internal static class EmitDemo
         foreach (string line in unresolvedSamples)
             Console.WriteLine(line);
 
-        File.WriteAllLines("jr_naoresolvidos.txt", allUnresolved);
-        Console.WriteLine($"Todos os JR nao resolvidos (com contexto): {Path.GetFullPath("jr_naoresolvidos.txt")}");
     }
 }

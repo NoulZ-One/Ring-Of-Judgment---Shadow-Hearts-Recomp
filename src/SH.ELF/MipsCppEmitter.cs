@@ -883,7 +883,10 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
                 .GetManifestResourceStream($"SH.ELF.Vu1.{id}")
                 ?? throw new InvalidOperationException($"Rotina VU1 integrada ausente: {id}");
             using StreamReader reader = new(resource, Encoding.UTF8);
-            programs.AppendLine(reader.ReadToEnd());
+            string code = reader.ReadToEnd();
+            if (!code.Contains("um_mac_tick();", StringComparison.Ordinal))
+                code = code.Replace("c.vi[0] = 0;", "c.vi[0] = 0; um_mac_tick();");
+            programs.AppendLine(code);
         }
         string ReadVulkan(string name)
         {
@@ -2528,6 +2531,7 @@ static const bool g_gs_replay_capture_enabled = [] {
 }();
 static std::atomic<bool> g_gs_replay_request{false};
 std::atomic<bool> g_cap_request{false};   // F9: grava o trace dos proximos vsyncs em gs_captura_N.txt (sem custo quando nao usado)
+static std::atomic<bool> g_vu_capture_request{false}; // Same manual F9 diagnostic; never writes during ordinary play.
 // A medicao por quadword e opcional: duas consultas ao relogio
 // a cada 16 bytes podem dominar o custo de enfileirar a imagem.
 static const bool g_prof_image_qword = profile_enabled("PS2_GS_PROFILE_IMAGE_QWORD", g_perf_gs);
@@ -4361,6 +4365,7 @@ static void pad_input_thread()
                     g_gs_replay_request = true;
                 else
                     g_cap_request = true;
+                    g_vu_capture_request = true;
             }
 
             f9_last = f9;
@@ -8614,6 +8619,9 @@ namespace
             ((g_st.ctx[ci].tex0 >> 37) & 0x3FFFu) == 16348u;
         const unsigned font_palette = unsigned((g_st.ctx[ci].tex0 >> 37) & 0x3FFFu);
         const bool system_font = pc.ti.psm == 0x14u && font_palette == 16344u;
+        // Shop attribute digits have 18 texture rows inside a 19-row sprite.
+        // Capture the colored pass as well as its separately drawn shadow.
+        const bool system_digits = system_font && pc.ti.w == 128 && pc.ti.h == 32 && pc.ti.tbw == 2u;
         const bool menu_font = pc.ti.psm == 0x14u &&
             ((font_palette == 5492u && pc.ti.w == 128 && pc.ti.h == 64) ||
              (font_palette == 5613u && pc.ti.w == 256 && pc.ti.h == 64));
@@ -8667,6 +8675,7 @@ namespace
                  (ring_status_font && std::fabs((b.u-a.u)-w) <= 1.05f)) &&
                 (std::fabs(dv - 2.0f) < 0.03f || (caption_font && std::fabs(dv - 1.0f) < 0.03f) ||
                  (known_font && shadow && std::fabs((b.v-a.v)-h) <= 1.05f) ||
+                 (system_digits && std::fabs((b.v-a.v)-h) <= 1.05f) ||
                  (ring_status_font && std::fabs((b.v-a.v)-h) <= 2.05f)) &&
                 w >= 1 && w <= 640 && h >= 14 && h <= 64 &&
                 a.u >= 0.0f && a.v >= 0.0f)
@@ -8984,6 +8993,57 @@ namespace
         return true;
     }
 
+    static void gs_ui_window_overdraw(int ci, const GsVertex& a, const GsVertex& b,
+                                      const GsVertex& c, const PixCfg& pc)
+    {
+        // Window fills are drawn after the battle HUD. Native-height fonts
+        // are composed later, so carry this subsequent affine blend into
+        // their colors too: W(F over B) = W(F) over W(B). Retaining coverage
+        // preserves the original translucent window instead of deleting text.
+        if (!g_ui_native || !g_gs_crt_int || !g_gs_crt_ffmd || pc.tme || !pc.abe || pc.zte ||
+            pc.fpsm || pc.fbmsk || pc.fbw != 10 || (pc.fbp != 0 && pc.fbp != 2240) ||
+            g_st.ctx[ci].alpha != 0x44u || !(g_st.prim & 8u) ||
+            a.a != b.a || b.a != c.a || a.a <= 0 || a.a > 128 || !gs_alpha_pass(pc,gs_f2i255(a.a))) return;
+#ifdef _WIN32
+        if (g_vk_replaying) return; // CPU recovery must not apply the fill twice.
+#endif
+        const GsVertex* v[3] = {&a,&b,&c};
+        float area = (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+        if (area == 0) return;
+        if (area < 0) { std::swap(v[1],v[2]); area = -area; }
+        const float minx=std::min({a.x,b.x,c.x}),maxx=std::max({a.x,b.x,c.x});
+        const float miny=std::min({a.y,b.y,c.y}),maxy=std::max({a.y,b.y,c.y});
+        const auto edge=[](const GsVertex& p,const GsVertex& q,float x,float y){
+            return (q.x-p.x)*(y-p.y)-(q.y-p.y)*(x-p.x);
+        };
+        const auto inside=[](float e,const GsVertex& p,const GsVertex& q){
+            return e>0 || (e==0 && (q.y<p.y || (q.y==p.y && q.x>p.x)));
+        };
+        const int alpha=gs_f2i255(a.a);
+        std::lock_guard<std::mutex> lk(g_ui_native_mu);
+        for (auto& glyph:g_ui_native_glyphs)
+        {
+            if (glyph.fbp!=pc.fbp || glyph.outline || glyph.x>=maxx || glyph.x+glyph.w<=minx ||
+                glyph.y>=maxy*2 || glyph.y+glyph.h<=miny*2) continue;
+            for(int y=0;y<glyph.h;++y)for(int x=0;x<glyph.w;++x)
+            {
+                auto& pixel=glyph.rgba[size_t(y)*glyph.w+x]; if(!(pixel>>24))continue;
+                const float px=glyph.x+x+.5f,py=(glyph.y+y+.5f)*.5f;
+                if(px<pc.sx0 || px>=pc.sx1+1 || py<pc.sy0 || py>=pc.sy1+1)continue;
+                const float e0=edge(*v[1],*v[2],px,py),e1=edge(*v[2],*v[0],px,py),e2=edge(*v[0],*v[1],px,py);
+                if(!inside(e0,*v[1],*v[2]) || !inside(e1,*v[2],*v[0]) || !inside(e2,*v[0],*v[1]))continue;
+                const float w0=e0/area,w1=e1/area,w2=e2/area;
+                const int color[3]={gs_f2i255(v[0]->r*w0+v[1]->r*w1+v[2]->r*w2),
+                    gs_f2i255(v[0]->g*w0+v[1]->g*w1+v[2]->g*w2),
+                    gs_f2i255(v[0]->b*w0+v[1]->b*w1+v[2]->b*w2)};
+                uint32_t result=pixel&0xff000000u;
+                for(unsigned channel=0;channel<3;++channel){const int old=(pixel>>(channel*8))&255;
+                    result|=uint32_t(gs_clamp255(old+(((color[channel]-old)*alpha)>>7)))<<(channel*8);}
+                pixel=result;
+            }
+        }
+    }
+
     void gs_draw_triangle(int ci, const GsVertex& a, const GsVertex& b, const GsVertex& c)
     {
         float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
@@ -9007,6 +9067,8 @@ namespace
         gs_pix_cfg(ci, pc);
 
         if (gs_ui_copyright(ci,a,b,c,pc)) return;
+
+        gs_ui_window_overdraw(ci,a,b,c,pc);
 
         // Condicoes reais da batalha: somente triangulos com STQ/perspectiva
         // destinados aos framebuffers FBP 0/70 (nao os sprites TEX1=0 da UI).
@@ -13224,7 +13286,7 @@ void ps2_unsupported(Ctx&, uint32_t address, const char* mnemonic)
 // (g_vu1_regs), com EFU (P), XTOP/XITOP e XGKICK (envia o pacote ao GIF). A micro memoria chega por MPG (VIF) ou por
 // escritas da CPU; os dados por UNPACK ou escritas da CPU. MSCAL/VCALLMS rodam o programa na hora, ate o bit E.
 // Cada instrucao de 64 bits = lower (palavra 0) + upper (palavra 1).
-// Simplificacoes: sem ciclos de pipeline, exceto a latencia de Q (DIV/SQRT 7, RSQRT 13).
+// Simplificacoes: latencia de Q (DIV/SQRT 7, RSQRT 13) e leituras MAC (4 pares).
 
 struct VuUnit
 {
@@ -13262,6 +13324,38 @@ static void um_trace_header_write(const VuUnit& u, uint32_t qaddr, const char* o
 
 
 static bool g_um_flags = true;   // calcula MAC/status? (so se algum programa carregado os le)
+
+// Micro-mode MAC reads observe FMAC results four instruction pairs later.
+// Keep the newest result in Ctx for halt/host reads, but use this history
+// for FMEQ/FMAND/FMOR. Both the interpreter and embedded AOT advance it.
+struct UmMacHistory;
+static UmMacHistory* g_um_mac_history = nullptr;
+struct UmMacHistory
+{
+    Ctx& context;
+    UmMacHistory* previous;
+    uint32_t values[4];
+    unsigned cursor = 0;
+    UmMacHistory(Ctx& c, bool enabled) : context(c), previous(g_um_mac_history)
+    {
+        std::fill(std::begin(values), std::end(values), c.vi[17]);
+        g_um_mac_history = enabled ? this : nullptr;
+    }
+    ~UmMacHistory() { g_um_mac_history = previous; }
+};
+static inline uint32_t um_mac_read(const Ctx& c)
+{
+    const auto* history = g_um_mac_history;
+    return history && &history->context == &c ? history->values[history->cursor] : c.vi[17];
+}
+static inline void um_mac_tick()
+{
+    if (auto* history = g_um_mac_history)
+    {
+        history->values[history->cursor] = history->context.vi[17];
+        history->cursor = (history->cursor + 1) & 3u;
+    }
+}
 
 // Algum programa le MAC/status? (FSEQ/FSAND/FSOR/FMEQ/FMAND/FMOR). Se nenhum le, o calculo e dispensavel.
 static bool um_scan_flag_readers(const uint8_t* micro, uint32_t pairs)
@@ -13825,7 +13919,7 @@ static bool vu_aot_emit_pair(std::string& code, uint32_t pc, uint32_t lo, uint32
     if (deferred)
         code += "if (lw.vf != 0) for (int lane = 0; lane < 4; ++lane)"
                 " if (lw.mask & (8 >> lane)) c.vf[lw.vf][lane] = lw.v[lane];\n";
-    code += "c.vf[0][0] = c.vf[0][1] = c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u; c.vi[0] = 0;\n}\n";
+    code += "c.vf[0][0] = c.vf[0][1] = c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u; c.vi[0] = 0; um_mac_tick();\n}\n";
     return true;
 }
 
@@ -13890,6 +13984,7 @@ static bool vu_aot_generate(const uint32_t* image, uint32_t entry, const uint32_
 static unsigned vu_run(VuUnit& u, uint32_t byte_addr)
 {
     Ctx& c = *u.r;
+    UmMacHistory macHistory(c, g_um_flags);
     const bool optimize = u.vu1 && g_vu1_fast;
     auto arith = [&](int op, int src, int dest, int fd, int fs, int ft, int to_acc)
     {
@@ -14063,9 +14158,9 @@ static unsigned vu_run(VuUnit& u, uint32_t byte_addr)
                     else if (op7 == 0x17 && it != 0) c.vi[it] = (c.vi[16] | imm12) & 0xFFFu;
                     break;
                 }
-                case 0x18: if (it != 0) c.vi[it] = (c.vi[is] == (c.vi[17] & 0xFFFFu)) ? 1u : 0u; break;        // FMEQ
-                case 0x1A: if (it != 0) c.vi[it] = c.vi[is] & c.vi[17] & 0xFFFFu; break;                       // FMAND
-                case 0x1B: if (it != 0) c.vi[it] = (c.vi[is] | c.vi[17]) & 0xFFFFu; break;                     // FMOR
+                case 0x18: if (it != 0) c.vi[it] = (c.vi[is] == (um_mac_read(c) & 0xFFFFu)) ? 1u : 0u; break;   // FMEQ
+                case 0x1A: if (it != 0) c.vi[it] = c.vi[is] & um_mac_read(c) & 0xFFFFu; break;                  // FMAND
+                case 0x1B: if (it != 0) c.vi[it] = (c.vi[is] | um_mac_read(c)) & 0xFFFFu; break;                // FMOR
                 case 0x1C: if (it != 0) c.vi[it] = c.vi[18] & 0xFFFu; break;                                   // FCGET
                 case 0x20: new_target = (int)((cur + 1 + (uint32_t)imm11) & u.imask); break;                   // B
                 case 0x21:                                                                                       // BAL
@@ -14247,6 +14342,7 @@ static unsigned vu_run(VuUnit& u, uint32_t byte_addr)
 
         c.vf[0][0] = 0; c.vf[0][1] = 0; c.vf[0][2] = 0; c.vf[0][3] = 0x3F800000u;
         c.vi[0] = 0;
+        um_mac_tick();
 
         if (was_delay)
         {
@@ -14357,6 +14453,31 @@ void vu0_run(Ctx& c, uint32_t byte_addr)
 void vu1_run(uint32_t byte_addr)
 {
     g_vu1_runs++;
+
+    // Save the actual sky program and its input registers on manual F9.
+    // Micro memory is reused by models later in the frame, so a VRAM or
+    // process snapshot taken afterwards cannot reproduce this submission.
+    static unsigned captureBudget = 0;
+    if (g_vu_capture_request.exchange(false)) captureBudget = 512;
+    if (captureBudget != 0)
+    {
+        --captureBudget;
+        if (byte_addr == 0x1800u)
+        {
+            captureBudget = 0;
+            if (FILE* file = std::fopen("gs_vu_sphere.bin", "wb"))
+            {
+                const uint32_t header[]{0x31555653u, byte_addr, sizeof(Ctx), sizeof(g_vu1_data)};
+                Ctx registers = g_vu1_regs;
+                registers.mem = nullptr; registers.spr = nullptr;
+                std::fwrite(header, sizeof(header), 1, file);
+                std::fwrite(&registers, sizeof(registers), 1, file);
+                std::fwrite(g_vu1_micro, sizeof(g_vu1_micro), 1, file);
+                std::fwrite(g_vu1_data, sizeof(g_vu1_data), 1, file);
+                std::fclose(file);
+            }
+        }
+    }
 
     if (g_vu1_dirty) { g_vu1_flags = um_scan_flag_readers(g_vu1_micro, 2048); g_vu1_dirty = false; }
 

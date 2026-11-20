@@ -11,6 +11,14 @@
 
 namespace roj
 {
+    inline constexpr char DefaultDiscordApplicationId[] = "1573256524724445324";
+    inline bool valid_discord_id(const std::string& id)
+    {
+        if (id.size() < 17 || id.size() > 20) return false;
+        uint64_t number = 0;
+        auto parsed = std::from_chars(id.data(), id.data() + id.size(), number);
+        return parsed.ec == std::errc{} && parsed.ptr == id.data() + id.size() && number != 0;
+    }
     struct Settings
     {
         int width = 1280;
@@ -26,6 +34,8 @@ namespace roj
         bool text_aa = true;
         int text_style = 1; // 0: borda preta; 1: faixa escura continua
         int launcher_language = 0; // 0: portugues; 1: English
+        bool discord_presence = true;
+        std::string discord_application_id = DefaultDiscordApplicationId;
         InputBindings input;
     };
 
@@ -43,6 +53,7 @@ namespace roj
         value.effects_volume = std::clamp(value.effects_volume, 0, 100);
         value.text_style = std::clamp(value.text_style, 0, 1);
         value.launcher_language = std::clamp(value.launcher_language, 0, 1);
+        if (!valid_discord_id(value.discord_application_id)) value.discord_application_id.clear();
         normalize(value.input);
     }
 
@@ -57,6 +68,12 @@ namespace roj
             const auto split = line.find('=');
             if (split == std::string::npos) continue;
             const auto key = line.substr(0, split);
+            if (key == "discord_application_id")
+            {
+                result.discord_application_id = line.substr(split + 1);
+                if (result.discord_application_id.empty()) result.discord_application_id = DefaultDiscordApplicationId;
+                continue;
+            }
             int value = 0;
             const char* first = line.data() + split + 1;
             const char* last = line.data() + line.size();
@@ -75,6 +92,7 @@ namespace roj
             else if (key == "text_aa") result.text_aa = value != 0;
             else if (key == "text_style") result.text_style = value;
             else if (key == "launcher_language") result.launcher_language = value;
+            else if (key == "discord_presence") result.discord_presence = value != 0;
             else for (unsigned i = 0; i < InputActionCount; ++i)
             {
                 if (key == std::string("key_") + InputActionNames[i]) result.input.keyboard[i] = value;
@@ -94,7 +112,9 @@ namespace roj
                << "\ninternal_resolution=" << value.internal_resolution << "\nmaster_volume=" << value.master_volume
                << "\nmusic_volume=" << value.music_volume << "\neffects_volume=" << value.effects_volume
                << "\ntext_aa=" << int(value.text_aa) << "\ntext_style=" << value.text_style
-               << "\nlauncher_language=" << value.launcher_language << '\n';
+               << "\nlauncher_language=" << value.launcher_language
+               << "\ndiscord_presence=" << int(value.discord_presence)
+               << "\ndiscord_application_id=" << value.discord_application_id << '\n';
         for (unsigned i = 0; i < InputActionCount; ++i)
             output << "key_" << InputActionNames[i] << '=' << value.input.keyboard[i] << '\n'
                    << "pad_" << InputActionNames[i] << '=' << value.input.gamepad[i] << '\n';

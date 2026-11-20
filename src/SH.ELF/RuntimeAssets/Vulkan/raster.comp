@@ -66,6 +66,11 @@ void writeDepth(uint address,uint value) {
 void main() {
  uint x=gl_GlobalInvocationID.x,y=gl_GlobalInvocationID.y;
  uint mode=p.unused>>28,hw=p.unused&4095,hh=(p.unused>>12)&4095;
+ if(mode==4&&(p.unused&(1u<<27))!=0){
+  uint rect=p.depthTable+4096;
+  x+=work[rect];y+=work[rect+1];
+  if(x>=work[rect+2]||y>=work[rect+3])return;
+ }
  if(mode==1||mode==2){
   uint rect=p.depthTable+4096;
   x+=work[rect]*hw/640;y+=work[rect+1]*hh/224;
@@ -88,7 +93,7 @@ void main() {
  if(x>=(hires?hw:640)||y>=(hires?hh:224))return;
  precise float py=hires?(float(y)+0.5)*224.0/float(hh):float(y)+0.5;
  precise float px=hires?(float(x)+0.5)*640.0/float(hw):float(x)+0.5;
- uint tile=hires?(uint(py)/8)*80+uint(px)/8:gl_WorkGroupID.y*80+gl_WorkGroupID.x;
+ uint tile=(uint(py)/8)*80+uint(px)/8;
  uint start=work[tile*2],count=work[tile*2+1];
  bool dirty=false; uint destination=0,address=0;
  for(uint n=0;n<count;++n) {

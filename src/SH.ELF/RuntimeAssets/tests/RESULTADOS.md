@@ -48,3 +48,45 @@ finais. A comparacao local em 720p, na RX 6600, produziu arquivos identicos
 com e sem o retangulo limitado. Duas medicoes deram reducoes aproximadas
 de 2 a 3% nesse cenario. Isso nao equivale ao FPS do jogo e nao mede
 isoladamente o ganho de evitar a reconstrucao espacial.
+
+## 2026-11-20: importacao e passe nativo Vulkan por regiao
+
+`vulkan-native-regions.cpp` compara a VRAM inteira e todos os pixels
+ampliados com `PS2_GS_VK_FULL_NATIVE=1`, em 2x e 720p, nos tres destinos
+(0, 2240, 5760). Inclui escritas CPU nas bordas de blocos e arredondamento
+da escala 720/224. Ambos passaram. Reset de destino continua integral;
+as dependencias de textura continuam sendo importadas.
+
+Tambem passaram os testes de resolucao interna, fog e composicao offscreen.
+Na reproducao de 230.000 comandos GS de uma batalha, os 91 lotes passaram
+na validacao CPU/GPU e produziram BMPs com SHA256 identico. Importacoes
+caem de 82.001.920 para 26.032.896 bytes. Na ultima comparacao na RX 6600,
+o tempo acumulado GPU/sincronizacao foi de 84,269 para 71,385 ms (~15%).
+Uma medicao preliminar deu ~27%; o tempo varia entre execucoes. Esses
+numeros medem o caminho grafico capturado, nao o FPS total do jogo.
+
+A otimizacao vale para qualquer cena que use os destinos ampliados
+compativeis, incluindo exploracao e menus. Nao muda o relogio do jogo.
+O F9 tambem pode salvar `gs_vu_sphere.bin` com o microprograma e os
+registradores efetivos da esfera de fundo. Isso permite investigar o
+fundo branco sem depender de uma leitura posterior da micro memoria,
+que e reutilizada durante o quadro. Nao ha escrita desse arquivo sem F9.
+
+## 2026-11-20: esfera de fundo e latencia MAC
+
+O programa da esfera em 0x1800 executa o teste FMAND quatro pares depois
+da operacao que calcula o sentido do triangulo. A leitura imediata pegava
+os indicadores da transformacao do proximo vertice e descartava o ceu.
+O historico MAC agora avanca por par no interpretador e nos blocos AOT
+integrados; FMEQ/FMAND/FMOR leem o resultado com quatro pares de atraso.
+O formato Z/S/U/O e o estado final no contexto permanecem iguais.
+
+`vu-flags.cpp` testa leitura antecipada, sobrescritas intermediarias e
+avanco de um bloco AOT real. Na reproducao isolada de CSphere.Draw com
+RAM e microprograma capturados, o total de desenhos passou de 0 para 353,
+e a imagem mostra a textura original do ceu. Validacao visual na alpha
+ainda depende de copiar o executavel atualizado.
+
+`sky-panorama.cpp` valida texturas CT32/T8 de 1024x256 com o teste alfa
+NEVER/FB_ONLY usado pelo ceu, nos dois framebuffers, em 2x e 720p.
+Ambos passaram: processamento na GPU e VRAM inteira identica a CPU.

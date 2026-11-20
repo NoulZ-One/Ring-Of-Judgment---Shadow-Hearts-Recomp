@@ -134,8 +134,21 @@ void gs_vk_flush() {
    high.x0=unsigned(x0);high.y0=unsigned(y0);high.x1=unsigned(x1);high.y1=unsigned(y1);
   }
   const unsigned fbp=g_vk_triangles.front().state[0];
-  for(unsigned i=fbp;i<fbp+2240;++i)g_vk_read[i]=true;
-  for(unsigned i=4480;i<4480+1280;++i)g_vk_read[i]=true;
+  if(!high.reset&&high.x1&&!std::getenv("PS2_GS_VK_FULL_NATIVE")){
+   // Rounded high-resolution dispatch edges can sample one guest pixel
+   // outside the native rectangle (720/224 is not an integer scale).
+   // Include those blocks too; retain all existing texture dependencies.
+   const unsigned x0=high.x0?high.x0-1:0,y0=high.y0?high.y0-1:0;
+   const unsigned x1=std::min(high.x1+1,640u),y1=std::min(high.y1+1,224u);
+   for(unsigned y=y0&~7u;y<y1;y+=8)
+    for(unsigned x=x0&~7u;x<x1;x+=8){
+     g_vk_read[ix_ct32(fbp,10,x,y)>>6]=true;
+     g_vk_read[ix_z16s(4480,10,x,y)>>7]=true;
+    }
+  }else{
+   for(unsigned i=fbp;i<fbp+2240;++i)g_vk_read[i]=true;
+   for(unsigned i=4480;i<4480+1280;++i)g_vk_read[i]=true;
+  }
  }
  const bool useGPU=highActive||validate||std::getenv("PS2_GS_VK_SINGLE")||g_vk_estimated_ns>=minimumWork;
  std::vector<uint32_t> work;
@@ -261,8 +274,9 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
  const bool flat=!g_nofastsprite&&!perspective&&int64_t(maxx-minx+1)*(maxy-miny+1)>=1024&&
   a.r==b.r&&b.r==c.r&&a.g==b.g&&b.g==c.g&&a.b==b.b&&b.b==c.b&&a.a==b.a&&b.a==c.a&&(!pc.tme||FastRaster::tex_ok(pc.ti));
  auto supported=[](const TexInfo& t) {
-  const bool scene=t.psm==0&&t.tbp==5760&&t.tbw==10&&t.w==1024&&t.h==256;
-  if((t.w>512&&!scene)||t.h>512||t.ui_vpair)return false;
+  // Panoramic skies use 1024-wide textures too. The decoder and sampler
+  // support them directly; keep the same VRAM alias and capacity guards.
+  if(t.w>1024||t.h>512||t.ui_vpair)return false;
   if(t.umode>=2&&(t.uminv<0||t.umaxv>=t.w||(t.umode==3&&(t.uminv|t.umaxv)>=t.w)))return false;
   if(t.vmode>=2&&(t.vminv<0||t.vmaxv>=t.h||(t.vmode==3&&(t.vminv|t.vmaxv)>=t.h)))return false;
   switch(t.psm){case 0:case 1:case 2:case 0x0a:case 0x13:case 0x14:case 0x1b:case 0x24:case 0x2c:return true;default:return false;}

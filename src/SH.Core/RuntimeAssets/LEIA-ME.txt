@@ -55,3 +55,15 @@ Para instalar: Ferramentas/Instalar-Efeitos.ps1 -Revisao 'EfeitosSonorosRevisao'
 Arquivos aprovados tem prioridade. Os cinco WAVs manuais acima continuam como
 substituicoes especificas; na ausencia de um externo valido, retorna ao RSSD.
 Gerar novamente o C++ preserva os saves e os arquivos de midia existentes.
+
+DISCORD RICH PRESENCE
+A integracao esta compilada no jogo e usa o Discord desktop por IPC local.
+O aplicativo Ring Of Judgment - Shadow Hearts ja esta configurado nesta build.
+Abra o Discord desktop e o jogo para mostrar a atividade e o tempo jogado.
+Nao requer DLL adicional, bot, token nem senha.
+Configuracao em RingOfJudgment.ini, ao lado do executavel:
+discord_presence=1
+discord_application_id=1573256524724445324
+Para desligar, use discord_presence=0. O launcher preserva essas duas chaves.
+O nome principal vem do aplicativo criado no portal do Discord.
+Protocolo de referencia: https://docs.discord.com/developers/topics/rpc

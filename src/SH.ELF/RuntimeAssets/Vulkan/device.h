@@ -184,12 +184,14 @@ public:
    vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&before,0,nullptr,0,nullptr);
    vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,1,&set,0,nullptr);
    uint32_t parameters[4];std::memcpy(parameters,push,sizeof(parameters));
+   const bool nativeRect=high&&high->x1&&!high->reset&&!std::getenv("PS2_GS_VK_FULL_NATIVE");
    const auto dispatch=[&](uint32_t mode,uint32_t width,uint32_t height){
     if(high&&high->x1&&(mode==1||mode==2)){
      width=(high->x1*high->width+639)/640-high->x0*high->width/640;
      height=(high->y1*high->height+223)/224-high->y0*high->height/224;
     }
-    parameters[3]=high?(high->width|(high->height<<12)|(high->frame<<24)|(uint32_t(high->reset)<<26)|(mode<<28)):0;
+    if(mode==4&&nativeRect){width=high->x1-high->x0;height=high->y1-high->y0;}
+    parameters[3]=high?(high->width|(high->height<<12)|(high->frame<<24)|(uint32_t(high->reset)<<26)|(uint32_t(nativeRect)<<27)|(mode<<28)):0;
     vkCmdPushConstants(command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,parameters);
     vkCmdDispatch(command,(width+7)/8,(height+7)/8,1);
    };
