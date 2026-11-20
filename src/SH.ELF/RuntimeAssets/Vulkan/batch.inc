@@ -2,24 +2,76 @@
 // no depth sorting, frame interpolation or timing changes are introduced.
 void gs_draw_triangle(int ci,const GsVertex&,const GsVertex&,const GsVertex&);
 #ifdef _WIN32
+extern bool g_vk_replaying;
+static bool gs_vk_high_dimensions(unsigned&,unsigned&);
+static bool gs_vk_scene_available();
+static void gs_vk_sprite_begin(const GsVertex&,const GsVertex&,const PixCfg&);
+struct VkSpriteMapping { bool active=false,queued=false,second=false;GsVertex a,b;float u,du,v,y,invY,deltaV,x; };
+static VkSpriteMapping g_vk_sprite;
+#endif
+bool gs_vk_scene_sprite(int ci,const GsVertex& a,const GsVertex& b) {
+#ifdef _WIN32
+ if(g_vk_replaying)return false;
+ unsigned width,height;
+ if(!gs_vk_high_dimensions(width,height)||!gs_vk_scene_available()||gs_edge_t_enabled()||gs_tex_uv_bias_u()!=0)return false;
+ PixCfg pc;gs_pix_cfg(ci,pc);
+ if(!pc.abe||pc.fbmsk||pc.fpsm||pc.fbw!=10||(pc.fbp!=0&&pc.fbp!=2240)||
+    pc.sx0!=0||pc.sy0!=0||pc.sx1!=639||pc.sy1!=223)return false;
+ const bool fade=!pc.tme&&!pc.ate&&!pc.zactive&&pc.A==0&&pc.B==1&&pc.C==0&&pc.D==1&&
+    a.x==0&&a.y==0&&b.x>=640&&b.x<=640.125f&&b.y>=224&&b.y<=224.125f;
+ const bool fog=pc.tme&&pc.ti.psm==0x13&&pc.ti.w==64&&pc.ti.h==32&&pc.ti.tbw==2&&
+    pc.ti.tbp>=5760&&pc.ti.umode<=1&&pc.ti.vmode<=1&&
+    pc.ti.tcc&&pc.ti.tfx==0&&((g_st.ctx[ci].tex0>>37)&16383)==5444&&
+    g_st.ctx[ci].alpha==0x48&&pc.zpsm==0x3a&&pc.zbp==4480&&
+    std::fabs(b.x-a.x-448)<.01f&&std::fabs(b.y-a.y-224)<.01f;
+ const bool composite=pc.tme&&pc.ti.psm==0&&pc.ti.tbp==5760&&pc.ti.tbw==10&&
+    pc.ti.w==1024&&pc.ti.h==256&&pc.ti.umode==1&&pc.ti.vmode==1&&
+    a.x==0&&a.y==0&&b.x==640&&b.y==224&&a.u==0&&a.v==0&&b.u==640&&b.v==224;
+ if(!fade&&!fog&&!composite)return false;
+ if(fog&&std::getenv("PS2_GS_VK_SINGLE"))return false;
+ GsVertex tl=b,tr=b,bl=b,br=b;
+ tl.x=bl.x=a.x;tl.y=tr.y=a.y;
+ tl.u=bl.u=a.u;tl.v=tr.v=a.v;tr.u=br.u=b.u;bl.v=br.v=b.v;
+ tl.persp=tr.persp=bl.persp=br.persp=false;
+ if(fog||composite)gs_vk_sprite_begin(a,b,pc);
+ gs_draw_triangle(ci,tl,tr,bl);
+ g_vk_sprite.second=true;
+ gs_draw_triangle(ci,tr,br,bl);
+ g_vk_sprite.active=false;
+ return true;
+#else
+ return false;
+#endif
+}
+#ifdef _WIN32
 struct VkTriangle {
  float coeff[8],rgba[12],uvq[12],z[4];
  uint32_t tex[4]; int32_t bounds[4]; uint32_t state[4],alpha[4],blend[4],wrap[4];
  int32_t region[4];uint32_t span[4];
 };
 static_assert(sizeof(VkTriangle)==272,"Vulkan shader ABI");
-struct VkFallback { int ci;GsVertex a,b,c;GsState state;uint32_t provenance[32]; };
+struct VkFallback { int ci;GsVertex a,b,c;uint32_t state;unsigned kind=0; };
+struct VkSavedState { GsState state;uint32_t provenance[32]; };
 struct VkTexture { uint64_t key[5];uint32_t offset;TexInfo info;uint32_t palette[512]; };
 rojvk::Device g_vk_device;
+static bool gs_vk_scene_available(){return g_vk_device.ready();}
 std::vector<VkTriangle> g_vk_triangles;
 std::vector<VkFallback> g_vk_fallback;
+std::vector<VkSavedState> g_vk_states;
+static void gs_vk_sprite_begin(const GsVertex& a,const GsVertex& b,const PixCfg& pc){
+ if(g_vk_triangles.size()>=4095)gs_vk_flush();
+ const int x=std::max({0,pc.sx0,fast_ceil(std::min(a.x,b.x)-.5f)});
+ const float du=(b.u-a.u)/(b.x-a.x);
+ g_vk_sprite={true,false,false,a,b,a.u+du*(float(x)+.5f-a.x),du,a.v,a.y,1.f/(b.y-a.y),b.v-a.v,float(x)};
+}
 std::vector<VkTexture> g_vk_textures;
 std::vector<uint32_t> g_vk_texels,g_vk_spans;
 std::vector<uint32_t> g_vk_bins[80*28];
 bool g_vk_written[16384]{};
 bool g_vk_read[16384]{};
 bool g_vk_replaying=false;
-bool g_vk_high_reset[2]{true,true};
+bool g_vk_high_reset[3]{true,true,true};
+static unsigned gs_vk_high_slot(unsigned fbp){return fbp==5760?2u:fbp==2240?1u:0u;}
 bool g_vk_high_compatible=true;
 static bool gs_vk_requested();
 static bool gs_vk_high_dimensions(unsigned& width,unsigned& height) {
@@ -33,7 +85,8 @@ uint64_t g_vk_prepare_ns=0;
 uint64_t g_vk_estimated_ns=0;
 size_t g_vk_texture_size=0;
 struct VkPrepareProfile {
- uint64_t start=std::getenv("PS2_GS_VK_PROFILE")?prof_now():0;
+ static bool enabled(){static const bool value=std::getenv("PS2_GS_VK_PROFILE")!=nullptr;return value;}
+ uint64_t start=enabled()?prof_now():0;
  ~VkPrepareProfile(){if(start)g_vk_prepare_ns+=prof_now()-start;}
 };
 static bool gs_vk_requested() {
@@ -72,7 +125,7 @@ void gs_vk_flush() {
  }();
  unsigned highWidth=0,highHeight=0;
  const bool highActive=gs_vk_high_dimensions(highWidth,highHeight)&&g_vk_high_compatible;
- rojvk::HighTarget high{highWidth,highHeight,g_vk_triangles.front().state[0]==0?0u:1u,false,nullptr};
+ rojvk::HighTarget high{highWidth,highHeight,gs_vk_high_slot(g_vk_triangles.front().state[0]),false,nullptr};
  if(highActive){
   high.reset=g_vk_high_reset[high.frame];
   if(!std::getenv("PS2_GS_HI_FULL_FRAME")){
@@ -80,7 +133,8 @@ void gs_vk_flush() {
    for(const auto& triangle:g_vk_triangles){x0=std::min(x0,triangle.bounds[0]);x1=std::max(x1,triangle.bounds[1]+1);y0=std::min(y0,triangle.bounds[2]);y1=std::max(y1,triangle.bounds[3]+1);}
    high.x0=unsigned(x0);high.y0=unsigned(y0);high.x1=unsigned(x1);high.y1=unsigned(y1);
   }
-  for(unsigned i=high.frame*2240;i<(high.frame+1)*2240;++i)g_vk_read[i]=true;
+  const unsigned fbp=g_vk_triangles.front().state[0];
+  for(unsigned i=fbp;i<fbp+2240;++i)g_vk_read[i]=true;
   for(unsigned i=4480;i<4480+1280;++i)g_vk_read[i]=true;
  }
  const bool useGPU=highActive||validate||std::getenv("PS2_GS_VK_SINGLE")||g_vk_estimated_ns>=minimumWork;
@@ -121,7 +175,13 @@ void gs_vk_flush() {
   if(!ok)g_vk_cpu+=g_vk_triangles.size();
   const GsState saved=g_st;uint32_t savedProv[32];std::memcpy(savedProv,g_clut_prov,sizeof(savedProv));
   g_vk_replaying=true;
-  for(const auto& draw:g_vk_fallback){g_st=draw.state;std::memcpy(g_clut_prov,draw.provenance,sizeof(draw.provenance));gs_draw_triangle(draw.ci,draw.a,draw.b,draw.c);}
+  uint32_t current=~0u;
+  for(const auto& draw:g_vk_fallback){
+   if(draw.kind==2)continue;
+   if(current!=draw.state){const auto& snapshot=g_vk_states[draw.state];g_st=snapshot.state;std::memcpy(g_clut_prov,snapshot.provenance,sizeof(snapshot.provenance));current=draw.state;}
+   if(draw.kind==1)gs_draw_sprite(draw.ci,draw.a,draw.b);
+   else gs_draw_triangle(draw.ci,draw.a,draw.b,draw.c);
+  }
   g_vk_replaying=false;g_st=saved;std::memcpy(g_clut_prov,savedProv,sizeof(savedProv));
  }
  if(validate&&ok)for(size_t i=0;i<gpu.size();i++)if(gpu[i]!=g_vram[i]){
@@ -131,7 +191,7 @@ void gs_vk_flush() {
   for(int f=0;f<4;f++){FILE* file=std::fopen(names[f],"wb");if(file){std::fwrite(data[f],1,sizes[f],file);std::fclose(file);}}
   std::exit(3);
  }
- g_vk_triangles.clear();g_vk_fallback.clear();g_vk_textures.clear();g_vk_texels.clear();g_vk_spans.clear();
+ g_vk_triangles.clear();g_vk_fallback.clear();g_vk_states.clear();g_vk_textures.clear();g_vk_texels.clear();g_vk_spans.clear();
  g_vk_estimated_ns=0;
  g_vk_texture_size=0;
  g_vk_high_compatible=true;
@@ -139,10 +199,10 @@ void gs_vk_flush() {
  std::fill(std::begin(g_vk_read),std::end(g_vk_read),false);
 }
 void gs_vk_hi_reset(uint32_t fbp) {
- if(fbp==0||fbp==2240)g_vk_high_reset[fbp==0?0:1]=true;
+ if(fbp==0||fbp==2240||fbp==5760)g_vk_high_reset[gs_vk_high_slot(fbp)]=true;
 }
 static bool gs_vk_hi_resolve(uint32_t fbp,std::vector<uint32_t>& pixels,unsigned& width,unsigned& height) {
- if((fbp!=0&&fbp!=2240)||!gs_vk_high_dimensions(width,height)||!g_vk_device.ready())return false;
+ if((fbp!=0&&fbp!=2240&&fbp!=5760)||!gs_vk_high_dimensions(width,height)||!g_vk_device.ready())return false;
  gs_vk_flush();
  std::vector<uint32_t> work;
  for(unsigned y=0;y<32;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_ct32[y][x]);
@@ -150,7 +210,7 @@ static bool gs_vk_hi_resolve(uint32_t fbp,std::vector<uint32_t>& pixels,unsigned
  for(unsigned y=0;y<64;y++)for(unsigned x=0;x<64;x++)work.push_back(g_page_z16s[y][x]);
  const uint32_t bounds[]{0,0,640,224};work.insert(work.end(),std::begin(bounds),std::end(bounds));
  uint32_t push[4]{0,0,depthTable,0};
- rojvk::HighTarget target{width,height,fbp==0?0u:1u,g_vk_high_reset[fbp==0?0:1],&pixels};
+ rojvk::HighTarget target{width,height,gs_vk_high_slot(fbp),g_vk_high_reset[gs_vk_high_slot(fbp)],&pixels};
  const std::vector<rojvk::Range> reads{{fbp*256,2240*256},{4480*256,1280*256}};
  if(!g_vk_device.render(g_vram,nullptr,0,{},work,push,reads,{},&target))return false;
  g_vk_high_reset[target.frame]=false;
@@ -201,12 +261,13 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
  const bool flat=!g_nofastsprite&&!perspective&&int64_t(maxx-minx+1)*(maxy-miny+1)>=1024&&
   a.r==b.r&&b.r==c.r&&a.g==b.g&&b.g==c.g&&a.b==b.b&&b.b==c.b&&a.a==b.a&&b.a==c.a&&(!pc.tme||FastRaster::tex_ok(pc.ti));
  auto supported=[](const TexInfo& t) {
-  if(t.w>512||t.h>512||t.ui_vpair)return false;
+  const bool scene=t.psm==0&&t.tbp==5760&&t.tbw==10&&t.w==1024&&t.h==256;
+  if((t.w>512&&!scene)||t.h>512||t.ui_vpair)return false;
   if(t.umode>=2&&(t.uminv<0||t.umaxv>=t.w||(t.umode==3&&(t.uminv|t.umaxv)>=t.w)))return false;
   if(t.vmode>=2&&(t.vminv<0||t.vmaxv>=t.h||(t.vmode==3&&(t.vminv|t.vmaxv)>=t.h)))return false;
   switch(t.psm){case 0:case 1:case 2:case 0x0a:case 0x13:case 0x14:case 0x1b:case 0x24:case 0x2c:return true;default:return false;}
  };
- if(pc.fpsm!=0||pc.fbw!=10||(pc.fbp!=0&&pc.fbp!=2240)||minx<0||maxx>=640||miny<0||maxy>=224||
+ if(pc.fpsm!=0||pc.fbw!=10||(pc.fbp!=0&&pc.fbp!=2240&&pc.fbp!=5760)||minx<0||maxx>=640||miny<0||maxy>=224||
   (pc.zactive&&(pc.zpsm!=0x3a||pc.zbp<4480||pc.zbp>15000))||
   (pc.tme&&!supported(pc.ti))||gs_edge_t_enabled()||gs_tex_uv_bias_u()!=0.0f){++g_vk_cpu;return false;}
  if(minx>maxx||miny>maxy)return true;
@@ -279,9 +340,36 @@ static bool gs_vk_enqueue(int ci,const GsVertex& a,const GsVertex& b,const GsVer
   for(float value:values){uint32_t bits;std::memcpy(&bits,&value,4);g_vk_spans.push_back(bits);}
   g_vk_spans.insert(g_vk_spans.end(),3,0u);
  }
+ if(g_vk_sprite.active){
+  if(pc.tme&&pc.ti.psm==0&&pc.ti.tbp==5760&&pc.ti.tbw==10&&pc.ti.w==1024&&pc.ti.h==256&&
+     pc.fbp!=5760&&!g_vk_high_reset[2])triangle.tex[3]|=1024u;
+  // Sprite UVs have a single horizontal origin and constant V per native
+  // row. Recreating them from triangle barycentrics changes bilinear
+  // rounding. Reserved metadata preserves the original sprite arithmetic.
+  const auto bits=[](float value){uint32_t result;std::memcpy(&result,&value,4);return result;};
+  triangle.tex[3]|=128u|256u|(g_vk_sprite.second?512u:0u);triangle.coeff[6]=g_vk_sprite.du;triangle.coeff[7]=g_vk_sprite.deltaV;
+  triangle.span[1]=bits(g_vk_sprite.u);triangle.span[2]=bits(g_vk_sprite.v);triangle.span[3]=bits(g_vk_sprite.y);
+  triangle.blend[3]=bits(g_vk_sprite.invY);
+  // Sprite depth is constant in z.x; other Z lanes carry its rectangle.
+  triangle.z[1]=g_vk_sprite.b.x;triangle.z[2]=g_vk_sprite.b.y;triangle.z[3]=g_vk_sprite.a.x;
+ }
  const unsigned index=unsigned(g_vk_triangles.size());g_vk_triangles.push_back(triangle);
  if(pc.zactive&&pc.zbp!=4480)g_vk_high_compatible=false;
- VkFallback saved{};saved.ci=ci;saved.a=a;saved.b=b;saved.c=c;saved.state=g_st;std::memcpy(saved.provenance,g_clut_prov,sizeof(saved.provenance));g_vk_fallback.push_back(std::move(saved));
+ // Consecutive model triangles share render state and palette. Keep one
+ // exact CPU recovery snapshot per state instead of copying ~2.6 KiB for
+ // every triangle. Vertex-assembly q/rgbaq are already captured in a/b/c.
+ const auto sameState=[&](const VkSavedState& previous){const auto& s=previous.state;
+  return s.prim==g_st.prim&&s.texa==g_st.texa&&s.colclamp==g_st.colclamp&&
+   std::memcmp(s.ctx,g_st.ctx,sizeof(s.ctx))==0&&
+   std::memcmp(s.clut,g_st.clut,sizeof(s.clut))==0&&
+   std::memcmp(previous.provenance,g_clut_prov,sizeof(previous.provenance))==0;
+ };
+ if(g_vk_states.empty()||!sameState(g_vk_states.back())){
+  VkSavedState snapshot{};snapshot.state=g_st;std::memcpy(snapshot.provenance,g_clut_prov,sizeof(snapshot.provenance));g_vk_states.push_back(std::move(snapshot));
+ }
+ VkFallback saved{};saved.ci=ci;saved.a=a;saved.b=b;saved.c=c;saved.state=uint32_t(g_vk_states.size()-1);
+ if(g_vk_sprite.active){saved.kind=g_vk_sprite.queued?2:1;saved.a=g_vk_sprite.a;saved.b=g_vk_sprite.b;g_vk_sprite.queued=true;}
+ g_vk_fallback.push_back(std::move(saved));
  for(int ty=miny/8;ty<=maxy/8;ty++)for(int tx=minx/8;tx<=maxx/8;tx++)g_vk_bins[ty*80+tx].push_back(index);
  for(int y=miny&~7;y<=maxy;y+=8)for(int x=minx&~7;x<=maxx;x+=8){
   const unsigned colorBlock=ix_ct32(pc.fbp,pc.fbw,x,y)>>6;

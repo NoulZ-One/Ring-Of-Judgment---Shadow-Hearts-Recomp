@@ -1,0 +1,77 @@
+{
+  "source": "Identificações do usuário em pastas.txt, 19/11/2026",
+  "effects": {
+    "01C_S/001": {
+      "label": "Áudio de cura",
+      "certainty": "confirmado",
+      "audioApproved": true
+    },
+    "01C_S/002": {
+      "label": "Áudio de cura",
+      "certainty": "confirmado",
+      "audioApproved": true
+    },
+    "06A_S/001": {
+      "label": "Alice — contexto exato não informado",
+      "certainty": "confirmado"
+    },
+    "06B_S/003": {
+      "label": "Halley Brancket — identificação provável",
+      "certainty": "provável"
+    },
+    "04A_S/003": {
+      "label": "Margareth — contexto exato não informado",
+      "certainty": "confirmado",
+      "audioApproved": true
+    },
+    "18B_S/001": {
+      "label": "Margareth — contexto exato não informado",
+      "certainty": "confirmado"
+    },
+    "regist01/010": {
+      "label": "Obtenção de item durante a exploração",
+      "certainty": "confirmado",
+      "audioApproved": true,
+      "approvedSha256": "A2D08B5562DA63D7CF7CFFE36DC4A20382830A2373EECA7E8BFE37F58684BF77",
+      "approvedSeconds": 2,
+      "approval": "Usuário aprovou a reconstrução de 2 segundos em 19/11/2026"
+    }
+  },
+  "bankRanges": [
+    {
+      "prefix": "000",
+      "first": 1,
+      "last": 8,
+      "label": "Provavelmente Yuri",
+      "certainty": "provável"
+    },
+    {
+      "prefix": "001",
+      "first": 9,
+      "last": 16,
+      "label": "Alice",
+      "certainty": "confirmado"
+    },
+    {
+      "prefix": "002",
+      "first": 17,
+      "last": 24,
+      "label": "Li Zhuzhen",
+      "certainty": "confirmado"
+    },
+    {
+      "prefix": "003",
+      "first": 25,
+      "last": 32,
+      "label": "Margareth",
+      "certainty": "confirmado"
+    },
+    {
+      "prefix": "004",
+      "first": 33,
+      "last": 40,
+      "label": "Possivelmente Keith Valentine — identificação pendente",
+      "certainty": "provável"
+    }
+  ]
+}

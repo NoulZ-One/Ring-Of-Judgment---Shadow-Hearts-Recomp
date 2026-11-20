@@ -46,13 +46,24 @@ internal static class EmitDemo
         List<ElfSymbol> functions = Unique(allFunctions);
 
         Directory.CreateDirectory(directory);
-        foreach (string folder in new[] { "Data", "Saves", Path.Combine("Saves", "Slot2"), "Videos", Path.Combine("Audio", "Sound Effects") })
+        foreach (string folder in new[] { "Data", "Saves", Path.Combine("Saves", "Slot2"), "Videos", Path.Combine("Audio", "Sound Effects"), Path.Combine("Audio", "Music") })
             Directory.CreateDirectory(Path.Combine(directory, folder));
 
         // Os recursos acompanham o executavel do recompilador em qualquer pasta.
         (string Resource, string File)[] assets =
         [
             ("Preparar-Videos.ps1", Path.Combine("Ferramentas", "Preparar-Videos.ps1")),
+            ("Preparar-Musicas.ps1", Path.Combine("Ferramentas", "Preparar-Musicas.ps1")),
+            ("decode_music.cpp", Path.Combine("Ferramentas", "Audio", "decode_music.cpp")),
+            ("music-map.tsv", Path.Combine("Ferramentas", "Audio", "music-map.tsv")),
+            ("MUSICAS.md", Path.Combine("Ferramentas", "Audio", "MUSICAS.md")),
+            ("Instalar-Efeitos.ps1", Path.Combine("Ferramentas", "Instalar-Efeitos.ps1")),
+            ("prepare_effects.cpp", Path.Combine("Ferramentas", "Audio", "prepare_effects.cpp")),
+            ("effect-banks.tsv", Path.Combine("Ferramentas", "Audio", "effect-banks.tsv")),
+            ("effect-behavior.tsv", Path.Combine("Ferramentas", "Audio", "effect-behavior.tsv")),
+            ("effect-labels.json", Path.Combine("Ferramentas", "Audio", "effect-labels.json")),
+            ("update_effect_catalog.cjs", Path.Combine("Ferramentas", "Audio", "update_effect_catalog.cjs")),
+            ("EFEITOS.md", Path.Combine("Ferramentas", "Audio", "EFEITOS.md")),
             ("roj_settings.h", "roj_settings.h"),
             ("roj_input.h", "roj_input.h"),
             ("launcher_input.h", Path.Combine("Launcher", "launcher_input.h")),

@@ -36,6 +36,7 @@ Estrutura de arquivos:
   Saves/Slot2/                  segundo cartao, independente do Slot1
   Videos/MOVIE_00.mp4 ...        videos externos preparados
   Audio/Sound Effects/          efeitos externos confirmados
+  Audio/Music/                 musicas externas e music.tsv
 
 Efeitos externos usados atualmente:
   estilhaco_anel.wav
@@ -46,5 +47,11 @@ Efeitos externos usados atualmente:
 
 Mantenha ps2_image.bin junto do executavel do jogo.
 O catalogo de efeitos extraidos nao precisa acompanhar este pacote.
-As musicas e os demais efeitos continuam sendo lidos da ISO.
+As musicas usam os WAVs externos quando configurados em Audio/Music/music.tsv.
+Para preparar os MP3s: Ferramentas/Preparar-Musicas.ps1 -Zip 'Musicas originais.zip'.
+Sem arquivo externo valido, a musica retorna ao sintetizador da ISO.
+O pacote Audio/Sound Effects usa WAVs por banco e ID, com banks.tsv e effects.tsv.
+Para instalar: Ferramentas/Instalar-Efeitos.ps1 -Revisao 'EfeitosSonorosRevisao'.
+Arquivos aprovados tem prioridade. Os cinco WAVs manuais acima continuam como
+substituicoes especificas; na ausencia de um externo valido, retorna ao RSSD.
 Gerar novamente o C++ preserva os saves e os arquivos de midia existentes.

@@ -1,0 +1,61 @@
+# id	MP3 de origem	loop inicial (PCM 22050 Hz, -1=sem loop)	loop final	ganho
+# loop-pendente bgm321 album mais curto que a sequencia da ISO; reproducao unica
+# loop-pendente bgm416 album mais curto que a sequencia da ISO; reproducao unica
+# loop-pendente bgm417 album mais curto que a sequencia da ISO; reproducao unica
+bgm101	1-03. Continental Express II 'Wind which blows from the dark  -  II'.mp3	0	1852108	1
+bgm102	1-06. Plains 'Sphere -qu-'.mp3	0	1507301	1
+bgm103	1-07. Zhaoyang Village 'Destruction -Noiz of fangs-'.mp3	587908	2645914	1
+bgm104	1-14. Fengtian 'Heaven -Kunyang Kunyang-'.mp3	0	1881600	1
+bgm106	1-15. Dalian 'Sea -Highnoon fish-'.mp3	306679	2147394	1
+bgm107	1-17. Smuggler's Boat 'Maneuver -Beltconveyor for Killers-'.mp3	0	3414167	1
+bgm108	1-18. Shanghai 'Swindler -Shanghai mood-'.mp3	192386	2453614	1
+bgm109	1-23. Temple Ruins 'Death -Zombie party-'.mp3	0	3586918	1
+bgm110	1-26. Kuihai Tower 'Misfortune -Psycho temple-'.mp3	264508	2381308	1
+bgm201	2-02. Prague 'c-I-t-y'.mp3	225094	2589681	1
+bgm202	2-04. Bistritz 'Dirty nails'.mp3	0	1764144	1
+bgm203	2-08. Blue Castle 'Coffin fetish'.mp3	155544	1867727	1
+bgm204	2-11. Rouen 'But-dad-dead-bed'.mp3	160230	2161451	1
+bgm205	2-12. London 'Vitamin metropolis'.mp3	227574	1820871	1
+bgm206	2-14. Halley's Hideout 'Babysitter is old nurse'.mp3	0	2156031	1
+bgm207	2-16. Murderer's Mansion 'Ripper ripper'.mp3	0	2182275	1
+bgm208	2-17. Castle of Closed Windows 'Castle of a silence'.mp3	0	3782402	1
+bgm209	2-19. Nemeton Monastery 'Bacon's juice'.mp3	0	1646400	1
+bgm210	2-23. Castle of the Mad Gods I 'Nobody knocks the door'.mp3	0	1411200	1
+bgm211	2-24. Castle of the Mad Gods II 'Star shape'.mp3	92794	2321000	1
+bgm212	2-25. Castle of the Mad Gods III 'Middle of nowhere'.mp3	0	2216852	1
+bgm302	2-21. Main Theme Beat Arrange 'ICARO beated ver.'.mp3	687868	2857680	1
+bgm304	1-08. Tension 'DOA'.mp3	910757	2616049	1
+bgm305	1-09. Reinforcements 'Blade'.mp3	0	1573268	1
+bgm306	2-03. Sadness 'God knows bad news'.mp3	871159	3466260	1
+bgm307	1-25. Alice's Theme 'ALICE'.mp3	440908	2902974	1
+bgm308	1-21. Anxiety 'Someone's table'.mp3	0	1883693	1
+bgm310	1-16. Fear 'Angel Heart'.mp3	0	2154377	1
+bgm311	1-22. Anger 'Much hatred still rankles'.mp3	0	1953998	1
+bgm313	2-18. Mystery 'Callback from Jesus'.mp3	0	2429175	1
+bgm315	2-32. Happiness I 'Black cat floating in bluesky'.mp3	0	2103203	1
+bgm316	1-11. Joy 'Rice field of light'.mp3	266897	1325265	1
+bgm317	2-22. Birth 'Steel Soul - tanjou'.mp3	68171	2207684	1
+bgm318	1-20. Betrayal 'Profile'.mp3	1667991	2020791	1
+bgm319	2-15. Memories 'Don't cry my vampire'.mp3	90864	1391263	1
+bgm320	1-12. Daily Life I 'Coffee with Bullet'.mp3	0	2602635	1
+bgm321	2-20. Daily Life II 'Trip or treat'.mp3	-1	0	1
+bgm326	1-10. Japanese Army Theme 'Army mood'.mp3	403148	1612774	1
+bgm327	2-13. Inn 'Sweet pillows'.mp3	-1	0	1
+bgm328	1-13. Happiness II 'Asian Parfait'.mp3	476188	2593080	1
+bgm401	1-04. China Battle 'Brain hopper'.mp3	69549	2088870	1
+bgm403	2-09. Europe Battle 'nde  -  near death experience'.mp3	318898	2161649	1
+bgm405	1-27. Mid-Boss I 'China ogre'.mp3	158668	2063880	1
+bgm406	2-26. Mid-Boss II 'Demon's gig'.mp3	588000	2866500	1
+bgm407	1-05. China Berserk 'Ghosts jogging'.mp3	4134	1591734	1
+bgm409	2-31. Victory 'Result'.mp3	143325	707805	1
+bgm410	2-29. Decisive Battle 'Imbroglio'.mp3	278473	2506809	1
+bgm411	2-10. Europe Berserk 'ssc  -  special short cuts'.mp3	0	1786050	1
+bgm412	1-28. Mid-Boss Berserk I 'Melt down'.mp3	0	1872045	1
+bgm413	2-30. Decisive Battle Berserk 'Bate me bate me'.mp3	1041954	1048294	1
+bgm415	2-05. Death Battle 'The thorn of mind'.mp3	176308	2293108	1
+bgm416	2-06. Death Berserk 'Reckless'.mp3	-1	0	1
+bgm417	2-27. Mid-Boss Berserk II 'Sicking fucking'.mp3	-1	0	1
+bgm501	1-24. China Map 'Blow up'.mp3	97020	1262271	1
+bgm502	2-01. Europe Map 'Atmosphere - Blow up'.mp3	0	1362383	1
+bgm504	1-30. Defeat 'Bloody kitchens'.mp3	1430218	2002322	1
+bgm506	2-07. Graveyard 'Graveyard moon'.mp3	0	1392633	1

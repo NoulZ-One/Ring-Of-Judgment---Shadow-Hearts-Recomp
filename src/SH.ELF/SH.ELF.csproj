@@ -7,6 +7,8 @@
     <EmbeddedResource Include="RuntimeAssets\Vulkan\device.h" LogicalName="SH.ELF.Vulkan.device" />
     <EmbeddedResource Include="RuntimeAssets\Vulkan\batch.inc" LogicalName="SH.ELF.Vulkan.batch" />
     <EmbeddedResource Include="RuntimeAssets\Vulkan\raster.spv" LogicalName="SH.ELF.Vulkan.shader" />
+    <EmbeddedResource Include="RuntimeAssets\external_music.h" LogicalName="SH.ELF.Vulkan.music" />
+    <EmbeddedResource Include="RuntimeAssets\external_effects.h" LogicalName="SH.ELF.Vulkan.effects" />
   </ItemGroup>
 
   <PropertyGroup>

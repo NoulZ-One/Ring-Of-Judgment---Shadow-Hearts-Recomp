@@ -15,8 +15,8 @@ layout(push_constant) uniform Parameters { uint spanOffset; uint colorTable; uin
 // Separate storage: guest VRAM stays exactly 4 MiB. No scaled address can
 // overlap a guest framebuffer, texture, CLUT or Z page.
 const uint nativePixels=640*224,maxPixels=1280*720;
-const uint cacheColor=1048576,cacheDepth=cacheColor+2*nativePixels;
-const uint highColor=cacheDepth+2*nativePixels,highDepth=highColor+2*maxPixels;
+const uint cacheColor=1048576,cacheDepth=cacheColor+3*nativePixels;
+const uint highColor=cacheDepth+3*nativePixels,highDepth=highColor+3*maxPixels;
 uint colorAddress(uint bp,uint bw,uint x,uint y) {
  return ((((bp>>5)+(y>>5)*bw+(x>>6))<<11)+((bp&31)<<6)+work[p.colorTable+(y&31)*64+(x&63)])&0xfffff;
 }
@@ -71,7 +71,7 @@ void main() {
   x+=work[rect]*hw/640;y+=work[rect+1]*hh/224;
   if(x>=(work[rect+2]*hw+639)/640||y>=(work[rect+3]*hh+223)/224)return;
  }
- uint frame=(p.unused>>24)&1,fbp=frame*2240;
+ uint frame=(p.unused>>24)&3,fbp=frame==2?5760:frame*2240;
  bool hires=mode==1;
  if(mode==2||mode==3) {
   if(x>=hw||y>=hh)return;
@@ -93,10 +93,21 @@ void main() {
  bool dirty=false; uint destination=0,address=0;
  for(uint n=0;n<count;++n) {
   Triangle t=tris[work[start+n]];
+  bool sprite=(t.tex.w&256)!=0;
   if(hires) {if(px<float(t.bounds.x)||px>=float(t.bounds.y+1)||py<float(t.bounds.z)||py>=float(t.bounds.w+1))continue;}
   else if(int(y)<t.bounds.z||int(y)>t.bounds.w)continue;
   uint s=p.spanOffset+(t.span.x+(hires?uint(py):y)-uint(t.bounds.z))*8;
-  if(!hires&&(int(x)<int(work[s])||int(x)>int(work[s+1])))continue;
+  if(!hires&&!sprite&&(int(x)<int(work[s])||int(x)>int(work[s+1])))continue;
+  if(!hires&&sprite){
+   precise float ay=uintBitsToFloat(t.span.w),width=t.z.y-t.z.w,height=t.z.z-ay;
+   if(px<t.z.w||px>=t.z.y||py<ay||py>=t.z.z)continue;
+   // The two halves consume every native sprite pixel exactly once,
+   // including diagonals crossing pixel centers. Legacy triangle spans
+   // are inclusive and would otherwise blend the shared edge twice.
+   precise float diagonal=(px-t.z.w)*height+(py-ay)*width;
+   bool first=diagonal<=width*height;
+   if(first==((t.tex.w&512)!=0))continue;
+  }
   precise float k0=t.coeff0.z+t.coeff0.w*py;
   precise float k1=t.coeff1.x+t.coeff1.y*py;
   precise float w0=k0+t.coeff0.x*px,w1=k1+t.coeff0.y*px,w2=1.0-w0-w1;
@@ -108,6 +119,7 @@ void main() {
   bool flatShade=(t.tex.w&128)!=0;
   precise float delta=float(int(x)-int(work[s]));
   if(flatShade&&!hires)zf=uintBitsToFloat(work[s+4])+t.z.w*delta;
+  if(sprite)zf=t.z.x;
   uint z=zf<=0.0?0:(zf>=4294967040.0?0xffffff00u:uint(zf));
   bool zactive=(t.state.w&1)!=0,zmasked=(t.state.w&2)!=0;
   uint ztest=(t.state.w>>2)&3,za=0;
@@ -126,7 +138,18 @@ void main() {
    if((t.tex.w&4)!=0&&uvq.z!=0.0)q=fma(q,fma(-uvq.z,q,1.0),q);
    precise float u=uvq.x*q,v=uvq.y*q;
    if(flatShade&&!hires){u=uintBitsToFloat(work[s+2])+t.coeff1.z*delta;v=uintBitsToFloat(work[s+3])+t.coeff1.w*delta;}
-   uint texel=sampleTex(t,u,v);
+   if(sprite&&!hires){
+    precise float origin=max(0.0,ceil(t.z.w-0.5));
+    u=uintBitsToFloat(t.span.y)+t.coeff1.z*(float(x)-origin);
+    precise float vertical=(float(y)+0.5-uintBitsToFloat(t.span.w))*uintBitsToFloat(t.blend.w);
+    v=uintBitsToFloat(t.span.z)+t.coeff1.w*vertical;
+   }
+   uint texel;
+   if(hires&&(t.tex.w&1024)!=0) {
+    uint tx=uint(clamp(floor(u*float(hw)/640.0),0.0,float(hw-1)));
+    uint ty=uint(clamp(floor(v*float(hh)/224.0),0.0,float(hh-1)));
+    texel=memory[highColor+2*maxPixels+ty*hw+tx];
+   } else texel=sampleTex(t,u,v);
    ivec4 tex=ivec4(texel&255,(texel>>8)&255,(texel>>16)&255,texel>>24);
    bool tcc=(t.tex.w&8)!=0;
    uint tfx=(t.tex.w>>4)&3;
@@ -159,7 +182,7 @@ void main() {
   uint rect=p.depthTable+4096;
   // Only acknowledge native pixels whose high-resolution counterparts
   // were synchronized. CPU UI elsewhere must stay dirty until resolve.
-  if((p.unused&(1u<<25))==0 &&
+  if((p.unused&(1u<<26))==0 &&
      (x<work[rect]||x>=work[rect+2]||y<work[rect+1]||y>=work[rect+3]))return;
   uint ni=frame*nativePixels+y*640+x;
   memory[cacheColor+ni]=memory[colorAddress(fbp,10,x,y)];

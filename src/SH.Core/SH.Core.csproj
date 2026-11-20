@@ -4,6 +4,17 @@
     <ProjectReference Include="..\SH.ISO\SH.ISO.csproj" />
     <ProjectReference Include="..\SH.ELF\SH.ELF.csproj" />
     <EmbeddedResource Include="Ferramentas\Preparar-Videos.ps1" LogicalName="SH.Core.Preparar-Videos.ps1" />
+    <EmbeddedResource Include="Ferramentas\Preparar-Musicas.ps1" LogicalName="SH.Core.Preparar-Musicas.ps1" />
+    <EmbeddedResource Include="Ferramentas\Audio\decode_music.cpp" LogicalName="SH.Core.decode_music.cpp" />
+    <EmbeddedResource Include="Ferramentas\Audio\music-map.tsv" LogicalName="SH.Core.music-map.tsv" />
+    <EmbeddedResource Include="Ferramentas\Audio\MUSICAS.md" LogicalName="SH.Core.MUSICAS.md" />
+    <EmbeddedResource Include="Ferramentas\Instalar-Efeitos.ps1" LogicalName="SH.Core.Instalar-Efeitos.ps1" />
+    <EmbeddedResource Include="Ferramentas\Audio\prepare_effects.cpp" LogicalName="SH.Core.prepare_effects.cpp" />
+    <EmbeddedResource Include="Ferramentas\Audio\effect-banks.tsv" LogicalName="SH.Core.effect-banks.tsv" />
+    <EmbeddedResource Include="Ferramentas\Audio\effect-behavior.tsv" LogicalName="SH.Core.effect-behavior.tsv" />
+    <EmbeddedResource Include="Ferramentas\Audio\effect-labels.json" LogicalName="SH.Core.effect-labels.json" />
+    <EmbeddedResource Include="Ferramentas\Audio\update_effect_catalog.cjs" LogicalName="SH.Core.update_effect_catalog.cjs" />
+    <EmbeddedResource Include="Ferramentas\Audio\EFEITOS.md" LogicalName="SH.Core.EFEITOS.md" />
     <EmbeddedResource Include="RuntimeAssets\roj_settings.h" LogicalName="SH.Core.roj_settings.h" />
     <EmbeddedResource Include="RuntimeAssets\roj_input.h" LogicalName="SH.Core.roj_input.h" />
     <EmbeddedResource Include="RuntimeAssets\launcher_input.h" LogicalName="SH.Core.launcher_input.h" />

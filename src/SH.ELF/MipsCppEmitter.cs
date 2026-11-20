@@ -901,7 +901,9 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
         device.AppendLine("\n};").AppendLine(ReadVulkan("device"));
         return RuntimeSourceTemplate.Replace("/* SH_EMBEDDED_VU1_PROGRAMS */", programs.ToString())
             .Replace("/* SH_EMBEDDED_VULKAN_DEVICE */", device.ToString())
-            .Replace("/* SH_EMBEDDED_VULKAN_BATCH */", ReadVulkan("batch"));
+            .Replace("/* SH_EMBEDDED_VULKAN_BATCH */", ReadVulkan("batch"))
+            .Replace("/* SH_EMBEDDED_EXTERNAL_MUSIC */", ReadVulkan("music"))
+            .Replace("/* SH_EMBEDDED_EXTERNAL_EFFECTS */", ReadVulkan("effects"));
     }
 
     private const string RuntimeSourceTemplate = """
@@ -930,6 +932,7 @@ void vu0_callms(Ctx& c, uint32_t address, uint32_t raw);
 #include <vector>
 #include <utility>
 const roj::Settings& ps2_settings();
+/* SH_EMBEDDED_EXTERNAL_EFFECTS */
 /* SH_EMBEDDED_VULKAN_DEVICE */
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
@@ -1348,6 +1351,7 @@ namespace
     {
         std::shared_ptr<const LiveBytes> swd, auxiliary;
         LiveBytes seds;
+        roj::EffectBankKey external_key;
     };
 
     struct EffectRequest
@@ -1389,6 +1393,7 @@ namespace
         static constexpr unsigned ShatterFade = LiveRate*220/1000;
 
         std::vector<EffectVoice> voices;
+        roj::ExternalEffects external;
         struct RecordedEffect
         {
             std::shared_ptr<const LiveSample> channels[2];
@@ -1435,6 +1440,10 @@ namespace
         }
 
     public:
+        void external_root(const std::filesystem::path& root)
+        {
+            if(external.configure(root))std::fprintf(stderr,"  [audio RSSD ao vivo] pacote de efeitos externos ativo\n");
+        }
         bool load_effect_wav(unsigned id, double playback_gain, const LiveBytes& wav)
         {
             // O arquivo do efeito usa PCM estereo de 16 bits na taxa do mixer.
@@ -1487,6 +1496,7 @@ namespace
 
         unsigned play(const EffectRequest& request)
         {
+            if(request.bank && external.play(request.bank->external_key,request.id,request.volume,request.pan,true))return 1;
             if (auto it=recordings.find(request.id); request.use_recording && it!=recordings.end())
             {
                 // Mantem a separacao L/R e aplica o volume do pedido original.
@@ -1507,6 +1517,7 @@ namespace
                 return 2;
             }
 
+            if(request.bank && external.play(request.bank->external_key,request.id,request.volume,request.pan))return 1;
             if (!request.bank)
                 return 0;
             const auto& b = *request.bank;
@@ -1873,6 +1884,7 @@ namespace
 
         void stop(unsigned id, bool whole_bank)
         {
+            external.stop(id,whole_bank);
             voices.erase(std::remove_if(voices.begin(),voices.end(),[=](const EffectVoice& v){
                 return id == (whole_bank ? v.id >> 16 : v.id);
             }),voices.end());
@@ -1977,6 +1989,7 @@ namespace
                 pcm[2*i]=int16_t(std::clamp(left,-32768.0,32767.0));
                 pcm[2*i+1]=int16_t(std::clamp(right,-32768.0,32767.0));
             }
+            external.render(pcm,frames,gain);
         }
     };
 }
@@ -3260,7 +3273,7 @@ namespace
             case 35: case 36:   // ExitThread, ExitDeleteThread
                 if (me == 1)
                 {
-                    std::fprintf(stderr, "a thread principal chamou ExitThread: encerrando\n");
+                    std::fprintf(stderr, "a thread principal chamou ExitThread: encerrando\n[ROJ_SESSION_CLOSED_NORMALLY]\n");
                     std::fflush(stderr);
                     std::exit(0);
                 }
@@ -4014,6 +4027,7 @@ bool ps2_iso_open(const char* path)
 
 // Ctrl+C: mostra o que o jogo estava fazendo (util quando ele fica preso em um laco).
 void ps2_install_crash_filter();   // filtro de excecoes do Windows (definido no fim do arquivo)
+void ps2_begin_crash_log();
 void ps2_win_tune();               // resolucao do timer e anti-throttling do Windows (definido no fim do arquivo)
 
 static void on_interrupt(int)
@@ -4036,6 +4050,7 @@ static void on_crash(int sig)
         std::_Exit(4);
 
     in_crash = 1;
+    ps2_begin_crash_log();
 
     const char* name = sig == SIGSEGV ? "SIGSEGV (acesso invalido a memoria)"
         : sig == SIGFPE ? "SIGFPE (divisao por zero ou erro aritmetico)"
@@ -5214,9 +5229,13 @@ namespace
                         return UINT32_MAX;
                 }
             }
-            effects[handle] = std::make_shared<EffectBank>(EffectBank{
+            auto loaded = std::make_shared<EffectBank>(EffectBank{
                 primary!=waves.end()?primary->second:nullptr,
                 auxiliary!=waves.end()?auxiliary->second:nullptr,LiveBytes(data,data+length)});
+            loaded->external_key.sequence=roj::effect_fingerprint(data,length,12);
+            if(loaded->swd)loaded->external_key.primary=roj::effect_fingerprint(loaded->swd->data(),loaded->swd->size());
+            if(loaded->auxiliary)loaded->external_key.auxiliary=roj::effect_fingerprint(loaded->auxiliary->data(),loaded->auxiliary->size());
+            effects[handle]=std::move(loaded);
             if (trace)
                 std::fprintf(stderr,"  [RSSD FX] t=%lldms banco=%.16s id=%04X registros=%u\n",
                     rssd_fx_ms(),reinterpret_cast<const char*>(data+0x20),handle,live_word(data+26,2));
@@ -6768,6 +6787,7 @@ namespace
 
     GsState g_st;
     void gs_vk_flush();
+    bool gs_vk_scene_sprite(int ci, const GsVertex& a, const GsVertex& b);
     void gs_vk_hi_reset(uint32_t fbp);
     void gs_vk_palette_barrier(uint32_t bp);
 
@@ -8338,6 +8358,12 @@ namespace
 
     static void gs_ui_on_sprite(const PixCfg& pc, int x0, int y0, int x1, int y1)
     {
+        // Field scenes also clear an offscreen target before composing it.
+        // Its one-bit color mask and ALWAYS alpha test still start a new scene.
+        if (pc.fbp == 5760 && !pc.tme && !pc.abe && !pc.fpsm && pc.fbw == 10 &&
+            pc.fbmsk == 1 && pc.ate && pc.atst == 1 && x0 <= 0 && y0 <= 0 && x1 >= 640 && y1 >= 224 &&
+            pc.sx0 == 0 && pc.sy0 == 0 && pc.sx1 >= 639 && pc.sy1 >= 223)
+            gs_vk_hi_reset(pc.fbp);
         if (!pc.tme && !pc.abe && !pc.ate && !pc.fbmsk && !pc.fpsm && pc.fbw == 10 &&
             x0 <= 0 && y0 <= 0 && x1 >= 640 && y1 >= 224 &&
             pc.sx0 == 0 && pc.sy0 == 0 && pc.sx1 >= 639 && pc.sy1 >= 223)
@@ -8409,7 +8435,6 @@ namespace
 
     void gs_draw_sprite(int ci, const GsVertex& a, const GsVertex& b)
     {
-        gs_vk_flush();
         float x0 = std::min(a.x, b.x), x1 = std::max(a.x, b.x), y0 = std::min(a.y, b.y), y1 = std::max(a.y, b.y);
 
         if (x1 <= x0 || y1 <= y0)
@@ -8423,6 +8448,44 @@ namespace
 
         PixCfg pc;
         gs_pix_cfg(ci, pc);
+
+        // Scene overlays must blend with detailed model pixels, rather than
+        // forcing a native-resolution replacement during the next resolve.
+        // Keep consecutive fog sprites in GS order in the same GPU batch.
+        if (gs_vk_scene_sprite(ci, a, b)) return;
+        gs_vk_flush();
+
+        // The game tiles a separate dark patch behind each dialogue letter.
+        // Its atlas is distinct from the glyph atlas and portrait. Suppress
+        // only its RGB: the selected final outline/band replaces this patch;
+        // original alpha/depth writes remain intact for GS compatibility.
+        const bool caption_patch = g_ui_native && g_gs_crt_int && g_gs_crt_ffmd &&
+            pc.tme && pc.abe && pc.fpsm == 0 && pc.fbw == 10 &&
+            (pc.fbp == 0 || pc.fbp == 2240) && pc.ti.psm == 0x14 &&
+            pc.ti.w == 64 && pc.ti.h == 32 && pc.ti.tbw == 2 &&
+            pc.ti.csa16 == 0 && pc.ate && pc.atst == 6 && pc.aref == 1 && pc.afail == 0 && !pc.zactive &&
+            g_st.ctx[ci].alpha == 0x44 && pc.ti.tcc && pc.ti.tfx == 0 &&
+            std::fabs(x1-x0-16) < .01f && std::fabs(y1-y0-19) < .01f &&
+            a.u == 0 && b.u == 39 && a.v == 0 && b.v == 19;
+        if (caption_patch) { gs_ui_sprite_auxiliary(pc,a,b); return; }
+
+        // The streamed field background uses 16x16 CT32 atlases and 16x8
+        // field sprites with the signed-maximum screen-space Z sentinel.
+        // Truncating that sentinel to Z16S writes 65535 over the scene depth
+        // and rejects every character after the opening train battle.
+        // Keep the backdrop read-only in depth; model and HUD depth writes
+        // retain their normal GS rules. Do not apply this to ordinary sprites.
+        if (pc.tme && pc.abe && pc.fpsm == 0 && pc.fbw == 10 &&
+            (pc.fbp == 0 || pc.fbp == 2240) && pc.ti.psm == 0 &&
+            pc.ti.w == 16 && pc.ti.h == 16 && pc.ti.tbw == 1 &&
+            pc.ti.tfx == 0 && pc.ti.tcc && pc.zactive &&
+            pc.zpsm == 0x3A && pc.ztst == 2 &&
+            a.z == 0x7FFFFFFFu && b.z == 0x7FFFFFFFu &&
+            std::fabs(x1 - x0 - 16.0f) < 0.01f &&
+            std::fabs(y1 - y0 - 8.0f) < 0.01f &&
+            std::fabs(std::fabs(b.u - a.u) - 16.0f) < 0.01f &&
+            std::fabs(std::fabs(b.v - a.v) - 8.0f) < 0.01f)
+            pc.zmsk = true;
 
         gs_ui_on_sprite(pc, px0, py0, px1, py1);
 
@@ -8557,7 +8620,10 @@ namespace
         // BtlStat2: nomes e valores do HUD, atlas 512x128 da captura de batalha.
         // Usa Z ALWAYS com escrita, por isso era rejeitado pelo caminho nativo
         // e perdia metade das linhas da fonte no framebuffer de 224 linhas.
-        const bool battle_font = pc.ti.psm == 0x14u && font_palette == 5708u &&
+        // These UI allocations move with the battle's loaded resources.
+        // Atlas layout, CSA and the sprite/depth/UV checks identify the font;
+        // a fixed CLUT address misses the first Bacon battle on the train.
+        const bool battle_font = pc.ti.psm == 0x14u &&
             pc.ti.w == 512 && pc.ti.h == 128 && pc.ti.tbw == 8u;
         const bool result_font = pc.ti.psm == 0x13u &&
             ((font_palette == 5708u && pc.ti.w == 256 && pc.ti.h == 128 && pc.ti.tbw == 4u) ||
@@ -8567,15 +8633,19 @@ namespace
             a.u == 172.0f && a.v == 40.0f && b.u == 180.0f && b.v == 56.0f;
         // Nome no topo e ajuda inferior: paleta 5532, CSA 4. A faixa de
         // ajuda usa TBP 5588, abaixo do limite usado pelos outros atlas.
-        const bool battle_prompt_font = pc.ti.psm == 0x14u && font_palette == 5532u &&
+        const bool battle_prompt_font = pc.ti.psm == 0x14u &&
             pc.ti.csa16 == 64u && pc.ti.h == 32 &&
             ((pc.ti.w == 256 && pc.ti.tbw == 4u) ||
              (pc.ti.w == 1024 && pc.ti.tbw == 10u));
-        const bool known_font = caption_font || system_font || menu_font || battle_font || battle_prompt_font || result_font || result_gold_label;
+        // Cyan current HP/MP/SP beside the ring use the high nibble of a
+        // CT32 texture (PSMT4HH), not the ordinary PSMT4 font format.
+        const bool ring_status_font = pc.ti.psm == 0x2Cu && pc.ti.csa16 == 48u &&
+            pc.ti.w == 256 && pc.ti.h == 64 && pc.ti.tbw == 4u;
+        const bool known_font = caption_font || system_font || menu_font || battle_font || battle_prompt_font || ring_status_font || result_font || result_gold_label;
         const bool writable_font_depth = known_font && pc.zactive && pc.ztst == 1u &&
             pc.zbp >= 4480u && pc.zbp <= 15000u && (pc.ti.tbp >= 5760u || battle_prompt_font);
         if (ui_native_enabled && g_gs_crt_int && g_gs_crt_ffmd &&
-            pc.tme && (!pc.ti.linear || known_font) && (pc.ti.psm == 0x14u || caption_font || result_font) &&
+            pc.tme && (!pc.ti.linear || known_font) && (pc.ti.psm == 0x14u || caption_font || result_font || ring_status_font) &&
             pc.ti.tfx == 0u && pc.ti.tcc &&
             pc.fpsm == 0u && pc.fbmsk == 0u &&
             (pc.fbp == 0u || pc.fbp == 2240u) &&
@@ -8593,9 +8663,11 @@ namespace
             // Os atlas de dialogo tambem usam duas linhas de textura por
             // linha do campo. Preserve ambas na imagem final, como no menu.
             const bool shadow = b.r == 0 && b.g == 0 && b.b == 0;
-            if ((std::fabs(du - 1.0f) < 0.03f || (known_font && shadow && std::fabs((b.u-a.u)-w) <= 1.05f)) &&
+            if ((std::fabs(du - 1.0f) < 0.03f || (known_font && shadow && std::fabs((b.u-a.u)-w) <= 1.05f) ||
+                 (ring_status_font && std::fabs((b.u-a.u)-w) <= 1.05f)) &&
                 (std::fabs(dv - 2.0f) < 0.03f || (caption_font && std::fabs(dv - 1.0f) < 0.03f) ||
-                 (known_font && shadow && std::fabs((b.v-a.v)-h) <= 1.05f)) &&
+                 (known_font && shadow && std::fabs((b.v-a.v)-h) <= 1.05f) ||
+                 (ring_status_font && std::fabs((b.v-a.v)-h) <= 2.05f)) &&
                 w >= 1 && w <= 640 && h >= 14 && h <= 64 &&
                 a.u >= 0.0f && a.v >= 0.0f)
             {
@@ -10107,15 +10179,23 @@ namespace
         }
     };
 
-    static UiGlyphP gs_ui_scale_glyph(const UiGlyphP& source,unsigned width,unsigned height)
+    static void gs_ui_scale_geometry(UiGlyphP& result,const UiGlyphP& source,unsigned width,unsigned height)
     {
-        UiGlyphP result=source;
         const double sx=width/640.0,sy=height/448.0;
+        result.fbp=source.fbp; result.vsync=source.vsync; result.tint=source.tint;
+        result.outline=source.outline; result.ring_hud=source.ring_hud;
         result.x=int(std::lround(source.x*sx)); result.y=int(std::lround(source.y*sy));
         result.w=int(std::lround((source.x+source.w)*sx))-result.x;
         result.h=int(std::lround((source.y+source.h)*sy))-result.y;
         result.clip_x0=int(std::lround(source.clip_x0*sx)); result.clip_x1=int(std::lround(source.clip_x1*sx));
         result.clip_y0=int(std::lround(source.clip_y0*sy)); result.clip_y1=int(std::lround(source.clip_y1*sy));
+    }
+
+    static UiGlyphP gs_ui_scale_glyph(const UiGlyphP& source,unsigned width,unsigned height)
+    {
+        UiGlyphP result;
+        gs_ui_scale_geometry(result,source,width,height);
+        const double sx=width/640.0,sy=height/448.0;
         result.rgba.assign(size_t(result.w)*result.h,0);
         const auto sample=[&](int x,int y){return x<0||y<0||x>=source.w||y>=source.h?0u:source.rgba[size_t(y)*source.w+x];};
         for(int y=0;y<result.h;++y)for(int x=0;x<result.w;++x){
@@ -10128,6 +10208,45 @@ namespace
         }
         return result;
     }
+
+    struct UiGlyphScaleCache
+    {
+        struct Entry { bool valid = false; UiGlyphP source, scaled; };
+        unsigned width = 0, height = 0;
+        std::vector<Entry> entries;
+        void begin(unsigned w, unsigned h, size_t count)
+        {
+            if (width != w || height != h) entries.clear();
+            width = w; height = h;
+            entries.resize(count);
+        }
+        const UiGlyphP& get(size_t index, const UiGlyphP& source)
+        {
+            Entry& entry = entries[index];
+            const UiGlyphP& old = entry.source;
+            UiGlyphP layout; gs_ui_scale_geometry(layout,source,width,height);
+            const bool same = entry.valid && old.fbp == source.fbp &&
+                old.w == source.w && old.h == source.h && old.rgba == source.rgba &&
+                layout.w == entry.scaled.w && layout.h == entry.scaled.h &&
+                int64_t(layout.x-entry.scaled.x)*640 == int64_t(source.x-old.x)*width &&
+                int64_t(layout.y-entry.scaled.y)*448 == int64_t(source.y-old.y)*height;
+            if (!same)
+            {
+                entry.source = source;
+                entry.scaled = gs_ui_scale_glyph(source, width, height);
+                entry.valid = true;
+            }
+            else
+            {
+                // Integer translations with the same sampling phase reuse
+                // texels during menu slides as well as stationary screens.
+                layout.rgba = std::move(entry.scaled.rgba);
+                entry.scaled = std::move(layout);
+                entry.source.x = source.x; entry.source.y = source.y;
+            }
+            return entry.scaled;
+        }
+    };
 
     void gs_present_frame()
     {
@@ -10573,7 +10692,15 @@ namespace
                         glyphs.push_back(glyph);
             }
             if(present_width!=d.w||present_height!=d.h)
-                for(auto& glyph:glyphs)glyph=gs_ui_scale_glyph(glyph,present_width,present_height);
+            {
+                // Each display buffer owns its cache. Compare actual texels,
+                // so palette changes, fades, clipping and cursor animation
+                // apply immediately; only equivalent samples are reused.
+                static UiGlyphScaleCache caches[2];
+                auto& cache = caches[d.fbp == 2240 ? 1 : 0];
+                cache.begin(present_width, present_height, glyphs.size());
+                for(size_t i=0;i<glyphs.size();++i) glyphs[i]=cache.get(i,glyphs[i]);
+            }
             gs_ui_text_background(pix, int(present_width), int(present_height), glyphs, ps2_settings().text_style);
             for (const UiGlyphP& glyph : glyphs)
                 for (int gy = 0; gy < glyph.h; ++gy)
@@ -11506,6 +11633,9 @@ namespace
 
             if (!active)
             {
+                // GIF resets its internal Q at every tag, including IMAGE and
+                // REGLIST tags. PACKED RGBA must not reuse the previous draw's Q.
+                q = 0x3F800000u;
                 uint64_t nloop = lo & 0x7FFF;
                 bool pre = ((lo >> 46) & 1) != 0;
                 uint64_t prim = (lo >> 47) & 0x7FF;
@@ -14678,6 +14808,7 @@ static HWND ps2_create_game_window(HINSTANCE instance)
     return window;
 }
 
+/* SH_EMBEDDED_EXTERNAL_MUSIC */
 namespace
 {
     struct RssdWaveApi
@@ -14799,6 +14930,7 @@ namespace
         bool closing = false;
         bool device_failed = false;
         std::unique_ptr<LiveSong> song;
+        std::unique_ptr<roj::ExternalMusic> external_song;
         LiveEffects effects;
         bool effect_logged = false;
         std::string song_name;
@@ -14835,13 +14967,23 @@ namespace
                     effects.stop(c.id,c.whole_bank);
                 else
                 {
-                    if (song)
+                    if (song || external_song)
                     {
                         std::fprintf(stderr,"  [audio RSSD ao vivo] %s: fim\n",song_name.c_str());
                         song.reset();
+                        external_song.reset();
                     }
                     if (c.kind == Command::Play)
                     {
+                        if(c.sequence.size()<0x3c || !c.bank)continue;
+                        const auto first=c.sequence.begin()+0x2c;
+                        song_name.assign(first,std::find(first,first+16,uint8_t(0)));
+                        auto external=std::make_unique<roj::ExternalMusic>();
+                        if(external->open(ps2_windows_executable_path().parent_path()/L"Audio"/L"Music",song_name)){
+                            external_song=std::move(external);
+                            std::fprintf(stderr,"  [audio RSSD ao vivo] %s: musica externa\n",song_name.c_str());
+                            continue;
+                        }
                         auto next = std::make_unique<LiveSong>();
                         if (next->load(c.sequence,*c.bank))
                         {
@@ -14882,7 +15024,14 @@ namespace
             auto write = [&](unsigned i)
             {
                 auto& pcm = buffers->pcm[i];
-                if (song)
+                if (external_song)
+                {
+                    if(!external_song->render(pcm,BlockFrames)){
+                        std::fprintf(stderr,"  [audio RSSD ao vivo] %s: falha ao ler musica externa\n",song_name.c_str());
+                        external_song.reset();
+                    }
+                }
+                else if (song)
                     song->render(pcm,BlockFrames);
                 else
                     std::fill_n(pcm,BlockFrames*2,int16_t(0));
@@ -14932,6 +15081,7 @@ namespace
 
         void run()
         {
+            effects.external_root(ps2_windows_executable_path().parent_path()/L"Audio"/L"Sound Effects");
             rssd_load_recorded_effects(effects);
             const RssdWaveApi api(rssd_live_module());
             if (!api.ready() || (update(true) && !playback(api)))
@@ -15214,6 +15364,7 @@ namespace
             case WM_CLOSE:
             case WM_DESTROY:
                 ps2_restore_display();
+                std::fprintf(stderr, "\n[ROJ_SESSION_CLOSED_NORMALLY]\n");
                 std::fflush(stderr);
                 std::_Exit(0);
 
@@ -15474,6 +15625,7 @@ void ps2_window_start()
 // Excecoes que o signal() do C nao pega (estouro de pilha, divisao inteira por zero, instrucao ilegal...).
 static LONG WINAPI ps2_exception_filter(EXCEPTION_POINTERS* ep)
 {
+    ps2_begin_crash_log();
     ps2_restore_display();
     std::fprintf(stderr, "\n  [CRASH] excecao do Windows 0x%08lX no endereco %p\n",
         (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
@@ -15489,6 +15641,23 @@ static LONG WINAPI ps2_exception_filter(EXCEPTION_POINTERS* ep)
 void ps2_install_crash_filter()
 {
     SetUnhandledExceptionFilter(ps2_exception_filter);
+}
+
+void ps2_begin_crash_log()
+{
+    // The launcher supervisor retains the recent output from this pipe.
+    // A direct launch has no supervisor, so create a report only on failure.
+    static bool started = false;
+    char supervised[2]{};
+    const bool monitored = GetEnvironmentVariableA("ROJ_CRASH_SUPERVISED", supervised, sizeof supervised) == 1 && supervised[0] == '1';
+    if (started || (monitored && GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_PIPE)) return;
+    started = true;
+    wchar_t executable[32768]{};
+    if (GetModuleFileNameW(nullptr, executable, DWORD(std::size(executable))))
+    {
+        const auto path = std::filesystem::path(executable).parent_path() / L"RingOfJudgment-crash.log";
+        _wfreopen(path.c_str(), L"w", stderr);
+    }
 }
 
 // Usa um temporizador de alta resolucao por thread, sem espera ocupada.
@@ -16357,6 +16526,19 @@ static void irq_wait_tick()
                 }
                 else
                 {
+                    // SLUS-20347 lottery easing reaches sin(pi/2). Our EE
+                    // arithmetic can leave that endpoint one float ULP below
+                    // one, so the original completion test never succeeds.
+                    // Snap only this completed easing, not other sine results.
+                    if (start == 0x0027EED0u && address == 0x0027F198u)
+                    {
+                        _sb.AppendLine($"{I1}if (c.f[21] == 0x3F7FFFFFu) {{");
+                        _sb.AppendLine($"{I1}    const uint32_t ring = (uint32_t)c.r[17].lo;");
+                        _sb.AppendLine($"{I1}    const float base = f32(mrd<uint32_t>(c, ring + 0x6Cu));");
+                        _sb.AppendLine($"{I1}    const float elapsed = f32(mrd<uint32_t>(c, ring + 0x90u));");
+                        _sb.AppendLine($"{I1}    if (elapsed >= base + 0.3f * (10.0f - base)) c.f[21] = 0x3F800000u;");
+                        _sb.AppendLine($"{I1}}}");
+                    }
                     Simple(instruction, address, I1);
                 }
             }

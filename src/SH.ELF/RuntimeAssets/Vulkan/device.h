@@ -20,8 +20,8 @@ struct HighTarget {
  uint32_t x0=0,y0=0,x1=0,y1=0; // Guest pixel bounds; zero x1 means full frame.
 };
 constexpr uint32_t HighMaxPixels=1280*720;
-constexpr uint32_t HighColorWord=1048576+4*640*224;
-constexpr uint32_t HighMemoryBytes=(HighColorWord+4*HighMaxPixels)*4;
+constexpr uint32_t HighColorWord=1048576+6*640*224;
+constexpr uint32_t HighMemoryBytes=(HighColorWord+6*HighMaxPixels)*4;
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void* mapped{}; VkDeviceSize size{}; bool coherent{}; };
 class Device {
  std::mutex renderMutex;
@@ -167,7 +167,7 @@ public:
    }
    const uint32_t highOffset=high?(HighColorWord+high->frame*HighMaxPixels)*4:0;
    const uint32_t highBytes=high?high->width*high->height*4:0;
-   if(high&&(high->width!=1280||(high->height!=448&&high->height!=720)||high->frame>1))throw std::runtime_error("resolucao interna invalida");
+   if(high&&(high->width!=1280||(high->height!=448&&high->height!=720)||high->frame>2))throw std::runtime_error("resolucao interna invalida");
    if(high&&high->output){downloads.push_back({highOffset,highOffset,highBytes});downloadBytes+=highBytes;}
    if(triangleBytes)std::memcpy(buffers[1].mapped,triangles,triangleBytes);
    if(!texture.empty())std::memcpy(buffers[2].mapped,texture.data(),texture.size()*4);
@@ -189,7 +189,7 @@ public:
      width=(high->x1*high->width+639)/640-high->x0*high->width/640;
      height=(high->y1*high->height+223)/224-high->y0*high->height/224;
     }
-    parameters[3]=high?(high->width|(high->height<<12)|(high->frame<<24)|(uint32_t(high->reset)<<25)|(mode<<28)):0;
+    parameters[3]=high?(high->width|(high->height<<12)|(high->frame<<24)|(uint32_t(high->reset)<<26)|(mode<<28)):0;
     vkCmdPushConstants(command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,16,parameters);
     vkCmdDispatch(command,(width+7)/8,(height+7)/8,1);
    };
